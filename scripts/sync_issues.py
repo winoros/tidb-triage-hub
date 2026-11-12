@@ -516,6 +516,7 @@ def write_pending_bundle(pending_path: Path, pending_items: list[tuple[int, list
     template_new: dict[str, Any] = {}
     for num, scopes, it in pending_items:
         labels = [l["name"] for l in (it.get("labels", {}).get("nodes") or []) if l]
+        assignees = [a["login"] for a in (it.get("assignees", {}).get("nodes") or []) if a]
         prs = extract_prs_from_issue(num, it)
         comments = [
             {
@@ -532,6 +533,7 @@ def write_pending_bundle(pending_path: Path, pending_items: list[tuple[int, list
                 "url": f"https://github.com/pingcap/tidb/issues/{num}",
                 "title": it["title"],
                 "author": (it.get("author") or {}).get("login", "ghost"),
+                "assignees": assignees,
                 "created_at": it["createdAt"],
                 "updated_at": it["updatedAt"],
                 "labels": labels,

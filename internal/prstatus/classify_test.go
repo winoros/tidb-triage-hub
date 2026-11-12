@@ -191,3 +191,27 @@ func TestClassifyPR_TiDBQuirksAndPriority(t *testing.T) {
 		}
 	})
 }
+
+
+func TestParsePRSpecs(t *testing.T) {
+	got, err := ParsePRSpecs("73064, #72862, pingcap/tiflash#11155, #73064", "pingcap/tidb")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 deduplicated targets, got %d (%+v)", len(got), got)
+	}
+	if got[0].Repo != "pingcap/tidb" || got[0].Number != 73064 {
+		t.Fatalf("unexpected target[0]: %+v", got[0])
+	}
+	if got[1].Repo != "pingcap/tidb" || got[1].Number != 72862 {
+		t.Fatalf("unexpected target[1]: %+v", got[1])
+	}
+	if got[2].Repo != "pingcap/tiflash" || got[2].Number != 11155 {
+		t.Fatalf("unexpected target[2]: %+v", got[2])
+	}
+
+	if _, err := ParsePRSpecs("not-a-pr", "pingcap/tidb"); err == nil {
+		t.Fatal("expected error on invalid PR spec")
+	}
+}

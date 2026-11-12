@@ -8,8 +8,8 @@
 
   var store = { "zh-CN": {}, "en": {} };
   var listeners = [];
+  var themeListeners = [];
   var currentLocale = DEFAULT_LOCALE;
-  var hasUrlLangParam = false;
 
   function safeStorageGet(key) {
     try { return global.localStorage ? global.localStorage.getItem(key) : null; }
@@ -22,7 +22,7 @@
   }
 
   function escHtml(str) {
-    return String(str)
+    return String(str == null ? "" : str)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
@@ -89,10 +89,7 @@
     try {
       var params = new URLSearchParams(global.location.search || "");
       var qLang = normalizeLocale(params.get("lang"));
-      if (qLang) {
-        hasUrlLangParam = true;
-        return qLang;
-      }
+      if (qLang) return qLang;
     } catch (_) {}
 
     var saved = normalizeLocale(safeStorageGet(STORAGE_KEY));
@@ -117,7 +114,6 @@
       if (forceParam || url.searchParams.has("lang")) {
         url.searchParams.set("lang", locale === "zh-CN" ? "zh" : "en");
         global.history.replaceState(null, "", url.toString());
-        hasUrlLangParam = true;
       }
     } catch (_) {}
   }
@@ -186,6 +182,27 @@
     }
   }
 
+  function getEffectiveTheme() {
+    var doc = global.document;
+    if (doc) {
+      var attr = doc.documentElement.getAttribute("data-theme");
+      if (attr === "dark" || attr === "light") return attr;
+    }
+    try {
+      if (global.matchMedia && global.matchMedia("(prefers-color-scheme: dark)").matches) {
+        return "dark";
+      }
+    } catch (_) {}
+    return "light";
+  }
+
+  function notifyThemeListeners() {
+    var eff = getEffectiveTheme();
+    for (var i = 0; i < themeListeners.length; i++) {
+      themeListeners[i](eff);
+    }
+  }
+
   function initTheme(btnId) {
     var doc = global.document;
     if (!doc) return;
@@ -198,14 +215,19 @@
     if (btn && !btn.hasAttribute("data-theme-bound")) {
       btn.setAttribute("data-theme-bound", "1");
       btn.addEventListener("click", function() {
-        var cur = root.getAttribute("data-theme");
-        var sysDark = false;
-        try { sysDark = global.matchMedia("(prefers-color-scheme: dark)").matches; } catch (_) {}
-        var next = cur ? (cur === "dark" ? "light" : "dark") : (sysDark ? "light" : "dark");
+        var next = getEffectiveTheme() === "dark" ? "light" : "dark";
         root.setAttribute("data-theme", next);
         safeStorageSet(THEME_STORAGE_KEY, next);
+        notifyThemeListeners();
       });
     }
+    try {
+      var mq = global.matchMedia && global.matchMedia("(prefers-color-scheme: dark)");
+      if (mq && mq.addEventListener) {
+        mq.addEventListener("change", notifyThemeListeners);
+      }
+    } catch (_) {}
+    notifyThemeListeners();
   }
 
   var switcherBound = false;
@@ -232,6 +254,7 @@
     getLocale: function() {
       return currentLocale;
     },
+    getEffectiveTheme: getEffectiveTheme,
     t: function(key, params, locale) {
       var raw = resolveRaw(key, locale);
       if (typeof raw !== "string") return key;
@@ -265,6 +288,9 @@
     },
     onChange: function(fn) {
       if (typeof fn === "function") listeners.push(fn);
+    },
+    onThemeChange: function(fn) {
+      if (typeof fn === "function") themeListeners.push(fn);
     },
     applyDOM: applyDOM,
     init: function(opts) {

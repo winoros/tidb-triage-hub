@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -332,12 +333,115 @@ func runGHGraphQL(ctx context.Context, query string) ([]byte, error) {
 	return nil, lastErr
 }
 
+type RateLimitInfo struct {
+	ViewerLogin string `json:"viewer_login"`
+	Limit       int    `json:"limit"`
+	Remaining   int    `json:"remaining"`
+	Used        int    `json:"used"`
+	ResetAtUTC  string `json:"reset_at_utc"`
+	ResetAtUTC8 string `json:"reset_at_utc8"`
+}
+
+func CheckGHQuota(ctx context.Context, minRemaining int) (RateLimitInfo, error) {
+	if _, err := exec.LookPath("gh"); err != nil {
+		return RateLimitInfo{}, fmt.Errorf("gh CLI not found in PATH: %w", err)
+	}
+	raw, err := runGHGraphQL(ctx, `query { viewer { login } rateLimit { limit remaining used resetAt } }`)
+	if err != nil {
+		return RateLimitInfo{}, fmt.Errorf("gh GraphQL authentication/network check failed: %w", err)
+	}
+	var resp struct {
+		Data struct {
+			Viewer struct {
+				Login string `json:"login"`
+			} `json:"viewer"`
+			RateLimit struct {
+				Limit     int    `json:"limit"`
+				Remaining int    `json:"remaining"`
+				Used      int    `json:"used"`
+				ResetAt   string `json:"resetAt"`
+			} `json:"rateLimit"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return RateLimitInfo{}, fmt.Errorf("decode rateLimit response: %w", err)
+	}
+	if resp.Data.RateLimit.Limit == 0 && len(resp.Errors) > 0 {
+		return RateLimitInfo{}, fmt.Errorf("gh GraphQL error: %s", resp.Errors[0].Message)
+	}
+	info := RateLimitInfo{
+		ViewerLogin: resp.Data.Viewer.Login,
+		Limit:       resp.Data.RateLimit.Limit,
+		Remaining:   resp.Data.RateLimit.Remaining,
+		Used:        resp.Data.RateLimit.Used,
+		ResetAtUTC:  resp.Data.RateLimit.ResetAt,
+	}
+	if info.ResetAtUTC != "" {
+		info.ResetAtUTC8 = ToUTC8Display(info.ResetAtUTC) + " (UTC+8)"
+	}
+	if minRemaining > 0 && info.Remaining < minRemaining {
+		return info, fmt.Errorf(
+			"insufficient GitHub GraphQL quota for @%s: remaining %d/%d points (need >= %d, resets at %s)",
+			info.ViewerLogin, info.Remaining, info.Limit, minRemaining, info.ResetAtUTC8,
+		)
+	}
+	return info, nil
+}
+
+func ParsePRSpecs(spec string, defaultRepo string) ([]PRTarget, error) {
+	if defaultRepo == "" {
+		defaultRepo = "pingcap/tidb"
+	}
+	var out []PRTarget
+	seen := make(map[string]bool)
+	for _, tok := range strings.Split(spec, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		repo := defaultRepo
+		numPart := tok
+		if strings.Contains(tok, "#") {
+			parts := strings.SplitN(tok, "#", 2)
+			if strings.TrimSpace(parts[0]) != "" {
+				repo = strings.TrimSpace(parts[0])
+			}
+			numPart = strings.TrimSpace(parts[1])
+		}
+		numPart = strings.TrimPrefix(numPart, "#")
+		n, err := strconv.Atoi(numPart)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("invalid PR spec %q (expected e.g. 73064 or pingcap/tiflash#11155)", tok)
+		}
+		key := model.PRKey(repo, n)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, PRTarget{
+			Repo:   repo,
+			Number: n,
+		})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty PR spec")
+	}
+	return out, nil
+}
+
 type FetchStats struct {
-	GraphQLCalls int `json:"graphql_calls"`
-	TotalFetched int `json:"total_fetched"`
-	OpenCount    int `json:"open_count"`
-	ClosedCount  int `json:"closed_count"`
-	DurationMs   int `json:"duration_ms"`
+	GraphQLCalls       int    `json:"graphql_calls"`
+	GraphQLCost        int    `json:"graphql_cost"`
+	RateLimitLimit     int    `json:"rate_limit_limit,omitempty"`
+	RateLimitRemaining int    `json:"rate_limit_remaining,omitempty"`
+	RateLimitResetUTC8 string `json:"rate_limit_reset_utc8,omitempty"`
+	TotalFetched       int    `json:"total_fetched"`
+	OpenCount          int    `json:"open_count"`
+	ClosedCount        int    `json:"closed_count"`
+	DurationMs         int    `json:"duration_ms"`
 }
 
 func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize int) ([]model.PRStatus, FetchStats, error) {
@@ -396,10 +500,14 @@ func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize in
 
 	now := time.Now().UTC()
 	var (
-		mu       sync.Mutex
-		results  []model.PRStatus
-		firstErr error
-		calls    int
+		mu          sync.Mutex
+		results     []model.PRStatus
+		firstErr    error
+		calls       int
+		totalCost   int
+		rlLimit     int
+		rlRemaining = -1
+		rlResetUTC8 string
 	)
 
 	sem := make(chan struct{}, 3)
@@ -423,7 +531,7 @@ func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize in
 				fmt.Fprintf(&aliases, "    p%d: pullRequest(number: %d) { ...PRStatusFields }\n", it.Number, it.Number)
 			}
 			gql := fmt.Sprintf(
-				"%s\nquery {\n  repository(owner: %q, name: %q) {\n%s  }\n}",
+				"%s\nquery {\n  rateLimit { limit cost remaining resetAt }\n  repository(owner: %q, name: %q) {\n%s  }\n}",
 				prFieldsFragment, jb.owner, jb.name, aliases.String(),
 			)
 
@@ -439,6 +547,12 @@ func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize in
 
 			var resp struct {
 				Data struct {
+					RateLimit *struct {
+						Limit     int    `json:"limit"`
+						Cost      int    `json:"cost"`
+						Remaining int    `json:"remaining"`
+						ResetAt   string `json:"resetAt"`
+					} `json:"rateLimit"`
 					Repository map[string]*gqlPRNode `json:"repository"`
 				} `json:"data"`
 				Errors []struct {
@@ -475,6 +589,16 @@ func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize in
 
 			mu.Lock()
 			calls++
+			if resp.Data.RateLimit != nil {
+				totalCost += resp.Data.RateLimit.Cost
+				rlLimit = resp.Data.RateLimit.Limit
+				if rlRemaining < 0 || resp.Data.RateLimit.Remaining < rlRemaining {
+					rlRemaining = resp.Data.RateLimit.Remaining
+					if resp.Data.RateLimit.ResetAt != "" {
+						rlResetUTC8 = ToUTC8Display(resp.Data.RateLimit.ResetAt) + " (UTC+8)"
+					}
+				}
+			}
 			results = append(results, localOut...)
 			mu.Unlock()
 		}()
@@ -492,10 +616,17 @@ func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize in
 		return results[i].Num > results[j].Num
 	})
 
+	if rlRemaining < 0 {
+		rlRemaining = 0
+	}
 	stats := FetchStats{
-		GraphQLCalls: calls,
-		TotalFetched: len(results),
-		DurationMs:   int(time.Since(start).Milliseconds()),
+		GraphQLCalls:       calls,
+		GraphQLCost:        totalCost,
+		RateLimitLimit:     rlLimit,
+		RateLimitRemaining: rlRemaining,
+		RateLimitResetUTC8: rlResetUTC8,
+		TotalFetched:       len(results),
+		DurationMs:         int(time.Since(start).Milliseconds()),
 	}
 	for _, r := range results {
 		if r.State == "OPEN" || r.State == "DRAFT" {

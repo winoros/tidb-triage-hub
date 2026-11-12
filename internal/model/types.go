@@ -244,6 +244,7 @@ type PendingCandidate struct {
 	URL            string           `json:"url"`
 	Title          string           `json:"title"`
 	Author         string           `json:"author"`
+	Assignees      []string         `json:"assignees,omitempty"`
 	CreatedAt      string           `json:"created_at"`
 	UpdatedAt      string           `json:"updated_at"`
 	Labels         []string         `json:"labels"`
@@ -251,6 +252,12 @@ type PendingCandidate struct {
 	PRs            []LinkedPRRef    `json:"prs"`
 	Body           string           `json:"body"`
 	RecentComments []PendingComment `json:"recent_comments"`
+}
+
+type BatchTriageDecisions struct {
+	NewIssues     map[string]TriagePatchRequest `json:"new_issues,omitempty"`
+	ExcludeIssues map[string]string             `json:"exclude_issues,omitempty"`
+	Overrides     map[string]TriagePatchRequest `json:"overrides,omitempty"`
 }
 
 type TriagePatchRequest struct {
