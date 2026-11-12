@@ -1,0 +1,2069 @@
+<!DOCTYPE html>
+<html lang="en" data-i18n-title="report.meta.title">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TiDB Optimizer Issue Triage &amp; PR Status Hub</title>
+<meta name="description" data-i18n-content="report.meta.description" content="Standalone triage & PR blocker workbench for open pingcap/tidb optimizer issues.">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: light-dark(#ffffff, #0d0f12);
+    --surface: light-dark(#f6f8fa, #151920);
+    --surface-hover: light-dark(#eef1f5, #1c212b);
+    --border: light-dark(#dfe3e8, #272d38);
+    --text: light-dark(#16191f, #e8ecf2);
+    --muted: light-dark(#5c6573, #929cab);
+    --link: light-dark(#0969da, #58a6ff);
+
+    --easy-bg: light-dark(#e7f6ec, #132c1d);
+    --easy-fg: light-dark(#136c34, #56d364);
+    --med-bg: light-dark(#fff5db, #31250c);
+    --med-fg: light-dark(#8c5800, #e3b341);
+    --hard-bg: light-dark(#fdeaea, #361619);
+    --hard-fg: light-dark(#b42318, #ff7b72);
+    --enh-bg: light-dark(#e9f2ff, #13253e);
+    --enh-fg: light-dark(#0b57d0, #79c0ff);
+    --flt-bg: light-dark(#eff1f4, #20252e);
+    --flt-fg: light-dark(#525b68, #9aa4b2);
+
+    --sev-crit-bg: light-dark(#ffe4e6, #3b0d1d);
+    --sev-crit-fg: light-dark(#9f1239, #fda4af);
+    --sev-crit-bd: light-dark(#fecdd3, #881337);
+    --sev-maj-bg: light-dark(#ffedd5, #361908);
+    --sev-maj-fg: light-dark(#9a3412, #fdba74);
+    --sev-maj-bd: light-dark(#fed7aa, #7c2d12);
+    --sev-mod-bg: light-dark(#dbeafe, #132342);
+    --sev-mod-fg: light-dark(#1e40af, #93c5fd);
+    --sev-mod-bd: light-dark(#bfdbfe, #1e3a8a);
+    --sev-min-bg: light-dark(#f2f4f7, #1e232c);
+    --sev-min-fg: light-dark(#475467, #98a2b3);
+    --sev-min-bd: light-dark(#d0d5dd, #344054);
+
+    --pr-open-bg: light-dark(#ecfdf3, #102a1b);
+    --pr-open-fg: light-dark(#067647, #4ade80);
+    --pr-open-bd: light-dark(#abefc6, #1e5631);
+    --pr-merged-bg: light-dark(#f4ebff, #25173d);
+    --pr-merged-fg: light-dark(#6941c6, #c084fc);
+    --pr-merged-bd: light-dark(#d6bbfb, #4c2882);
+    --pr-draft-bg: light-dark(#eff8ff, #172334);
+    --pr-draft-fg: light-dark(#175cd3, #7dd3fc);
+    --pr-draft-bd: light-dark(#b2ddff, #274468);
+    --pr-closed-bg: light-dark(#f2f4f7, #1d2129);
+    --pr-closed-fg: light-dark(#667085, #8b95a5);
+    --pr-closed-bd: light-dark(#d0d5dd, #323946);
+    --qw-bg: light-dark(#fffbeb, #1f1b10);
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0d0f12; --surface: #151920; --surface-hover: #1c212b; --border: #272d38;
+    --text: #e8ecf2; --muted: #929cab; --link: #58a6ff;
+    --easy-bg: #132c1d; --easy-fg: #56d364;
+    --med-bg: #31250c; --med-fg: #e3b341;
+    --hard-bg: #361619; --hard-fg: #ff7b72;
+    --enh-bg: #13253e; --enh-fg: #79c0ff;
+    --flt-bg: #20252e; --flt-fg: #9aa4b2;
+    --sev-crit-bg: #3b0d1d; --sev-crit-fg: #fda4af; --sev-crit-bd: #881337;
+    --sev-maj-bg: #361908; --sev-maj-fg: #fdba74; --sev-maj-bd: #7c2d12;
+    --sev-mod-bg: #132342; --sev-mod-fg: #93c5fd; --sev-mod-bd: #1e3a8a;
+    --sev-min-bg: #1e232c; --sev-min-fg: #98a2b3; --sev-min-bd: #344054;
+    --pr-open-bg: #102a1b; --pr-open-fg: #4ade80; --pr-open-bd: #1e5631;
+    --pr-merged-bg: #25173d; --pr-merged-fg: #c084fc; --pr-merged-bd: #4c2882;
+    --pr-draft-bg: #172334; --pr-draft-fg: #7dd3fc; --pr-draft-bd: #274468;
+    --pr-closed-bg: #1d2129; --pr-closed-fg: #8b95a5; --pr-closed-bd: #323946;
+    --qw-bg: #1f1b10;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #ffffff; --surface: #f6f8fa; --surface-hover: #eef1f5; --border: #dfe3e8;
+    --text: #16191f; --muted: #5c6573; --link: #0969da;
+    --easy-bg: #e7f6ec; --easy-fg: #136c34;
+    --med-bg: #fff5db; --med-fg: #8c5800;
+    --hard-bg: #fdeaea; --hard-fg: #b42318;
+    --enh-bg: #e9f2ff; --enh-fg: #0b57d0;
+    --flt-bg: #eff1f4; --flt-fg: #525b68;
+    --sev-crit-bg: #ffe4e6; --sev-crit-fg: #9f1239; --sev-crit-bd: #fecdd3;
+    --sev-maj-bg: #ffedd5; --sev-maj-fg: #9a3412; --sev-maj-bd: #fed7aa;
+    --sev-mod-bg: #dbeafe; --sev-mod-fg: #1e40af; --sev-mod-bd: #bfdbfe;
+    --sev-min-bg: #f2f4f7; --sev-min-fg: #475467; --sev-min-bd: #d0d5dd;
+    --pr-open-bg: #ecfdf3; --pr-open-fg: #067647; --pr-open-bd: #abefc6;
+    --pr-merged-bg: #f4ebff; --pr-merged-fg: #6941c6; --pr-merged-bd: #d6bbfb;
+    --pr-draft-bg: #eff8ff; --pr-draft-fg: #175cd3; --pr-draft-bd: #b2ddff;
+    --pr-closed-bg: #f2f4f7; --pr-closed-fg: #667085; --pr-closed-bd: #d0d5dd;
+    --qw-bg: #fffbeb;
+  }
+
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.58;
+    overflow-x: hidden;
+  }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12px; background: var(--surface);
+    padding: 1px 5px; border-radius: 3px; border: 1px solid var(--border);
+    overflow-wrap: anywhere;
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 22px 16px 52px; }
+  .topbar {
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 10px; padding-bottom: 14px; margin-bottom: 18px;
+    border-bottom: 1px solid var(--border); font-size: 13px;
+  }
+  .brand-wrap {
+    display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .brand-title {
+    font-weight: 700; font-size: 14px; color: var(--text); letter-spacing: -0.01em;
+  }
+  .topbar-right { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+  .lang-switch {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    background: var(--surface);
+  }
+  .lang-btn {
+    background: transparent;
+    color: var(--muted);
+    border: none;
+    padding: 4px 8px;
+    font-size: 12px;
+    line-height: 1.25;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .lang-btn + .lang-btn { border-left: 1px solid var(--border); }
+  .lang-btn:hover { background: var(--surface-hover); color: var(--text); }
+  .lang-btn.active {
+    background: var(--text);
+    color: var(--bg);
+    font-weight: 600;
+  }
+  .btn-sm {
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 4px 10px; font-size: 12px; line-height: 1.25; cursor: pointer;
+    font-family: inherit;
+  }
+  .btn-sm:hover:not(:disabled) { background: var(--surface-hover); }
+  .btn-sm:disabled { opacity: 0.55; cursor: wait; }
+  .btn-primary {
+    background: var(--link); color: #fff; border-color: var(--link); font-weight: 600;
+  }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--link); }
+  .btn-amber {
+    background: var(--med-bg); color: var(--med-fg); border-color: var(--med-fg); font-weight: 600;
+  }
+
+  h1 { font-size: 21px; font-weight: 700; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+
+  .sync-bar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px; padding: 9px 12px; margin-bottom: 12px;
+    font-size: 12.5px; color: var(--muted);
+  }
+  .sync-bar b { color: var(--text); font-weight: 600; }
+  .copy-chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 3px;
+    padding: 2px 7px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px; cursor: pointer; max-width: 100%; word-break: break-all;
+  }
+  .copy-chip:hover { border-color: var(--link); color: var(--link); }
+
+  /* View Switcher & RW Action Bar */
+  .workbench-bar {
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 10px; margin-bottom: 16px;
+  }
+  .view-tabs {
+    display: inline-flex; border: 1px solid var(--border);
+    border-radius: 5px; overflow: hidden; background: var(--surface);
+    max-width: 100%;
+  }
+  .view-tab {
+    background: transparent; color: var(--muted); border: none;
+    padding: 7px 14px; font-size: 13px; font-weight: 600;
+    cursor: pointer; font-family: inherit; line-height: 1.3;
+  }
+  .view-tab + .view-tab { border-left: 1px solid var(--border); }
+  .view-tab:hover { background: var(--surface-hover); color: var(--text); }
+  .view-tab.active { background: var(--text); color: var(--bg); }
+  .rw-actions {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 7px;
+  }
+  .rw-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 2px 8px; border-radius: 3px; font-size: 11.5px; font-weight: 600;
+    background: var(--easy-bg); color: var(--easy-fg);
+  }
+  .rw-badge.ro {
+    background: var(--flt-bg); color: var(--flt-fg);
+  }
+
+  .kpi-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+    gap: 10px; margin-bottom: 14px;
+  }
+  .kpi {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px; padding: 11px 14px;
+  }
+  .kpi .lbl { font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+  .kpi .val { font-size: 21px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .kpi .hint { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+  /* PR Stage Strip Cards */
+  .stage-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+    gap: 8px; margin-bottom: 14px;
+  }
+  .stage-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px; padding: 9px 11px; cursor: pointer; text-align: left;
+    font-family: inherit; color: var(--text);
+    transition: background 0.12s ease, border-color 0.12s ease;
+  }
+  .stage-card:hover { background: var(--surface-hover); }
+  .stage-card.active {
+    outline: 2px solid var(--link); outline-offset: -2px;
+    background: var(--surface-hover);
+  }
+  .stage-card .sc-lbl { font-size: 11.5px; color: var(--muted); display: block; margin-bottom: 2px; }
+  .stage-card .sc-val { font-size: 19px; font-weight: 700; font-variant-numeric: tabular-nums; display: block; }
+
+  .funnel-bar {
+    display: flex; width: 100%; height: 9px; border-radius: 3px;
+    overflow: hidden; margin-bottom: 8px; background: var(--surface);
+  }
+  .funnel-seg { height: 100%; }
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 8px 16px;
+    font-size: 12px; color: var(--muted); margin-bottom: 18px;
+  }
+  .legend > span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+
+  .matrix-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px; padding: 12px 14px; margin-bottom: 16px;
+  }
+  .matrix-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    flex-wrap: wrap; gap: 8px; margin-bottom: 10px;
+  }
+  .matrix-title { font-size: 13.5px; font-weight: 650; }
+  .matrix-sub { font-size: 12px; color: var(--muted); }
+  .matrix-scroll { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table.mtx {
+    width: 100%; min-width: 560px; border-collapse: collapse; table-layout: fixed;
+  }
+  table.mtx th, table.mtx td {
+    border: 1px solid var(--border); padding: 7px 8px;
+    text-align: center; vertical-align: middle; font-size: 12.5px;
+  }
+  table.mtx th { background: var(--bg); color: var(--muted); font-weight: 600; font-size: 12px; }
+  table.mtx th.row-hdr { text-align: left; width: 162px; color: var(--text); }
+  table.mtx td.mcell {
+    background: var(--bg); cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease;
+  }
+  table.mtx td.mcell:hover { background: var(--surface-hover); }
+  table.mtx td.mcell.active {
+    outline: 2px solid var(--link); outline-offset: -2px;
+    background: var(--surface-hover);
+  }
+  table.mtx td.mcell.qw {
+    background: var(--qw-bg);
+  }
+  .mc-num { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; display: block; line-height: 1.25; }
+  .mc-sub { font-size: 11px; color: var(--muted); display: block; margin-top: 2px; }
+
+  details.analysis-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px; margin-bottom: 16px;
+  }
+  details.analysis-box > summary {
+    padding: 11px 14px; cursor: pointer; font-weight: 650; font-size: 13.5px;
+    list-style: none; display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  }
+  details.analysis-box > summary::-webkit-details-marker { display: none; }
+  .summary-hint { font-size: 12px; font-weight: 400; color: var(--muted); flex-shrink: 0; }
+  .analysis-body {
+    padding: 4px 14px 16px; border-top: 1px solid var(--border);
+    font-size: 13px; line-height: 1.65;
+  }
+  .analysis-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px; margin-top: 10px;
+  }
+  .a-card {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 12px 14px; min-width: 0;
+  }
+  .a-card h3 { margin: 0 0 8px; font-size: 13.5px; }
+  .a-card ul { margin: 0; padding-left: 17px; }
+  .a-card li { margin-bottom: 6px; word-break: break-word; }
+
+  .controls {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px; padding: 12px; margin-bottom: 12px;
+    display: flex; flex-direction: column; gap: 9px;
+  }
+  .ctrl-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  input[type="search"], input[type="date"], input[type="text"], select, textarea {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 6px 9px; font-size: 12.5px; min-width: 0; max-width: 100%;
+    font-family: inherit;
+  }
+  input[type="search"] { flex: 1 1 230px; }
+  select { flex: 0 1 auto; }
+  .date-grp { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); max-width: 100%; }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pill {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 4px 10px; font-size: 12px; cursor: pointer;
+    font-family: inherit;
+  }
+  .pill.active {
+    background: var(--text); color: var(--bg);
+    border-color: var(--text); font-weight: 600;
+  }
+
+  .status-line {
+    font-size: 12.5px; color: var(--muted); margin-bottom: 10px;
+    display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;
+  }
+  .mtx-active-tag {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--enh-bg); color: var(--enh-fg);
+    padding: 2px 8px; border-radius: 3px; font-size: 12px; font-weight: 600;
+  }
+  .mtx-active-tag button {
+    background: none; border: none; color: inherit; cursor: pointer;
+    padding: 0 2px; font-size: 13px; font-weight: 700;
+  }
+
+  table.issues-tbl, table.prs-tbl { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  table.issues-tbl th, table.issues-tbl td,
+  table.prs-tbl th, table.prs-tbl td {
+    text-align: left; padding: 10px 8px;
+    border-bottom: 1px solid var(--border); vertical-align: top; word-break: break-word;
+  }
+  table.issues-tbl th, table.prs-tbl th {
+    font-size: 12px; color: var(--muted); font-weight: 600; background: var(--surface);
+  }
+  col.c-id { width: 84px; }
+  col.c-cat { width: 176px; }
+  col.c-sub { width: 158px; }
+  col.c-title { width: auto; }
+  col.c-time { width: 180px; }
+
+  col.p-id { width: 104px; }
+  col.p-blk { width: 220px; }
+  col.p-iss { width: 176px; }
+  col.p-det { width: auto; }
+  col.p-time { width: 162px; }
+
+  table.issues-tbl tr:hover td, table.prs-tbl tr:hover td { background: var(--surface-hover); }
+
+  .badge {
+    display: inline-block; padding: 2px 7px; border-radius: 3px;
+    font-size: 11.5px; font-weight: 600; line-height: 1.38;
+  }
+  .badge-easy { background: var(--easy-bg); color: var(--easy-fg); }
+  .badge-medium { background: var(--med-bg); color: var(--med-fg); }
+  .badge-hard { background: var(--hard-bg); color: var(--hard-fg); }
+  .badge-enh { background: var(--enh-bg); color: var(--enh-fg); }
+  .badge-fuzz, .badge-ai, .badge-other { background: var(--flt-bg); color: var(--flt-fg); }
+
+  .sev-badge {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    font-size: 11px; font-weight: 600; line-height: 1.4; margin-top: 4px;
+    border: 1px solid transparent;
+  }
+  .sev-critical { background: var(--sev-crit-bg); color: var(--sev-crit-fg); border-color: var(--sev-crit-bd); }
+  .sev-major { background: var(--sev-maj-bg); color: var(--sev-maj-fg); border-color: var(--sev-maj-bd); }
+  .sev-moderate { background: var(--sev-mod-bg); color: var(--sev-mod-fg); border-color: var(--sev-mod-bd); }
+  .sev-minor { background: var(--sev-min-bg); color: var(--sev-min-fg); border-color: var(--sev-min-bd); }
+  .sev-na { background: var(--flt-bg); color: var(--flt-fg); border-color: var(--border); }
+  .gh-sev-note { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  .tag-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; align-items: center; }
+  .tag-mini {
+    display: inline-block; padding: 1px 5px; border: 1px solid var(--border);
+    border-radius: 3px; font-size: 11px; color: var(--muted);
+  }
+  .tag-cust { border-color: var(--hard-fg); color: var(--hard-fg); font-weight: 500; }
+  .tag-keep { border-color: var(--enh-fg); color: var(--enh-fg); font-weight: 500; }
+  .tag-cal { border-color: var(--easy-fg); color: var(--easy-fg); font-weight: 600; }
+
+  .pr-row { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; align-items: center; }
+  .pr-chip-grp { display: inline-flex; align-items: stretch; }
+  .pr-chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 1px 7px; border-radius: 3px; font-size: 11.5px; font-weight: 600;
+    border: 1px solid transparent; text-decoration: none;
+    font-variant-numeric: tabular-nums;
+  }
+  .pr-chip-grp .pr-chip { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+  .pr-jump-btn {
+    border: 1px solid var(--border); border-left: none;
+    background: var(--surface); color: var(--muted);
+    border-top-right-radius: 3px; border-bottom-right-radius: 3px;
+    padding: 0 5px; font-size: 11px; cursor: pointer; line-height: 1;
+  }
+  .pr-jump-btn:hover { color: var(--link); background: var(--surface-hover); }
+  .pr-chip:hover { text-decoration: underline; filter: brightness(0.97); }
+  .pr-open { background: var(--pr-open-bg); color: var(--pr-open-fg); border-color: var(--pr-open-bd); }
+  .pr-merged { background: var(--pr-merged-bg); color: var(--pr-merged-fg); border-color: var(--pr-merged-bd); }
+  .pr-draft { background: var(--pr-draft-bg); color: var(--pr-draft-fg); border-color: var(--pr-draft-bd); border-style: dashed; }
+  .pr-closed { background: var(--pr-closed-bg); color: var(--pr-closed-fg); border-color: var(--pr-closed-bd); font-weight: 500; }
+  .pr-danger { background: var(--sev-crit-bg); color: var(--sev-crit-fg); border-color: var(--sev-crit-bd); }
+  .pr-warn { background: var(--sev-maj-bg); color: var(--sev-maj-fg); border-color: var(--sev-maj-bd); }
+  .pr-lgtm1 { background: var(--med-bg); color: var(--med-fg); border-color: var(--med-fg); }
+  .pr-rev { background: var(--enh-bg); color: var(--enh-fg); border-color: var(--sev-mod-bd); }
+
+  .ci-fail-chip {
+    display: inline-flex; align-items: center; gap: 3px;
+    padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: 600;
+    background: var(--sev-crit-bg); color: var(--sev-crit-fg); border: 1px solid var(--sev-crit-bd);
+    text-decoration: none;
+  }
+  .ci-fail-chip:hover { text-decoration: underline; }
+
+  .note-txt { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .meta-cell { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; line-height: 1.5; }
+  .upd-val { color: var(--text); font-weight: 600; display: block; }
+  .iss-title-link { color: var(--text); font-weight: 500; }
+  .iss-title-link:hover { color: var(--link); text-decoration: underline; }
+  .row-edit-btn {
+    margin-top: 5px; padding: 2px 6px; font-size: 11px;
+    background: var(--surface); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 3px; cursor: pointer;
+    font-family: inherit;
+  }
+  .row-edit-btn:hover { color: var(--text); border-color: var(--link); }
+
+  /* Slide-over Drawers & Toast */
+  .drawer-backdrop {
+    position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45);
+    z-index: 90; display: flex; justify-content: flex-end;
+  }
+  .drawer-backdrop[hidden] { display: none !important; }
+  .drawer-panel {
+    width: 500px; max-width: 100vw; height: 100%;
+    background: var(--bg); border-left: 1px solid var(--border);
+    display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: -6px 0 24px rgba(0, 0, 0, 0.22);
+  }
+  .drawer-hdr {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 16px; border-bottom: 1px solid var(--border); background: var(--surface);
+  }
+  .drawer-hdr h2 { margin: 0; font-size: 15px; font-weight: 700; }
+  .drawer-body {
+    flex: 1; overflow-y: auto; padding: 16px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .drawer-ftr {
+    padding: 12px 16px; border-top: 1px solid var(--border); background: var(--surface);
+    display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;
+  }
+  .fld { display: flex; flex-direction: column; gap: 4px; }
+  .fld label { font-size: 12px; font-weight: 600; color: var(--muted); }
+  .fld select, .fld textarea, .fld input[type="text"] { width: 100%; }
+  .fld textarea { min-height: 68px; resize: vertical; line-height: 1.45; }
+  .chk-row { display: flex; align-items: center; gap: 7px; font-size: 12.5px; cursor: pointer; }
+  .pend-card {
+    border: 1px solid var(--border); border-radius: 4px; padding: 12px;
+    background: var(--surface); display: flex; flex-direction: column; gap: 8px;
+  }
+  .pend-pre {
+    max-height: 180px; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 3px;
+    padding: 8px; font-size: 12px; margin-top: 6px;
+  }
+  .toast-box {
+    position: fixed; bottom: 18px; right: 18px; z-index: 120;
+    background: var(--text); color: var(--bg);
+    padding: 9px 14px; border-radius: 5px; font-size: 12.5px; font-weight: 600;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); max-width: calc(100vw - 36px);
+  }
+  .toast-box[hidden] { display: none !important; }
+
+  @media (max-width: 780px) {
+    .wrap { padding: 14px 12px 36px; }
+    h1 { font-size: 18px; }
+    .analysis-grid { grid-template-columns: 1fr; }
+    table.issues-tbl thead, table.prs-tbl thead { display: none; }
+    table.issues-tbl, table.issues-tbl tbody, table.issues-tbl tr, table.issues-tbl td,
+    table.prs-tbl, table.prs-tbl tbody, table.prs-tbl tr, table.prs-tbl td {
+      display: block; width: 100%;
+    }
+    table.issues-tbl tr, table.prs-tbl tr {
+      border: 1px solid var(--border); border-radius: 4px;
+      padding: 10px 12px; margin-bottom: 10px; background: var(--surface);
+    }
+    table.issues-tbl td, table.prs-tbl td { border: none; padding: 3px 0; }
+  }
+  @media (max-width: 540px) {
+    .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+    .stage-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="topbar">
+    <div class="brand-wrap">
+      <span class="brand-title">🛠️ <span data-i18n="common.appBrand">TiDB Optimizer Triage Hub</span></span>
+      <span class="rw-badge" id="permBadge"></span>
+    </div>
+    <div class="topbar-right">
+      <a href="./api/dataset.json" id="dataJsonLink" target="_blank" rel="noopener" data-i18n="report.nav.dataJson">JSON Snapshot</a>
+      <a href="https://github.com/pingcap/tidb/issues?q=is%3Aissue+is%3Aopen+label%3Asig%2Fplanner" target="_blank" rel="noopener" data-i18n="report.nav.ghIssues">GitHub Issues</a>
+      <div class="lang-switch" role="group" data-i18n-aria-label="common.langSwitchAria" aria-label="Language">
+        <button type="button" class="lang-btn" data-lang-opt="zh-CN">中文</button>
+        <button type="button" class="lang-btn" data-lang-opt="en">EN</button>
+      </div>
+      <button class="btn-sm" id="themeBtn" type="button" data-i18n="common.toggleTheme" data-i18n-aria-label="common.toggleThemeAria">Theme</button>
+    </div>
+  </nav>
+  <h1 data-i18n="report.header.title">TiDB 优化器开放 Issue 研判与在途 PR 推进看板</h1>
+  <div class="sub" id="pageSub"></div>
+
+  <div class="sync-bar">
+    <span>🕒 <b data-i18n="report.sync.snapshotLabel">Issue 快照</b>: <span id="syncSnapTxt"></span></span>
+    <span id="prSyncWrap" hidden>🔀 <b data-i18n="report.sync.prSnapshotLabel">PR 状态刷新</b>: <span id="prSyncSnapTxt"></span></span>
+    <span>📌 <b data-i18n="report.sync.watermarkLabel">最新 Issue 更新水位线</b>: <code id="syncWatermarkCode"></code></span>
+    <span>🔄 <b data-i18n="report.sync.queryLabel">增量更新检索条件</b>: <button type="button" class="copy-chip" id="copySyncBtn" data-i18n-title="report.sync.copyTitle"></button></span>
+  </div>
+
+  <div class="workbench-bar">
+    <div class="view-tabs" role="tablist">
+      <button type="button" class="view-tab active" id="tabIssuesBtn" data-view="issues"></button>
+      <button type="button" class="view-tab" id="tabPrsBtn" data-view="prs"></button>
+    </div>
+    <div class="rw-actions" id="rwBar" hidden>
+      <button type="button" class="btn-sm" id="pendingInboxBtn" hidden></button>
+      <button type="button" class="btn-sm" id="syncPrsBtn" data-i18n="report.rw.syncPrsBtn" hidden></button>
+      <button type="button" class="btn-sm btn-primary" id="syncIssuesBtn" data-i18n="report.rw.syncIssuesBtn" hidden></button>
+    </div>
+  </div>
+
+  <!-- ==================== VIEW 1: ISSUE TRIAGE ==================== -->
+  <section id="viewIssuesSection">
+    <div class="kpi-grid" id="kpis"></div>
+    <div class="funnel-bar" id="funnelBar"></div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--easy-fg)"></i><span><span data-i18n="report.legend.easy"></span> (<b id="lg-easy">0</b>)</span></span>
+      <span><i class="dot" style="background:var(--med-fg)"></i><span><span data-i18n="report.legend.med"></span> (<b id="lg-med">0</b>)</span></span>
+      <span><i class="dot" style="background:var(--hard-fg)"></i><span><span data-i18n="report.legend.hard"></span> (<b id="lg-hard">0</b>)</span></span>
+      <span><i class="dot" style="background:var(--enh-fg)"></i><span><span data-i18n="report.legend.enh"></span> (<b id="lg-enh">0</b>)</span></span>
+      <span><i class="dot" style="background:var(--flt-fg)"></i><span><span data-i18n="report.legend.flt"></span> (<b id="lg-flt">0</b>)</span></span>
+    </div>
+
+    <div class="matrix-box">
+      <div class="matrix-head">
+        <span class="matrix-title" data-i18n="report.matrix.title"></span>
+        <span class="matrix-sub" data-i18n-html="report.matrix.subHtml"></span>
+      </div>
+      <div class="matrix-scroll">
+        <table class="mtx">
+          <thead>
+            <tr>
+              <th class="row-hdr" data-i18n="report.matrix.corner"></th>
+              <th data-i18n="report.matrix.colCrit"></th>
+              <th data-i18n="report.matrix.colMaj"></th>
+              <th data-i18n="report.matrix.colMod"></th>
+              <th data-i18n="report.matrix.colMin"></th>
+              <th data-i18n="report.matrix.colTotal"></th>
+            </tr>
+          </thead>
+          <tbody id="mtxBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <details class="analysis-box">
+      <summary>
+        <span data-i18n="report.rubric.summary"></span>
+        <span class="summary-hint" data-i18n="report.rubric.toggleHint"></span>
+      </summary>
+      <div class="analysis-body">
+        <div class="analysis-grid">
+          <div class="a-card">
+            <h3 data-i18n="report.rubric.scope.title"></h3>
+            <ul>
+              <li data-i18n-html="report.rubric.scope.fuzzHtml"></li>
+              <li data-i18n-html="report.rubric.scope.aiHtml"></li>
+              <li data-i18n-html="report.rubric.scope.nonOptHtml"></li>
+              <li data-i18n-html="report.rubric.scope.keepHtml"></li>
+            </ul>
+          </div>
+          <div class="a-card">
+            <h3 data-i18n="report.rubric.difficulty.title"></h3>
+            <ul>
+              <li data-i18n-html="report.rubric.difficulty.easyHtml"></li>
+              <li data-i18n-html="report.rubric.difficulty.medHtml"></li>
+              <li data-i18n-html="report.rubric.difficulty.hardHtml"></li>
+            </ul>
+          </div>
+          <div class="a-card">
+            <h3 data-i18n="report.rubric.severity.title"></h3>
+            <ul>
+              <li data-i18n-html="report.rubric.severity.critHtml"></li>
+              <li data-i18n-html="report.rubric.severity.majHtml"></li>
+              <li data-i18n-html="report.rubric.severity.modHtml"></li>
+              <li data-i18n-html="report.rubric.severity.minHtml"></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <div class="controls">
+      <div class="ctrl-row">
+        <input type="search" id="q" data-i18n-placeholder="report.filters.searchPlaceholder" data-i18n-aria-label="report.filters.searchAria">
+        <select id="scopeSel" data-i18n-aria-label="report.filters.scopeAria">
+          <option value="all" id="optScopeAll"></option>
+          <option value="canonical" id="optScopeCan"></option>
+          <option value="customer" id="optScopeCust"></option>
+          <option value="borderline" id="optScopeBdr"></option>
+        </select>
+        <select id="subSel" data-i18n-aria-label="report.filters.subAria">
+          <option value="all" data-i18n="report.filters.subAll"></option>
+          <option value="statistics" data-i18n="report.enums.subsystem.statistics"></option>
+          <option value="plan_cache_spm_hint" data-i18n="report.enums.subsystem.plan_cache_spm_hint"></option>
+          <option value="logical_rewrite" data-i18n="report.enums.subsystem.logical_rewrite"></option>
+          <option value="access_path_partition_lock" data-i18n="report.enums.subsystem.access_path_partition_lock"></option>
+          <option value="cbo_cost_join_reorder" data-i18n="report.enums.subsystem.cbo_cost_join_reorder"></option>
+          <option value="name_resolution_group_by" data-i18n="report.enums.subsystem.name_resolution_group_by"></option>
+          <option value="tiflash_mpp" data-i18n="report.enums.subsystem.tiflash_mpp"></option>
+        </select>
+      </div>
+      <div class="ctrl-row">
+        <select id="sevSel" data-i18n-aria-label="report.filters.sevAria">
+          <option value="all" data-i18n="report.filters.sev.all"></option>
+          <option value="HIGH_S0_S1" data-i18n="report.filters.sev.high"></option>
+          <option value="CRITICAL" data-i18n="report.filters.sev.critical"></option>
+          <option value="MAJOR" data-i18n="report.filters.sev.major"></option>
+          <option value="MODERATE" data-i18n="report.filters.sev.moderate"></option>
+          <option value="MINOR" data-i18n="report.filters.sev.minor"></option>
+          <option value="GH_UNLABELED" data-i18n="report.filters.sev.ghUnlabeled"></option>
+        </select>
+        <select id="prSel" data-i18n-aria-label="report.filters.prAria">
+          <option value="all" data-i18n="report.filters.pr.all"></option>
+          <option value="open_fix" data-i18n="report.filters.pr.openFix"></option>
+          <option value="ball_reviewer" data-i18n="report.filters.pr.ballReviewer"></option>
+          <option value="ball_author" data-i18n="report.filters.pr.ballAuthor"></option>
+          <option value="needs_lgtm2" data-i18n="report.filters.pr.needsLgtm2"></option>
+          <option value="unclaimed" data-i18n="report.filters.pr.unclaimed"></option>
+          <option value="has_any" data-i18n="report.filters.pr.hasAny"></option>
+          <option value="has_merged" data-i18n="report.filters.pr.hasMerged"></option>
+          <option value="no_pr" data-i18n="report.filters.pr.noPr"></option>
+        </select>
+        <select id="updWindowSel" data-i18n-aria-label="report.filters.updWinAria">
+          <option value="all" data-i18n="report.filters.updWin.all"></option>
+          <option value="1" data-i18n="report.filters.updWin.d1"></option>
+          <option value="7" data-i18n="report.filters.updWin.d7"></option>
+          <option value="30" data-i18n="report.filters.updWin.d30"></option>
+          <option value="90" data-i18n="report.filters.updWin.d90"></option>
+        </select>
+        <label class="date-grp">
+          <span data-i18n="report.filters.sincePrefix"></span>
+          <input type="date" id="sinceDate" data-i18n-aria-label="report.filters.sinceAria">
+          <span data-i18n="report.filters.sinceSuffix" data-i18n-hide-empty></span>
+        </label>
+        <select id="sortSel" data-i18n-aria-label="report.filters.sortAria">
+          <option value="updated_desc" data-i18n="report.filters.sort.updatedDesc"></option>
+          <option value="prio_desc" data-i18n="report.filters.sort.prioDesc"></option>
+          <option value="num_desc" selected data-i18n="report.filters.sort.numDesc"></option>
+          <option value="num_asc" data-i18n="report.filters.sort.numAsc"></option>
+        </select>
+      </div>
+      <div class="pills" id="catPills">
+        <button class="pill active" data-cat="REAL_ALL" data-i18n="report.pills.REAL_ALL"></button>
+        <button class="pill" data-cat="EASY" data-i18n="report.pills.EASY"></button>
+        <button class="pill" data-cat="MEDIUM" data-i18n="report.pills.MEDIUM"></button>
+        <button class="pill" data-cat="HARD" data-i18n="report.pills.HARD"></button>
+        <button class="pill" data-cat="ENHANCEMENT" data-i18n="report.pills.ENHANCEMENT"></button>
+        <button class="pill" data-cat="FILTER_RANDOM_FUZZ" data-i18n="report.pills.FILTER_RANDOM_FUZZ"></button>
+        <button class="pill" data-cat="FILTER_AI_OBSCURE" data-i18n="report.pills.FILTER_AI_OBSCURE"></button>
+        <button class="pill" data-cat="FILTER_NON_OPT_OR_FIXED" data-i18n="report.pills.FILTER_NON_OPT_OR_FIXED"></button>
+        <button class="pill" data-cat="ALL" data-i18n="report.pills.ALL"></button>
+      </div>
+    </div>
+
+    <div class="status-line">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <span id="countTxt"></span>
+        <span id="mtxFilterBadge"></span>
+      </div>
+      <span data-i18n="report.status.clickHint"></span>
+    </div>
+
+    <table class="issues-tbl">
+      <colgroup>
+        <col class="c-id"><col class="c-cat"><col class="c-sub"><col class="c-title"><col class="c-time">
+      </colgroup>
+      <thead>
+        <tr>
+          <th data-i18n="report.table.colIssue"></th>
+          <th data-i18n="report.table.colCatSev"></th>
+          <th data-i18n="report.table.colSub"></th>
+          <th data-i18n="report.table.colTitle"></th>
+          <th data-i18n="report.table.colTime"></th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </section>
+
+  <!-- ==================== VIEW 2: PR STATUS BOARD ==================== -->
+  <section id="viewPrsSection" hidden>
+    <div class="sub" id="prSummaryLine" style="margin-bottom:12px;font-weight:500;"></div>
+    <div class="stage-grid" id="prStageCards"></div>
+
+    <div class="controls">
+      <div class="ctrl-row">
+        <input type="search" id="prQ" data-i18n-placeholder="report.prBoard.filters.searchPlaceholder">
+        <select id="prScopeSel">
+          <option value="mainline" id="optPrScopeMainline"></option>
+          <option value="real_bug_mainline" id="optPrScopeReal"></option>
+          <option value="all_open" id="optPrScopeAll"></option>
+        </select>
+        <select id="prBallSel">
+          <option value="all" data-i18n="report.prBoard.filters.ballAll"></option>
+          <option value="REVIEWER" data-i18n="report.prBoard.filters.ballReviewer"></option>
+          <option value="AUTHOR" data-i18n="report.prBoard.filters.ballAuthor"></option>
+          <option value="MERGE_QUEUE" data-i18n="report.prBoard.filters.ballQueue"></option>
+          <option value="HOLD" data-i18n="report.prBoard.filters.ballHold"></option>
+        </select>
+      </div>
+      <div class="ctrl-row">
+        <select id="prSevSel">
+          <option value="all" data-i18n="report.filters.sev.all"></option>
+          <option value="HIGH_S0_S1" data-i18n="report.filters.sev.high"></option>
+          <option value="CRITICAL" data-i18n="report.filters.sev.critical"></option>
+          <option value="MAJOR" data-i18n="report.filters.sev.major"></option>
+          <option value="MODERATE" data-i18n="report.filters.sev.moderate"></option>
+          <option value="MINOR" data-i18n="report.filters.sev.minor"></option>
+        </select>
+        <select id="prSubSel">
+          <option value="all" data-i18n="report.filters.subAll"></option>
+          <option value="statistics" data-i18n="report.enums.subsystem.statistics"></option>
+          <option value="plan_cache_spm_hint" data-i18n="report.enums.subsystem.plan_cache_spm_hint"></option>
+          <option value="logical_rewrite" data-i18n="report.enums.subsystem.logical_rewrite"></option>
+          <option value="access_path_partition_lock" data-i18n="report.enums.subsystem.access_path_partition_lock"></option>
+          <option value="cbo_cost_join_reorder" data-i18n="report.enums.subsystem.cbo_cost_join_reorder"></option>
+          <option value="name_resolution_group_by" data-i18n="report.enums.subsystem.name_resolution_group_by"></option>
+          <option value="tiflash_mpp" data-i18n="report.enums.subsystem.tiflash_mpp"></option>
+        </select>
+        <select id="prSortSel">
+          <option value="prio_desc" selected data-i18n="report.prBoard.filters.sortPrio"></option>
+          <option value="wait_desc" data-i18n="report.prBoard.filters.sortWaitDesc"></option>
+          <option value="upd_desc" data-i18n="report.prBoard.filters.sortUpdDesc"></option>
+          <option value="num_desc" data-i18n="report.prBoard.filters.sortNumDesc"></option>
+        </select>
+      </div>
+    </div>
+
+    <div class="status-line">
+      <span id="prCountTxt"></span>
+      <span data-i18n="report.prBoard.clickHint"></span>
+    </div>
+
+    <table class="prs-tbl">
+      <colgroup>
+        <col class="p-id"><col class="p-blk"><col class="p-iss"><col class="p-det"><col class="p-time">
+      </colgroup>
+      <thead>
+        <tr>
+          <th data-i18n="report.prBoard.cols.pr"></th>
+          <th data-i18n="report.prBoard.cols.blocker"></th>
+          <th data-i18n="report.prBoard.cols.issues"></th>
+          <th data-i18n="report.prBoard.cols.details"></th>
+          <th data-i18n="report.prBoard.cols.time"></th>
+        </tr>
+      </thead>
+      <tbody id="prTbody"></tbody>
+    </table>
+  </section>
+</div>
+
+<!-- Slide-over Drawer: Calibrate Issue Triage -->
+<div class="drawer-backdrop" id="editDrawer" hidden>
+  <div class="drawer-panel" role="dialog" aria-modal="true">
+    <div class="drawer-hdr">
+      <h2 id="editDrawerTitle"></h2>
+      <button type="button" class="btn-sm" id="closeEditDrawerBtn" data-i18n="report.rw.drawer.close"></button>
+    </div>
+    <div class="drawer-body">
+      <div id="editIssueSummary" style="font-size:13px;font-weight:600;"></div>
+      <div class="fld">
+        <label for="edCat" data-i18n="report.rw.drawer.catLabel"></label>
+        <select id="edCat"></select>
+      </div>
+      <div class="fld">
+        <label for="edSev" data-i18n="report.rw.drawer.sevLabel"></label>
+        <select id="edSev"></select>
+      </div>
+      <div class="fld">
+        <label for="edSub" data-i18n="report.rw.drawer.subLabel"></label>
+        <select id="edSub"></select>
+      </div>
+      <label class="chk-row">
+        <input type="checkbox" id="edBorderline">
+        <span data-i18n="report.rw.drawer.borderlineCheck"></span>
+      </label>
+      <label class="chk-row">
+        <input type="checkbox" id="edForceKeep">
+        <span data-i18n="report.rw.drawer.forceKeepCheck"></span>
+      </label>
+      <div class="fld">
+        <label for="edNoteZh" data-i18n="report.rw.drawer.noteZhLabel"></label>
+        <textarea id="edNoteZh" data-i18n-placeholder="report.rw.drawer.notePlaceholderZh"></textarea>
+      </div>
+      <div class="fld">
+        <label for="edNoteEn" data-i18n="report.rw.drawer.noteEnLabel"></label>
+        <textarea id="edNoteEn" data-i18n-placeholder="report.rw.drawer.notePlaceholderEn"></textarea>
+      </div>
+    </div>
+    <div class="drawer-ftr">
+      <button type="button" class="btn-sm" id="resetOverrideBtn" data-i18n="report.rw.drawer.resetBtn"></button>
+      <div style="display:flex;gap:8px;">
+        <button type="button" class="btn-sm" id="cancelEditBtn" data-i18n="report.rw.drawer.cancelBtn"></button>
+        <button type="button" class="btn-sm btn-primary" id="saveOverrideBtn" data-i18n="report.rw.drawer.saveBtn"></button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Slide-over Drawer: Pending Candidate Inbox -->
+<div class="drawer-backdrop" id="inboxDrawer" hidden>
+  <div class="drawer-panel" role="dialog" aria-modal="true" style="width:620px;">
+    <div class="drawer-hdr">
+      <h2 id="inboxDrawerTitle"></h2>
+      <button type="button" class="btn-sm" id="closeInboxDrawerBtn" data-i18n="report.rw.drawer.close"></button>
+    </div>
+    <div class="drawer-body" id="inboxBody"></div>
+  </div>
+</div>
+
+<div class="toast-box" id="toastBox" hidden></div>
+
+<!--SERVER_INLINE_BUNDLE-->
+<script>
+(function() {
+  "use strict";
+
+  function appUrl(subpath) {
+    var p = (window.location && window.location.pathname) || "/";
+    if (p.slice(-11) === "/index.html") p = p.slice(0, -10);
+    if (p.charAt(p.length - 1) !== "/") p += "/";
+    return p + String(subpath || "").replace(/^\.?\//, "");
+  }
+
+  var djLink = document.getElementById("dataJsonLink");
+  if (djLink) djLink.setAttribute("href", appUrl("api/dataset.json"));
+
+  var SESSION = window.TRIAGE_SESSION || {
+    viewer: { login: "anonymous", role: "viewer" },
+    permissions: { can_triage: false, can_sync: false }
+  };
+  var CAN_TRIAGE = Boolean(SESSION.permissions && SESSION.permissions.can_triage);
+  var CAN_SYNC = Boolean(SESSION.permissions && SESSION.permissions.can_sync);
+
+  var esc = SiteI18n.escHtml;
+  var t = SiteI18n.t;
+
+  var META = window.REPORT_DATASET.sync_meta;
+  var DATA = window.REPORT_DATASET.records;
+  var PR_STATUS = window.REPORT_DATASET.pr_status || {};
+  var PENDING = window.TRIAGE_PENDING || [];
+  var SNAPSHOT_MS = Date.parse(META.snapshot_utc);
+
+  var BADGE_CLS = {
+    EASY: "badge-easy",
+    MEDIUM: "badge-medium",
+    HARD: "badge-hard",
+    ENHANCEMENT: "badge-enh",
+    FILTER_RANDOM_FUZZ: "badge-fuzz",
+    FILTER_AI_OBSCURE: "badge-ai",
+    FILTER_NON_OPT_OR_FIXED: "badge-other"
+  };
+
+  var SEV_CLS = {
+    CRITICAL: "sev-critical",
+    MAJOR: "sev-major",
+    MODERATE: "sev-moderate",
+    MINOR: "sev-minor",
+    "N/A": "sev-na"
+  };
+
+  var STAGE_CHIP_CLS = {
+    DRAFT_OR_HOLD: "pr-draft",
+    CONFLICT: "pr-danger",
+    NEEDS_OK_TO_TEST: "pr-rev",
+    CI_FAILED: "pr-danger",
+    WAITING_AUTHOR: "pr-warn",
+    GATE_BLOCKED: "pr-warn",
+    NEEDS_LGTM2: "pr-lgtm1",
+    WAITING_REVIEWER: "pr-rev",
+    READY_MERGING: "pr-open"
+  };
+
+  var STAGE_ORDER = [
+    "ALL",
+    "NEEDS_LGTM2",
+    "WAITING_REVIEWER",
+    "NEEDS_OK_TO_TEST",
+    "CI_FAILED",
+    "CONFLICT",
+    "WAITING_AUTHOR",
+    "GATE_BLOCKED",
+    "READY_MERGING",
+    "DRAFT_OR_HOLD"
+  ];
+
+  var activeView = "issues";
+  try {
+    var initParams = new URLSearchParams(window.location.search || "");
+    if (initParams.get("view") === "prs") activeView = "prs";
+  } catch (_) {}
+
+  var activeCat = "REAL_ALL";
+  var mtxDiff = null;
+  var mtxSev = null;
+  var activePrStage = "ALL";
+  var editingIssueNum = null;
+  var copyFeedbackTimer = null;
+  var toastTimer = null;
+  var renderInboxDrawer = function() {};
+
+  var SCOPE_COUNTS = { all: 0, can: 0, cust: 0, bdr: 0, sup: 0 };
+  var PR_ITEMS = [];
+
+  function showToast(msg) {
+    var box = document.getElementById("toastBox");
+    box.textContent = msg;
+    box.hidden = false;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function() {
+      box.hidden = true;
+    }, 3200);
+  }
+
+  function rebuildDerivedIndexes() {
+    META = window.REPORT_DATASET.sync_meta;
+    DATA = window.REPORT_DATASET.records || [];
+    PR_STATUS = window.REPORT_DATASET.pr_status || {};
+    SNAPSHOT_MS = Date.parse(META.snapshot_utc);
+
+    SCOPE_COUNTS.all = DATA.length;
+    SCOPE_COUNTS.can = DATA.filter(function(r) { return r.is_canonical; }).length;
+    SCOPE_COUNTS.cust = DATA.filter(function(r) { return r.is_customer; }).length;
+    SCOPE_COUNTS.bdr = DATA.filter(function(r) { return r.is_borderline_kept; }).length;
+    SCOPE_COUNTS.sup = SCOPE_COUNTS.all - SCOPE_COUNTS.can;
+
+    var linkedIssuesMap = {};
+    var fallbackRefMap = {};
+    for (var i = 0; i < DATA.length; i++) {
+      var iss = DATA[i];
+      for (var j = 0; j < iss.prs.length; j++) {
+        var p = iss.prs[j];
+        if (p.state !== "OPEN" && p.state !== "DRAFT") continue;
+        var key = p.repo + "#" + p.num;
+        if (!linkedIssuesMap[key]) linkedIssuesMap[key] = [];
+        linkedIssuesMap[key].push(iss);
+        if (!fallbackRefMap[key]) fallbackRefMap[key] = p;
+      }
+    }
+
+    var allKeys = {};
+    Object.keys(fallbackRefMap).forEach(function(k) { allKeys[k] = true; });
+    Object.keys(PR_STATUS).forEach(function(k) {
+      var st = PR_STATUS[k];
+      if (st && (st.state === "OPEN" || st.state === "DRAFT")) allKeys[k] = true;
+    });
+
+    PR_ITEMS = Object.keys(allKeys).map(function(key) {
+      var st = PR_STATUS[key];
+      var fb = fallbackRefMap[key];
+      var issues = (linkedIssuesMap[key] || []).slice().sort(function(a, b) {
+        if (b.sev_rank !== a.sev_rank) return b.sev_rank - a.sev_rank;
+        var da = a.diff_rank || 99, db = b.diff_rank || 99;
+        if (da !== db) return da - db;
+        return b.number - a.number;
+      });
+      var maxSevRank = 0;
+      var bestDiffRank = 99;
+      var hasRealBug = false;
+      var subSet = {};
+      issues.forEach(function(iss) {
+        if (iss.sev_rank > maxSevRank) maxSevRank = iss.sev_rank;
+        if (iss.diff_rank > 0 && iss.diff_rank < bestDiffRank) bestDiffRank = iss.diff_rank;
+        if (iss.cat === "EASY" || iss.cat === "MEDIUM" || iss.cat === "HARD") hasRealBug = true;
+        if (iss.subsystem) subSet[iss.subsystem] = true;
+      });
+
+      if (!st && fb) {
+        st = {
+          repo: fb.repo,
+          num: fb.num,
+          label: fb.label,
+          url: fb.url,
+          title: fb.title,
+          author: "",
+          state: fb.state,
+          is_draft: fb.state === "DRAFT",
+          is_cherry_pick: Boolean(fb.is_cherry_pick),
+          updated_at: fb.updated_at || "",
+          updated_display: (fb.updated_at || "").slice(0, 16).replace("T", " "),
+          waiting_days: 0,
+          blocker_stage: fb.state === "DRAFT" ? "DRAFT_OR_HOLD" : "WAITING_REVIEWER",
+          ball_owner: fb.state === "DRAFT" ? "HOLD" : "REVIEWER",
+          sub_reason: fb.state === "DRAFT" ? "draft" : "zero_review"
+        };
+      }
+      return {
+        key: key,
+        st: st,
+        issues: issues,
+        maxSevRank: maxSevRank,
+        bestDiffRank: bestDiffRank,
+        hasRealBug: hasRealBug,
+        subsystems: Object.keys(subSet)
+      };
+    });
+  }
+
+  rebuildDerivedIndexes();
+
+  function setDatasetAndRender(ds, pendingList) {
+    if (ds) window.REPORT_DATASET = ds;
+    if (Array.isArray(pendingList)) PENDING = pendingList;
+    rebuildDerivedIndexes();
+    renderAll();
+  }
+
+  function switchView(nextView, skipUrl) {
+    activeView = nextView === "prs" ? "prs" : "issues";
+    document.getElementById("viewIssuesSection").hidden = (activeView !== "issues");
+    document.getElementById("viewPrsSection").hidden = (activeView !== "prs");
+    document.getElementById("tabIssuesBtn").classList.toggle("active", activeView === "issues");
+    document.getElementById("tabPrsBtn").classList.toggle("active", activeView === "prs");
+
+    if (!skipUrl) {
+      try {
+        var proto = window.location && window.location.protocol;
+        if (proto === "http:" || proto === "https:") {
+          var u = new URL(window.location.href);
+          if (activeView === "prs") u.searchParams.set("view", "prs");
+          else u.searchParams.delete("view");
+          window.history.replaceState(null, "", u.toString());
+        }
+      } catch (_) {}
+    }
+    renderAll();
+  }
+
+  document.getElementById("tabIssuesBtn").addEventListener("click", function() { switchView("issues"); });
+  document.getElementById("tabPrsBtn").addEventListener("click", function() { switchView("prs"); });
+
+  function getPrShortChipLabel(st) {
+    if (!st) return "";
+    if (st.blocker_stage === "CI_FAILED") {
+      return t("report.prBoard.chipShort.CI_FAILED", { count: (st.failed_checks || []).length || 1 });
+    }
+    if (st.blocker_stage === "WAITING_REVIEWER") {
+      if (st.sub_reason === "zero_review") return t("report.prBoard.chipShort.WAITING_REVIEWER_zero");
+      if (st.sub_reason === "re_review") return t("report.prBoard.chipShort.WAITING_REVIEWER_re");
+    }
+    return t("report.prBoard.chipShort." + st.blocker_stage);
+  }
+
+  function getPrBlockerDetail(st) {
+    if (!st) return "";
+    var sr = st.sub_reason || "";
+    var gates = (st.gate_labels || []).map(function(g) { return g.replace("do-not-merge/", ""); }).join(", ");
+    if (sr === "draft") return t("report.prBoard.detail.draft");
+    if (sr === "hold_label") return t("report.prBoard.detail.hold_label", { gates: gates || "hold" });
+    if (sr === "merge_conflict") return t("report.prBoard.detail.merge_conflict");
+    if (sr === "needs_ok_to_test") return t("report.prBoard.detail.needs_ok_to_test");
+    if (sr === "ci_failed") return t("report.prBoard.detail.ci_failed", { count: (st.failed_checks || []).length || 1 });
+    if (sr === "changes_requested") {
+      return t("report.prBoard.detail.changes_requested", { users: (st.changes_requested_by || []).join(", @") || "reviewer" });
+    }
+    if (sr === "unresolved_thread") {
+      return t("report.prBoard.detail.unresolved_thread", {
+        count: st.unresolved_threads || 1,
+        users: (st.unresolved_by || []).join(", @") || "reviewer"
+      });
+    }
+    if (sr === "gate_label") return t("report.prBoard.detail.gate_label", { gates: gates });
+    if (sr === "needs_second_lgtm") {
+      if (st.lgtm_by && st.lgtm_by.length) {
+        return t("report.prBoard.detail.needs_second_lgtm", { users: st.lgtm_by.join(", @") });
+      }
+      return t("report.prBoard.detail.needs_second_lgtm_anon");
+    }
+    if (sr === "zero_review") return t("report.prBoard.detail.zero_review");
+    if (sr === "re_review") {
+      var revs = (st.reviewed_by && st.reviewed_by.length) ? st.reviewed_by.join(", @") : "reviewer";
+      return t("report.prBoard.detail.re_review", { users: revs });
+    }
+    if (sr === "awaiting_review") {
+      return t("report.prBoard.detail.awaiting_review", { users: (st.reviewed_by || []).join(", @") || "reviewer" });
+    }
+    if (sr === "ci_running") return t("report.prBoard.detail.ci_running", { count: st.running_checks_count || 1 });
+    return t("report.prBoard.detail.merge_queue");
+  }
+
+  function renderSyncAndScopeMeta() {
+    document.getElementById("syncSnapTxt").textContent = META.snapshot_utc8;
+    var prWrap = document.getElementById("prSyncWrap");
+    if (META.pr_snapshot_utc8) {
+      prWrap.hidden = false;
+      document.getElementById("prSyncSnapTxt").textContent = META.pr_snapshot_utc8;
+    } else {
+      prWrap.hidden = true;
+    }
+
+    var wm = document.getElementById("syncWatermarkCode");
+    wm.textContent = META.max_issue_updated_utc8;
+    wm.setAttribute("title", META.max_issue_updated_utc);
+
+    if (!copyFeedbackTimer) {
+      document.getElementById("copySyncBtn").textContent = META.incremental_gh_search_qualifier + " 📋";
+    }
+
+    var permBadge = document.getElementById("permBadge");
+    permBadge.textContent = CAN_TRIAGE ? t("report.rw.modeBadge") : t("report.rw.readonlyBadge");
+    permBadge.classList.toggle("ro", !CAN_TRIAGE);
+
+    var mainlineCnt = PR_ITEMS.filter(function(it) { return !it.st.is_cherry_pick; }).length;
+    document.getElementById("tabIssuesBtn").textContent = t("report.views.issuesTab", { count: SCOPE_COUNTS.all });
+    document.getElementById("tabPrsBtn").textContent = t("report.views.prsTab", { count: mainlineCnt });
+
+    var rwBar = document.getElementById("rwBar");
+    rwBar.hidden = !(CAN_TRIAGE || CAN_SYNC);
+    if (CAN_TRIAGE) {
+      var pBtn = document.getElementById("pendingInboxBtn");
+      pBtn.hidden = false;
+      pBtn.textContent = t("report.rw.pendingBtn", { count: PENDING.length });
+      pBtn.classList.toggle("btn-amber", PENDING.length > 0);
+    }
+    if (CAN_SYNC) {
+      document.getElementById("syncPrsBtn").hidden = false;
+      document.getElementById("syncIssuesBtn").hidden = false;
+    }
+
+    document.getElementById("optScopeAll").textContent = t("report.filters.scope.all", { count: SCOPE_COUNTS.all });
+    document.getElementById("optScopeCan").textContent = t("report.filters.scope.canonical", { count: SCOPE_COUNTS.can });
+    document.getElementById("optScopeCust").textContent = t("report.filters.scope.customer", { count: SCOPE_COUNTS.cust });
+    document.getElementById("optScopeBdr").textContent = t("report.filters.scope.borderline", { count: SCOPE_COUNTS.bdr });
+    document.getElementById("pageSub").textContent = t("report.header.subtitle", {
+      totalAll: SCOPE_COUNTS.all,
+      totalCan: SCOPE_COUNTS.can,
+      totalSup: SCOPE_COUNTS.sup
+    });
+  }
+
+  document.getElementById("copySyncBtn").addEventListener("click", function() {
+    var query = META.incremental_gh_search_qualifier;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(query);
+      }
+    } catch (_) {}
+    var btn = this;
+    btn.textContent = t("report.sync.copied", { query: query });
+    if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
+    copyFeedbackTimer = setTimeout(function() {
+      copyFeedbackTimer = null;
+      btn.textContent = query + " 📋";
+    }, 1800);
+  });
+
+  function getScoped() {
+    var sc = document.getElementById("scopeSel").value;
+    return DATA.filter(function(r) {
+      if (sc === "canonical") return r.is_canonical;
+      if (sc === "customer") return r.is_customer;
+      if (sc === "borderline") return r.is_borderline_kept;
+      return true;
+    });
+  }
+
+  function renderSummaryAndMatrix(scoped) {
+    var total = scoped.length || 1;
+    function cnt(c) { return scoped.filter(function(r) { return r.cat === c; }).length; }
+    var easy = cnt("EASY"), med = cnt("MEDIUM"), hard = cnt("HARD");
+    var realList = scoped.filter(function(r) { return r.cat === "EASY" || r.cat === "MEDIUM" || r.cat === "HARD"; });
+    var real = realList.length;
+    var enh = cnt("ENHANCEMENT");
+    var fuzz = cnt("FILTER_RANDOM_FUZZ"), ai = cnt("FILTER_AI_OBSCURE"), oth = cnt("FILTER_NON_OPT_OR_FIXED");
+    var flt = fuzz + ai + oth;
+
+    var critCnt = realList.filter(function(r) { return r.severity === "CRITICAL"; }).length;
+    var majCnt = realList.filter(function(r) { return r.severity === "MAJOR"; }).length;
+    var openPrReal = realList.filter(function(r) { return r.has_open_pr; }).length;
+    var unclaimedReal = real - openPrReal;
+
+    document.getElementById("kpis").innerHTML =
+      '<div class="kpi"><div class="lbl">' + esc(t("report.kpi.scopedTotal.label")) + '</div><div class="val">' + scoped.length + '</div><div class="hint">' + esc(t("report.kpi.scopedTotal.hint")) + '</div></div>' +
+      '<div class="kpi"><div class="lbl">' + esc(t("report.kpi.realBugs.label")) + '</div><div class="val" style="color:var(--hard-fg)">' + real + '</div><div class="hint">' + esc(t("report.kpi.realBugs.hint", { pct: (real * 100 / total).toFixed(1), easy: easy, med: med, hard: hard })) + '</div></div>' +
+      '<div class="kpi"><div class="lbl">' + esc(t("report.kpi.highSev.label")) + '</div><div class="val" style="color:var(--sev-crit-fg)">' + (critCnt + majCnt) + '</div><div class="hint">' + esc(t("report.kpi.highSev.hint", { crit: critCnt, maj: majCnt })) + '</div></div>' +
+      '<div class="kpi"><div class="lbl">' + esc(t("report.kpi.prCoverage.label")) + '</div><div class="val" style="color:var(--pr-open-fg)">' + openPrReal + ' <span style="font-size:13px;font-weight:500;color:var(--muted)">/ ' + real + '</span></div><div class="hint">' + esc(t("report.kpi.prCoverage.hint", { open: openPrReal, unclaimed: unclaimedReal })) + '</div></div>' +
+      '<div class="kpi"><div class="lbl">' + esc(t("report.kpi.enhAndNoise.label")) + '</div><div class="val" style="color:var(--enh-fg)">' + enh + ' <span style="font-size:13px;font-weight:500;color:var(--muted)">/ ' + flt + '</span></div><div class="hint">' + esc(t("report.kpi.enhAndNoise.hint", { fuzz: fuzz, ai: ai, oth: oth })) + '</div></div>';
+
+    document.getElementById("lg-easy").textContent = easy;
+    document.getElementById("lg-med").textContent = med;
+    document.getElementById("lg-hard").textContent = hard;
+    document.getElementById("lg-enh").textContent = enh;
+    document.getElementById("lg-flt").textContent = flt;
+
+    document.getElementById("funnelBar").innerHTML =
+      '<div class="funnel-seg" style="width:' + (easy * 100 / total) + '%;background:var(--easy-fg)"></div>' +
+      '<div class="funnel-seg" style="width:' + (med * 100 / total) + '%;background:var(--med-fg)"></div>' +
+      '<div class="funnel-seg" style="width:' + (hard * 100 / total) + '%;background:var(--hard-fg)"></div>' +
+      '<div class="funnel-seg" style="width:' + (enh * 100 / total) + '%;background:var(--enh-fg)"></div>' +
+      '<div class="funnel-seg" style="width:' + (flt * 100 / total) + '%;background:var(--flt-fg)"></div>';
+
+    var diffs = [
+      { k: "EASY", lbl: t("report.matrix.rowEasy") },
+      { k: "MEDIUM", lbl: t("report.matrix.rowMed") },
+      { k: "HARD", lbl: t("report.matrix.rowHard") }
+    ];
+    var sevs = ["CRITICAL", "MAJOR", "MODERATE", "MINOR"];
+
+    var mtxHtml = "";
+    for (var di = 0; di < diffs.length; di++) {
+      var d = diffs[di];
+      var rowItems = realList.filter(function(r) { return r.cat === d.k; });
+      var cells = "";
+      for (var si = 0; si < sevs.length; si++) {
+        var s = sevs[si];
+        var cellItems = rowItems.filter(function(r) { return r.severity === s; });
+        var inPr = cellItems.filter(function(r) { return r.has_open_pr; }).length;
+        var wait = cellItems.length - inPr;
+        var isAct = (mtxDiff === d.k && mtxSev === s) ? " active" : "";
+        var isQw = (d.k === "EASY" && (s === "CRITICAL" || s === "MAJOR")) ? " qw" : "";
+        var cellSub = cellItems.length ? esc(t("report.matrix.cellSub", { wait: wait, inPr: inPr })) : "—";
+        cells += '<td class="mcell' + isQw + isAct + '" data-d="' + d.k + '" data-s="' + s + '">' +
+          '<span class="mc-num">' + cellItems.length + '</span>' +
+          '<span class="mc-sub">' + cellSub + '</span>' +
+        '</td>';
+      }
+      var rAct = (mtxDiff === d.k && !mtxSev) ? " active" : "";
+      var rInPr = rowItems.filter(function(r) { return r.has_open_pr; }).length;
+      mtxHtml += '<tr>' +
+        '<th class="row-hdr">' + esc(d.lbl) + '</th>' +
+        cells +
+        '<td class="mcell' + rAct + '" data-d="' + d.k + '" data-s="">' +
+          '<span class="mc-num">' + rowItems.length + '</span>' +
+          '<span class="mc-sub">' + esc(t("report.matrix.unclaimedSub", { wait: rowItems.length - rInPr })) + '</span>' +
+        '</td>' +
+      '</tr>';
+    }
+
+    var colTotals = "";
+    for (var ci = 0; ci < sevs.length; ci++) {
+      var cs = sevs[ci];
+      var cItems = realList.filter(function(r) { return r.severity === cs; });
+      var cInPr = cItems.filter(function(r) { return r.has_open_pr; }).length;
+      var cAct = (!mtxDiff && mtxSev === cs) ? " active" : "";
+      colTotals += '<td class="mcell' + cAct + '" data-d="" data-s="' + cs + '">' +
+        '<span class="mc-num">' + cItems.length + '</span>' +
+        '<span class="mc-sub">' + esc(t("report.matrix.unclaimedSub", { wait: cItems.length - cInPr })) + '</span>' +
+      '</td>';
+    }
+    mtxHtml += '<tr>' +
+      '<th class="row-hdr">' + esc(t("report.matrix.rowTotal")) + '</th>' +
+      colTotals +
+      '<td class="mcell" data-d="RESET" data-s="RESET">' +
+        '<span class="mc-num">' + real + '</span>' +
+        '<span class="mc-sub">' + esc(t("report.matrix.resetSub")) + '</span>' +
+      '</td>' +
+    '</tr>';
+
+    document.getElementById("mtxBody").innerHTML = mtxHtml;
+  }
+
+  function formatPrChip(p) {
+    var key = p.repo + "#" + p.num;
+    var st = (p.state === "OPEN" || p.state === "DRAFT") ? PR_STATUS[key] : null;
+
+    var cls = "pr-open";
+    var stTxt = p.state;
+    var extraTip = "";
+
+    if (p.state === "MERGED") {
+      cls = "pr-merged";
+    } else if (p.state === "CLOSED") {
+      cls = "pr-closed";
+    } else if (st) {
+      cls = STAGE_CHIP_CLS[st.blocker_stage] || "pr-open";
+      var prefix = p.is_cherry_pick ? "CP · " : "";
+      stTxt = prefix + getPrShortChipLabel(st);
+      extraTip = "\n" + getPrBlockerDetail(st);
+    } else if (p.state === "DRAFT") {
+      cls = "pr-draft";
+    } else if (p.is_cherry_pick) {
+      stTxt = "CP-OPEN";
+    }
+
+    var tip = "[" + p.repo + "] " + p.label + " (" + p.state + "): " + p.title + extraTip;
+    var linkHtml = '<a class="pr-chip ' + cls + '" href="' + esc(p.url) + '" target="_blank" rel="noopener" title="' + esc(tip) + '">PR ' + esc(p.label) + ' · ' + esc(stTxt) + '</a>';
+
+    if (p.state === "OPEN" || p.state === "DRAFT") {
+      return '<span class="pr-chip-grp">' + linkHtml +
+        '<button type="button" class="pr-jump-btn" data-jump-pr="' + esc(p.label) + '" data-is-cp="' + (p.is_cherry_pick ? "1" : "0") + '" title="' + esc(t("report.rw.jumpToPr")) + '">↗</button>' +
+      '</span>';
+    }
+    return linkHtml;
+  }
+
+  function getNoteText(r, loc) {
+    if (!r.note) return "";
+    if (typeof r.note === "string") return r.note;
+    return r.note[loc] || r.note.en || r.note["zh-CN"] || "";
+  }
+
+  function issueHasMatchingOpenPr(r, predicate) {
+    for (var i = 0; i < r.prs.length; i++) {
+      var p = r.prs[i];
+      if ((p.state === "OPEN" || p.state === "DRAFT") && !p.is_cherry_pick) {
+        var st = PR_STATUS[p.repo + "#" + p.num];
+        if (st && predicate(st)) return true;
+      }
+    }
+    return false;
+  }
+
+  function renderIssuesView() {
+    var loc = SiteI18n.getLocale();
+    var scoped = getScoped();
+    renderSummaryAndMatrix(scoped);
+
+    var q = document.getElementById("q").value.trim().toLowerCase();
+    var sub = document.getElementById("subSel").value;
+    var sev = document.getElementById("sevSel").value;
+    var prFilter = document.getElementById("prSel").value;
+    var updWin = document.getElementById("updWindowSel").value;
+    var sinceDate = document.getElementById("sinceDate").value;
+    var sortBy = document.getElementById("sortSel").value;
+
+    var badgeEl = document.getElementById("mtxFilterBadge");
+    if (mtxDiff || mtxSev) {
+      var dText = mtxDiff ? t("report.enums.cat." + mtxDiff) : t("report.matrix.allDiff");
+      var sText = mtxSev ? t("report.enums.severity." + mtxSev) : t("report.matrix.allSev");
+      badgeEl.innerHTML = '<span class="mtx-active-tag">' + esc(t("report.matrix.activeBadge", { diff: dText, sev: sText })) + ' <button type="button" id="clrMtxBtn" title="' + esc(t("report.matrix.clearTitle")) + '">×</button></span>';
+      document.getElementById("clrMtxBtn").onclick = function() { mtxDiff = null; mtxSev = null; renderIssuesView(); };
+    } else {
+      badgeEl.innerHTML = "";
+    }
+
+    var rows = scoped.filter(function(r) {
+      var isReal = r.cat === "EASY" || r.cat === "MEDIUM" || r.cat === "HARD";
+      if (mtxDiff || mtxSev) {
+        if (!isReal) return false;
+        if (mtxDiff && r.cat !== mtxDiff) return false;
+        if (mtxSev && r.severity !== mtxSev) return false;
+      } else {
+        if (activeCat === "REAL_ALL" && !isReal) return false;
+        if (activeCat !== "REAL_ALL" && activeCat !== "ALL" && r.cat !== activeCat) return false;
+      }
+
+      if (sub !== "all" && r.subsystem !== sub) return false;
+
+      if (sev === "HIGH_S0_S1" && r.severity !== "CRITICAL" && r.severity !== "MAJOR") return false;
+      if ((sev === "CRITICAL" || sev === "MAJOR" || sev === "MODERATE" || sev === "MINOR") && r.severity !== sev) return false;
+      if (sev === "GH_UNLABELED" && r.gh_severity !== "unlabeled") return false;
+
+      if (prFilter === "open_fix" && !r.has_open_pr) return false;
+      if (prFilter === "ball_reviewer" && !issueHasMatchingOpenPr(r, function(st) { return st.ball_owner === "REVIEWER"; })) return false;
+      if (prFilter === "ball_author" && !issueHasMatchingOpenPr(r, function(st) { return st.ball_owner === "AUTHOR"; })) return false;
+      if (prFilter === "needs_lgtm2" && !issueHasMatchingOpenPr(r, function(st) { return st.blocker_stage === "NEEDS_LGTM2"; })) return false;
+      if (prFilter === "unclaimed" && r.has_open_pr) return false;
+      if (prFilter === "has_any" && !r.has_pr) return false;
+      if (prFilter === "has_merged" && !r.has_merged_pr) return false;
+      if (prFilter === "no_pr" && r.has_pr) return false;
+
+      if (updWin !== "all") {
+        var days = parseInt(updWin, 10);
+        var cutoffMs = SNAPSHOT_MS - days * 86400 * 1000;
+        if (Date.parse(r.updated_at) < cutoffMs) return false;
+      }
+      if (sinceDate) {
+        if (r.updated_display.slice(0, 10) < sinceDate && r.updated_at.slice(0, 10) < sinceDate) return false;
+      }
+
+      if (q) {
+        var prText = r.prs.map(function(p) { return p.label + " " + p.title + " " + p.state; }).join(" ");
+        var noteAll = r.note ? ((r.note["zh-CN"] || "") + " " + (r.note.en || "")) : "";
+        var subAll = t("report.enums.subsystem." + r.subsystem, null, "zh-CN") + " " + t("report.enums.subsystem." + r.subsystem, null, "en");
+        var hay = ("#" + r.number + " " + r.title + " @" + r.author + " " + noteAll + " " + subAll + " " + r.subsystem + " " + r.severity + " " + r.gh_severity + " " + prText).toLowerCase();
+        if (hay.indexOf(q) === -1) return false;
+      }
+      return true;
+    });
+
+    rows.sort(function(a, b) {
+      if (sortBy === "updated_desc") {
+        if (b.updated_at !== a.updated_at) return b.updated_at.localeCompare(a.updated_at);
+        return b.number - a.number;
+      }
+      if (sortBy === "prio_desc") {
+        if (b.sev_rank !== a.sev_rank) return b.sev_rank - a.sev_rank;
+        var da = a.diff_rank || 99, db = b.diff_rank || 99;
+        if (da !== db) return da - db;
+        return b.number - a.number;
+      }
+      if (sortBy === "num_asc") return a.number - b.number;
+      return b.number - a.number;
+    });
+
+    document.getElementById("countTxt").textContent = t("report.status.count", { matched: rows.length, scoped: scoped.length });
+
+    var htmlRows = rows.map(function(r) {
+      var tags = "";
+      if (r.manual_override) tags += '<span class="tag-mini tag-cal">✏️ ' + esc(t("report.rw.editedTag")) + '</span>';
+      if (r.force_keep) tags += '<span class="tag-mini tag-cal">' + esc(t("report.rw.forceKeepTag")) + '</span>';
+      if (r.is_customer) tags += '<span class="tag-mini tag-cust">' + esc(t("report.table.tagCustomer")) + '</span>';
+      if (r.is_borderline_kept) tags += '<span class="tag-mini tag-keep">' + esc(t("report.table.tagBorderline")) + '</span>';
+      if (!r.is_canonical) tags += '<span class="tag-mini">' + esc(t("report.table.tagSupplemental")) + '</span>';
+      var tagWrap = tags ? '<div class="tag-row">' + tags + '</div>' : "";
+
+      var noteStr = getNoteText(r, loc);
+      var noteHtml = noteStr ? '<div class="note-txt">' + esc(noteStr) + '</div>' : "";
+      var prWrap = r.prs.length ? '<div class="pr-row">' + r.prs.map(formatPrChip).join("") + '</div>' : "";
+
+      var sevHtml = "";
+      var ghRawDisp = r.gh_severity === "unlabeled" ? t("report.table.ghUnlabeled") : r.gh_severity;
+      if (r.severity !== "N/A") {
+        var ghDiffers = r.gh_severity.toUpperCase() !== r.severity;
+        var ghNote = ghDiffers ? '<div class="gh-sev-note">' + esc(t("report.table.ghSevNote", { val: ghRawDisp })) + '</div>' : "";
+        sevHtml = '<div><span class="sev-badge ' + (SEV_CLS[r.severity] || "sev-na") + '">' + esc(t("report.enums.severity." + r.severity)) + '</span></div>' + ghNote;
+      } else if (r.gh_severity !== "unlabeled") {
+        sevHtml = '<div class="gh-sev-note">' + esc(t("report.table.ghSevNote", { val: ghRawDisp })) + '</div>';
+      }
+
+      var editBtnHtml = CAN_TRIAGE ? '<div><button type="button" class="row-edit-btn" data-edit-issue="' + r.number + '">✏️ ' + esc(t("report.rw.editBtn")) + '</button></div>' : "";
+      var issUrl = "https://github.com/pingcap/tidb/issues/" + r.number;
+
+      return '<tr>' +
+        '<td><a href="' + issUrl + '" target="_blank" rel="noopener"><b>#' + r.number + '</b></a>' + editBtnHtml + '</td>' +
+        '<td>' +
+          '<span class="badge ' + (BADGE_CLS[r.cat] || "badge-other") + '">' + esc(t("report.enums.cat." + r.cat)) + '</span>' +
+          '<div class="note-txt">' + esc(t("report.enums.diff." + r.cat)) + '</div>' +
+          sevHtml +
+        '</td>' +
+        '<td>' + esc(t("report.enums.subsystem." + r.subsystem)) + '</td>' +
+        '<td>' +
+          '<div><a class="iss-title-link" href="' + issUrl + '" target="_blank" rel="noopener">' + esc(r.title) + '</a></div>' +
+          tagWrap + noteHtml + prWrap +
+        '</td>' +
+        '<td class="meta-cell">' +
+          '<span class="upd-val" title="UTC ISO: ' + esc(r.updated_at) + '">' + esc(t("report.table.updatedPrefix", { time: r.updated_display })) + '</span>' +
+          '<span>' + esc(t("report.table.createdPrefix", { date: r.created })) + '</span><br>' +
+          '<span>@' + esc(r.author) + '</span>' +
+        '</td>' +
+      '</tr>';
+    }).join("");
+
+    document.getElementById("tbody").innerHTML = htmlRows || '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:28px">' + esc(t("report.table.empty")) + '</td></tr>';
+  }
+
+  function renderPrsView() {
+    var mainlineList = PR_ITEMS.filter(function(it) { return !it.st.is_cherry_pick; });
+    var realBugMainlineList = mainlineList.filter(function(it) { return it.hasRealBug; });
+
+    document.getElementById("optPrScopeMainline").textContent = t("report.prBoard.filters.scopeMainline", { count: mainlineList.length });
+    document.getElementById("optPrScopeReal").textContent = t("report.prBoard.filters.scopeRealBugMainline", { count: realBugMainlineList.length });
+    document.getElementById("optPrScopeAll").textContent = t("report.prBoard.filters.scopeAllOpen", { count: PR_ITEMS.length });
+
+    var prScope = document.getElementById("prScopeSel").value;
+    var scoped = PR_ITEMS.filter(function(it) {
+      if (prScope === "mainline") return !it.st.is_cherry_pick;
+      if (prScope === "real_bug_mainline") return !it.st.is_cherry_pick && it.hasRealBug;
+      return true;
+    });
+
+    var cntReviewer = 0, cntAuthor = 0, cntQueue = 0, cntHold = 0;
+    var stageCounts = { ALL: scoped.length };
+    STAGE_ORDER.forEach(function(k) { if (k !== "ALL") stageCounts[k] = 0; });
+
+    scoped.forEach(function(it) {
+      var b = it.st.ball_owner;
+      if (b === "REVIEWER") cntReviewer++;
+      else if (b === "AUTHOR") cntAuthor++;
+      else if (b === "MERGE_QUEUE") cntQueue++;
+      else cntHold++;
+      stageCounts[it.st.blocker_stage] = (stageCounts[it.st.blocker_stage] || 0) + 1;
+    });
+
+    document.getElementById("prSummaryLine").textContent = t("report.prBoard.summaryLine", {
+      reviewer: cntReviewer,
+      author: cntAuthor,
+      queue: cntQueue,
+      hold: cntHold
+    });
+
+    document.getElementById("prStageCards").innerHTML = STAGE_ORDER.map(function(stg) {
+      var act = (activePrStage === stg) ? " active" : "";
+      var valColor = "";
+      if (stg === "CI_FAILED" || stg === "CONFLICT") valColor = " style=\"color:var(--sev-crit-fg)\"";
+      else if (stg === "NEEDS_LGTM2") valColor = " style=\"color:var(--med-fg)\"";
+      else if (stg === "READY_MERGING") valColor = " style=\"color:var(--pr-open-fg)\"";
+      return '<button type="button" class="stage-card' + act + '" data-stage="' + stg + '">' +
+        '<span class="sc-lbl">' + esc(t("report.prBoard.cards." + stg)) + '</span>' +
+        '<span class="sc-val"' + valColor + '>' + (stageCounts[stg] || 0) + '</span>' +
+      '</button>';
+    }).join("");
+
+    var q = document.getElementById("prQ").value.trim().toLowerCase();
+    var ballFilter = document.getElementById("prBallSel").value;
+    var sevFilter = document.getElementById("prSevSel").value;
+    var subFilter = document.getElementById("prSubSel").value;
+    var sortBy = document.getElementById("prSortSel").value;
+
+    var matched = scoped.filter(function(it) {
+      var st = it.st;
+      if (activePrStage !== "ALL" && st.blocker_stage !== activePrStage) return false;
+      if (ballFilter !== "all" && st.ball_owner !== ballFilter) return false;
+
+      if (sevFilter === "HIGH_S0_S1" && it.maxSevRank < 3) return false;
+      if ((sevFilter === "CRITICAL" || sevFilter === "MAJOR" || sevFilter === "MODERATE" || sevFilter === "MINOR")) {
+        var hasSev = it.issues.some(function(iss) { return iss.severity === sevFilter; });
+        if (!hasSev) return false;
+      }
+
+      if (subFilter !== "all" && it.subsystems.indexOf(subFilter) === -1) return false;
+
+      if (q) {
+        var issTxt = it.issues.map(function(iss) { return "#" + iss.number + " " + iss.title; }).join(" ");
+        var failTxt = (st.failed_checks || []).map(function(c) { return c.name; }).join(" ");
+        var revTxt = [].concat(st.lgtm_by || [], st.reviewed_by || [], st.changes_requested_by || [], st.requested_reviewers || [], st.unresolved_by || []).join(" @");
+        var hay = (st.label + " #" + st.num + " " + st.title + " @" + st.author + " " + issTxt + " " + failTxt + " @" + revTxt + " " + (st.gate_labels || []).join(" ")).toLowerCase();
+        if (hay.indexOf(q) === -1) return false;
+      }
+      return true;
+    });
+
+    matched.sort(function(a, b) {
+      if (sortBy === "wait_desc") {
+        if ((b.st.waiting_days || 0) !== (a.st.waiting_days || 0)) return (b.st.waiting_days || 0) - (a.st.waiting_days || 0);
+        return b.st.num - a.st.num;
+      }
+      if (sortBy === "upd_desc") {
+        if ((b.st.updated_at || "") !== (a.st.updated_at || "")) return (b.st.updated_at || "").localeCompare(a.st.updated_at || "");
+        return b.st.num - a.st.num;
+      }
+      if (sortBy === "num_desc") return b.st.num - a.st.num;
+
+      if (b.maxSevRank !== a.maxSevRank) return b.maxSevRank - a.maxSevRank;
+      if (a.bestDiffRank !== b.bestDiffRank) return a.bestDiffRank - b.bestDiffRank;
+      return (b.st.updated_at || "").localeCompare(a.st.updated_at || "");
+    });
+
+    document.getElementById("prCountTxt").textContent = t("report.prBoard.statusCount", { matched: matched.length, scoped: scoped.length });
+
+    var rowsHtml = matched.map(function(it) {
+      var st = it.st;
+      var chipCls = STAGE_CHIP_CLS[st.blocker_stage] || "pr-open";
+      var waitBadge = st.waiting_days > 0 ? t("report.prBoard.waitDays", { days: st.waiting_days }) : t("report.prBoard.waitToday");
+      var cpTag = st.is_cherry_pick ? '<span class="tag-mini">CP</span>' : "";
+      var szTag = st.size_label ? '<span class="tag-mini">' + esc(st.size_label) + '</span>' : "";
+
+      var issuesHtml = it.issues.map(function(iss) {
+        var issUrl = "https://github.com/pingcap/tidb/issues/" + iss.number;
+        var sCls = SEV_CLS[iss.severity] || "sev-na";
+        var sTxt = iss.severity !== "N/A" ? (' · ' + t("report.enums.severity." + iss.severity).split(" ")[0]) : "";
+        return '<div style="margin-bottom:5px;">' +
+          '<span class="pr-chip-grp">' +
+            '<a class="pr-chip ' + sCls + '" href="' + issUrl + '" target="_blank" rel="noopener" title="' + esc(iss.title) + '">#' + iss.number + esc(sTxt) + '</a>' +
+            '<button type="button" class="pr-jump-btn" data-jump-issue="' + iss.number + '" title="' + esc(t("report.rw.jumpToIssue")) + '">🔍</button>' +
+          '</span>' +
+          '<div class="gh-sev-note">' + esc(t("report.enums.cat." + iss.cat)) + '</div>' +
+        '</div>';
+      }).join("");
+      if (!issuesHtml) issuesHtml = '<span style="color:var(--muted)">—</span>';
+
+      var revTags = [];
+      if (st.lgtm_by && st.lgtm_by.length) {
+        revTags.push('<span class="tag-mini tag-cal">✅ ' + esc(t("report.prBoard.revLgtm", { users: "@" + st.lgtm_by.join(", @") })) + '</span>');
+      }
+      if (st.changes_requested_by && st.changes_requested_by.length) {
+        revTags.push('<span class="tag-mini tag-cust">🛠️ ' + esc(t("report.prBoard.revChanges", { users: "@" + st.changes_requested_by.join(", @") })) + '</span>');
+      }
+      if (st.unresolved_threads > 0) {
+        var uUsers = (st.unresolved_by && st.unresolved_by.length) ? "@" + st.unresolved_by.join(", @") : "";
+        revTags.push('<span class="tag-mini tag-keep">💬 ' + esc(t("report.prBoard.revThreads", { count: st.unresolved_threads, users: uUsers })) + '</span>');
+      }
+      if (st.requested_reviewers && st.requested_reviewers.length) {
+        revTags.push('<span class="tag-mini">📩 ' + esc(t("report.prBoard.revRequested", { users: "@" + st.requested_reviewers.join(", @") })) + '</span>');
+      }
+      if (st.running_checks_count > 0) {
+        revTags.push('<span class="tag-mini">⏳ ' + esc(t("report.prBoard.ciRunning", { count: st.running_checks_count })) + '</span>');
+      }
+      (st.gate_labels || []).forEach(function(gl) {
+        revTags.push('<span class="tag-mini">🚧 ' + esc(gl.replace("do-not-merge/", "")) + '</span>');
+      });
+
+      var failHtml = "";
+      if (st.failed_checks && st.failed_checks.length) {
+        var shown = st.failed_checks.slice(0, 4).map(function(fc) {
+          if (fc.url) {
+            return '<a class="ci-fail-chip" href="' + esc(fc.url) + '" target="_blank" rel="noopener">🔴 ' + esc(fc.name) + ' ↗</a>';
+          }
+          return '<span class="ci-fail-chip">🔴 ' + esc(fc.name) + '</span>';
+        });
+        if (st.failed_checks.length > 4) {
+          var restNames = st.failed_checks.slice(4).map(function(fc) { return fc.name; }).join(", ");
+          shown.push('<span class="tag-mini" title="' + esc(restNames) + '">' + esc(t("report.prBoard.ciMore", { count: st.failed_checks.length - 4 })) + '</span>');
+        }
+        failHtml = '<div class="pr-row">' + shown.join("") + '</div>';
+      }
+
+      var commitDisp = st.last_commit_at ? st.last_commit_at.slice(0, 10) : "—";
+      var authorDisp = st.author ? ('@' + esc(st.author)) : "";
+
+      return '<tr>' +
+        '<td>' +
+          '<a href="' + esc(st.url) + '" target="_blank" rel="noopener"><b>' + esc(st.label) + '</b></a>' +
+          '<div class="tag-row">' + szTag + cpTag + '</div>' +
+          '<div class="gh-sev-note">' + authorDisp + '</div>' +
+        '</td>' +
+        '<td>' +
+          '<span class="pr-chip ' + chipCls + '">' + esc(t("report.prBoard.cards." + st.blocker_stage)) + '</span>' +
+          '<div class="note-txt">' + esc(getPrBlockerDetail(st)) + '</div>' +
+          '<div class="tag-row">' +
+            '<span class="tag-mini">' + esc(t("report.prBoard.ballTag." + st.ball_owner)) + '</span>' +
+            '<span class="tag-mini">⏱ ' + esc(waitBadge) + '</span>' +
+          '</div>' +
+        '</td>' +
+        '<td>' + issuesHtml + '</td>' +
+        '<td>' +
+          '<div><a class="iss-title-link" href="' + esc(st.url) + '" target="_blank" rel="noopener">' + esc(st.title) + '</a></div>' +
+          (revTags.length ? '<div class="tag-row">' + revTags.join("") + '</div>' : '') +
+          failHtml +
+        '</td>' +
+        '<td class="meta-cell">' +
+          '<span class="upd-val">' + esc(t("report.table.updatedPrefix", { time: st.updated_display || "—" })) + '</span>' +
+          '<span>' + esc(t("report.prBoard.lastCommit", { date: commitDisp })) + '</span>' +
+        '</td>' +
+      '</tr>';
+    }).join("");
+
+    document.getElementById("prTbody").innerHTML = rowsHtml || '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:28px">' + esc(t("report.prBoard.empty")) + '</td></tr>';
+  }
+
+  function renderAll() {
+    renderSyncAndScopeMeta();
+    if (activeView === "prs") renderPrsView();
+    else renderIssuesView();
+  }
+
+  // Matrix click handler
+  document.getElementById("mtxBody").addEventListener("click", function(e) {
+    var td = e.target.closest(".mcell");
+    if (!td) return;
+    var d = td.dataset.d;
+    var s = td.dataset.s;
+    if (d === "RESET") {
+      mtxDiff = null; mtxSev = null;
+    } else {
+      var nextD = d || null;
+      var nextS = s || null;
+      if (mtxDiff === nextD && mtxSev === nextS) {
+        mtxDiff = null; mtxSev = null;
+      } else {
+        mtxDiff = nextD; mtxSev = nextS;
+      }
+    }
+    renderIssuesView();
+  });
+
+  ["q", "scopeSel", "subSel", "sevSel", "prSel", "updWindowSel", "sinceDate", "sortSel"].forEach(function(id) {
+    var el = document.getElementById(id);
+    el.addEventListener(el.tagName === "INPUT" && el.type === "search" ? "input" : "change", renderIssuesView);
+  });
+
+  ["prQ", "prScopeSel", "prBallSel", "prSevSel", "prSubSel", "prSortSel"].forEach(function(id) {
+    var el = document.getElementById(id);
+    el.addEventListener(el.tagName === "INPUT" && el.type === "search" ? "input" : "change", renderPrsView);
+  });
+
+  document.getElementById("prStageCards").addEventListener("click", function(e) {
+    var btn = e.target.closest(".stage-card");
+    if (!btn) return;
+    var stg = btn.dataset.stage;
+    activePrStage = (activePrStage === stg && stg !== "ALL") ? "ALL" : stg;
+    renderPrsView();
+  });
+
+  document.getElementById("catPills").addEventListener("click", function(e) {
+    var btn = e.target.closest(".pill");
+    if (!btn) return;
+    document.querySelectorAll("#catPills .pill").forEach(function(b) { b.classList.remove("active"); });
+    btn.classList.add("active");
+    activeCat = btn.dataset.cat;
+    mtxDiff = null;
+    mtxSev = null;
+    renderIssuesView();
+  });
+
+  // Cross-view jump handlers & Edit button delegation
+  document.addEventListener("click", function(e) {
+    var jumpPrBtn = e.target.closest("[data-jump-pr]");
+    if (jumpPrBtn) {
+      var prLbl = jumpPrBtn.getAttribute("data-jump-pr");
+      var isCp = jumpPrBtn.getAttribute("data-is-cp") === "1";
+      activePrStage = "ALL";
+      document.getElementById("prBallSel").value = "all";
+      document.getElementById("prSevSel").value = "all";
+      document.getElementById("prSubSel").value = "all";
+      if (isCp) document.getElementById("prScopeSel").value = "all_open";
+      else if (document.getElementById("prScopeSel").value === "real_bug_mainline") document.getElementById("prScopeSel").value = "mainline";
+      document.getElementById("prQ").value = prLbl;
+      switchView("prs");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
+
+    var jumpIssBtn = e.target.closest("[data-jump-issue]");
+    if (jumpIssBtn) {
+      var issNum = jumpIssBtn.getAttribute("data-jump-issue");
+      mtxDiff = null;
+      mtxSev = null;
+      activeCat = "ALL";
+      document.querySelectorAll("#catPills .pill").forEach(function(b) {
+        b.classList.toggle("active", b.dataset.cat === "ALL");
+      });
+      document.getElementById("scopeSel").value = "all";
+      document.getElementById("subSel").value = "all";
+      document.getElementById("sevSel").value = "all";
+      document.getElementById("prSel").value = "all";
+      document.getElementById("q").value = "#" + issNum;
+      switchView("issues");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
+
+    var editBtn = e.target.closest("[data-edit-issue]");
+    if (editBtn && CAN_TRIAGE) {
+      openEditDrawer(parseInt(editBtn.getAttribute("data-edit-issue"), 10));
+    }
+  });
+
+  // ==================== RW WORKBENCH LOGIC ====================
+  function populateSelectOptions(selEl, values, i18nPrefix) {
+    selEl.innerHTML = values.map(function(v) {
+      return '<option value="' + esc(v) + '">' + esc(t(i18nPrefix + v)) + '</option>';
+    }).join("");
+  }
+
+  function openEditDrawer(num) {
+    var rec = DATA.find(function(r) { return r.number === num; });
+    if (!rec) return;
+    editingIssueNum = num;
+
+    document.getElementById("editDrawerTitle").textContent = t("report.rw.drawer.title", { num: num });
+    document.getElementById("editIssueSummary").textContent = "#" + rec.number + " · " + rec.title;
+
+    var enums = window.REPORT_DATASET.enums;
+    populateSelectOptions(document.getElementById("edCat"), enums.categories, "report.enums.cat.");
+    populateSelectOptions(document.getElementById("edSev"), enums.severities, "report.enums.severity.");
+    populateSelectOptions(document.getElementById("edSub"), enums.subsystems, "report.enums.subsystem.");
+
+    document.getElementById("edCat").value = rec.cat;
+    document.getElementById("edSev").value = rec.severity;
+    document.getElementById("edSub").value = rec.subsystem;
+    document.getElementById("edBorderline").checked = Boolean(rec.is_borderline_kept);
+    document.getElementById("edForceKeep").checked = Boolean(rec.force_keep);
+    document.getElementById("edNoteZh").value = (rec.note && rec.note["zh-CN"]) || "";
+    document.getElementById("edNoteEn").value = (rec.note && rec.note.en) || "";
+    document.getElementById("resetOverrideBtn").hidden = !rec.manual_override;
+
+    document.getElementById("editDrawer").hidden = false;
+  }
+
+  function closeEditDrawer() {
+    editingIssueNum = null;
+    document.getElementById("editDrawer").hidden = true;
+  }
+
+  document.getElementById("edCat").addEventListener("change", function() {
+    var c = this.value;
+    var isReal = (c === "EASY" || c === "MEDIUM" || c === "HARD");
+    var sevEl = document.getElementById("edSev");
+    if (!isReal) sevEl.value = "N/A";
+    else if (sevEl.value === "N/A") sevEl.value = "MODERATE";
+  });
+
+  document.getElementById("closeEditDrawerBtn").addEventListener("click", closeEditDrawer);
+  document.getElementById("cancelEditBtn").addEventListener("click", closeEditDrawer);
+  document.getElementById("editDrawer").addEventListener("click", function(e) {
+    if (e.target === this) closeEditDrawer();
+  });
+
+  function apiFetch(subpath, opts) {
+    return fetch(appUrl(subpath), opts).then(function(res) {
+      return res.json().then(function(body) {
+        if (!res.ok) throw new Error((body && body.error) || ("HTTP " + res.status));
+        return body;
+      });
+    });
+  }
+
+  if (CAN_TRIAGE) {
+    document.getElementById("saveOverrideBtn").addEventListener("click", function() {
+      if (!editingIssueNum) return;
+      var num = editingIssueNum;
+      var payload = {
+        cat: document.getElementById("edCat").value,
+        severity: document.getElementById("edSev").value,
+        subsystem: document.getElementById("edSub").value,
+        is_borderline_kept: document.getElementById("edBorderline").checked,
+        force_keep: document.getElementById("edForceKeep").checked,
+        note: {
+          "zh-CN": document.getElementById("edNoteZh").value.trim(),
+          "en": document.getElementById("edNoteEn").value.trim()
+        }
+      };
+      var btn = this;
+      btn.disabled = true;
+      apiFetch("./api/issues/" + num + "/triage", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      }).then(function(resp) {
+        var idx = DATA.findIndex(function(r) { return r.number === num; });
+        if (idx !== -1 && resp.record) DATA[idx] = resp.record;
+        rebuildDerivedIndexes();
+        closeEditDrawer();
+        renderAll();
+        showToast(t("report.rw.toastSaved", { num: num }));
+      }).catch(function(err) {
+        alert(err.message);
+      }).finally(function() {
+        btn.disabled = false;
+      });
+    });
+
+    document.getElementById("resetOverrideBtn").addEventListener("click", function() {
+      if (!editingIssueNum) return;
+      var num = editingIssueNum;
+      var btn = this;
+      btn.disabled = true;
+      apiFetch("./api/issues/" + num + "/triage", { method: "DELETE" })
+        .then(function(resp) {
+          var idx = DATA.findIndex(function(r) { return r.number === num; });
+          if (idx !== -1 && resp.record) DATA[idx] = resp.record;
+          rebuildDerivedIndexes();
+          closeEditDrawer();
+          renderAll();
+          showToast(t("report.rw.toastReset", { num: num }));
+        }).catch(function(err) {
+          alert(err.message);
+        }).finally(function() {
+          btn.disabled = false;
+        });
+    });
+
+    function openInboxDrawer() {
+      renderInboxDrawer();
+      document.getElementById("inboxDrawer").hidden = false;
+    }
+
+    renderInboxDrawer = function() {
+      document.getElementById("inboxDrawerTitle").textContent = t("report.rw.inbox.title", { count: PENDING.length });
+      var body = document.getElementById("inboxBody");
+      if (!PENDING.length) {
+        body.innerHTML = '<div style="color:var(--muted);padding:18px 4px;">' + esc(t("report.rw.inbox.empty")) + '</div>';
+        return;
+      }
+      var enums = window.REPORT_DATASET.enums;
+      body.innerHTML = PENDING.map(function(pc) {
+        var catOpts = enums.categories.map(function(v) {
+          return '<option value="' + esc(v) + '"' + (v === "MEDIUM" ? " selected" : "") + '>' + esc(t("report.enums.cat." + v)) + '</option>';
+        }).join("");
+        var sevOpts = enums.severities.map(function(v) {
+          return '<option value="' + esc(v) + '"' + (v === "MAJOR" ? " selected" : "") + '>' + esc(t("report.enums.severity." + v)) + '</option>';
+        }).join("");
+        var subOpts = enums.subsystems.map(function(v) {
+          return '<option value="' + esc(v) + '">' + esc(t("report.enums.subsystem." + v)) + '</option>';
+        }).join("");
+
+        var cmtsTxt = (pc.recent_comments || []).map(function(c) {
+          return "--- @" + c.author + " (" + (c.created_at || "").slice(0, 16) + ") ---\n" + c.body;
+        }).join("\n\n");
+        var fullPreview = (pc.body || "(empty body)") + (cmtsTxt ? ("\n\n" + cmtsTxt) : "");
+
+        return '<div class="pend-card" data-pend-num="' + pc.number + '">' +
+          '<div><a href="' + esc(pc.url) + '" target="_blank" rel="noopener"><b>#' + pc.number + ' · ' + esc(pc.title) + '</b></a> <span style="color:var(--muted)">@' + esc(pc.author) + '</span></div>' +
+          '<div class="tag-row">' +
+            '<span class="tag-mini tag-keep">' + esc(t("report.rw.inbox.scopesLabel")) + ': ' + esc((pc.matched_scopes || []).join(", ")) + '</span>' +
+            (pc.labels || []).map(function(l) { return '<span class="tag-mini">' + esc(l) + '</span>'; }).join("") +
+          '</div>' +
+          '<details><summary style="cursor:pointer;font-size:12px;color:var(--link)">' + esc(t("report.rw.inbox.bodySummary", { comments: (pc.recent_comments || []).length })) + '</summary>' +
+            '<div class="pend-pre">' + esc(fullPreview) + '</div>' +
+          '</details>' +
+          '<div class="ctrl-row">' +
+            '<select class="p-cat">' + catOpts + '</select>' +
+            '<select class="p-sev">' + sevOpts + '</select>' +
+            '<select class="p-sub">' + subOpts + '</select>' +
+          '</div>' +
+          '<input type="text" class="p-note-zh" placeholder="' + esc(t("report.rw.drawer.notePlaceholderZh")) + '">' +
+          '<input type="text" class="p-note-en" placeholder="' + esc(t("report.rw.drawer.notePlaceholderEn")) + '">' +
+          '<div class="ctrl-row" style="justify-content:space-between;margin-top:4px;">' +
+            '<button type="button" class="btn-sm btn-primary p-accept-btn">' + esc(t("report.rw.inbox.acceptBtn")) + '</button>' +
+            '<div style="display:flex;gap:6px;flex:1;justify-content:flex-end;">' +
+              '<input type="text" class="p-ex-reason" style="flex:1;max-width:230px;" placeholder="' + esc(t("report.rw.inbox.excludeReasonPlaceholder")) + '">' +
+              '<button type="button" class="btn-sm p-exclude-btn">' + esc(t("report.rw.inbox.excludeBtn")) + '</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+      }).join("");
+    };
+
+    document.getElementById("pendingInboxBtn").addEventListener("click", openInboxDrawer);
+    document.getElementById("closeInboxDrawerBtn").addEventListener("click", function() {
+      document.getElementById("inboxDrawer").hidden = true;
+    });
+    document.getElementById("inboxDrawer").addEventListener("click", function(e) {
+      if (e.target === this) this.hidden = true;
+    });
+
+    document.getElementById("inboxBody").addEventListener("click", function(e) {
+      var card = e.target.closest("[data-pend-num]");
+      if (!card) return;
+      var num = parseInt(card.getAttribute("data-pend-num"), 10);
+
+      if (e.target.closest(".p-accept-btn")) {
+        var btn = e.target.closest(".p-accept-btn");
+        btn.disabled = true;
+        apiFetch("./api/pending/" + num + "/resolve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "accept",
+            cat: card.querySelector(".p-cat").value,
+            severity: card.querySelector(".p-sev").value,
+            subsystem: card.querySelector(".p-sub").value,
+            note: {
+              "zh-CN": card.querySelector(".p-note-zh").value.trim(),
+              "en": card.querySelector(".p-note-en").value.trim()
+            }
+          })
+        }).then(function(resp) {
+          setDatasetAndRender(resp.dataset, resp.pending_candidates);
+          renderInboxDrawer();
+          showToast(t("report.rw.toastPendingResolved", { num: num }));
+        }).catch(function(err) {
+          alert(err.message);
+          btn.disabled = false;
+        });
+      } else if (e.target.closest(".p-exclude-btn")) {
+        var exBtn = e.target.closest(".p-exclude-btn");
+        exBtn.disabled = true;
+        apiFetch("./api/pending/" + num + "/resolve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "exclude",
+            exclude_reason: card.querySelector(".p-ex-reason").value.trim()
+          })
+        }).then(function(resp) {
+          setDatasetAndRender(resp.dataset, resp.pending_candidates);
+          renderInboxDrawer();
+          showToast(t("report.rw.toastPendingResolved", { num: num }));
+        }).catch(function(err) {
+          alert(err.message);
+          exBtn.disabled = false;
+        });
+      }
+    });
+  }
+
+  if (CAN_SYNC) {
+    document.getElementById("syncPrsBtn").addEventListener("click", function() {
+      var btn = this;
+      var orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = t("report.rw.syncing");
+      apiFetch("./api/sync/prs", { method: "POST" })
+        .then(function(resp) {
+          setDatasetAndRender(resp.dataset, resp.pending_candidates);
+          showToast(t("report.rw.toastPrSynced", {
+            open: resp.stats.open_count,
+            calls: resp.stats.graphql_calls,
+            ms: resp.stats.duration_ms
+          }));
+        }).catch(function(err) {
+          alert(err.message);
+        }).finally(function() {
+          btn.disabled = false;
+          btn.textContent = orig;
+        });
+    });
+
+    document.getElementById("syncIssuesBtn").addEventListener("click", function() {
+      var btn = this;
+      var orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = t("report.rw.syncing");
+      apiFetch("./api/sync/issues", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      }).then(function(resp) {
+        setDatasetAndRender(resp.dataset, resp.pending_candidates);
+        showToast(t("report.rw.toastIssueSynced", { pending: (resp.pending_candidates || []).length }));
+        if (CAN_TRIAGE && resp.pending_candidates && resp.pending_candidates.length > 0) {
+          renderInboxDrawer();
+          document.getElementById("inboxDrawer").hidden = false;
+        }
+      }).catch(function(err) {
+        alert(err.message);
+      }).finally(function() {
+        btn.disabled = false;
+        btn.textContent = orig;
+      });
+    });
+  }
+
+  document.addEventListener("keydown", function(e) {
+    if (e.key === "Escape") {
+      closeEditDrawer();
+      document.getElementById("inboxDrawer").hidden = true;
+    }
+  });
+
+  SiteI18n.onChange(function() {
+    renderAll();
+    if (!document.getElementById("inboxDrawer").hidden) renderInboxDrawer();
+  });
+  SiteI18n.init();
+  switchView(activeView, true);
+})();
+</script>
+</body>
+</html>
