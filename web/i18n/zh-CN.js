@@ -214,9 +214,9 @@ SiteI18n.extend("zh-CN", {
       },
       "severity": {
         "title": "3. 严重度分级（Severity · 故障影响）",
-        "critHtml": "<b>S0 · Critical 致命</b>：进程 Panic / Crash、<code>ANALYZE</code> 或编译引发实例 OOM、后台核心协程永久退出、长时间阻塞全集群 GC、DML 错删改或串表、悲观事务 <code>FOR UPDATE</code> 静默漏锁、权限校验绕过。",
-        "majHtml": "<b>S1 · Major 严重</b>：只读 <code>SELECT</code> 返回错误结果、合法常见 SQL 报内部错误（如 <code>ERROR 1105</code>、隐式列解析失败）或统计信息元表死锁阻断执行、核心生产场景出现数量级计划退化。",
-        "modHtml": "<b>S2 · Moderate 中等</b>：一般性基数/代价估算偏差（计划次优但结果正确且无雪崩）、Plan Cache / SPM 未命中、Hint 导出回放局部失配或低频 MySQL 兼容性边缘差异。",
+        "critHtml": "<b>S0 · Critical 致命</b>：进程 Panic / Crash、<code>ANALYZE</code> 或编译引发实例 OOM、后台核心协程永久退出、长时间阻塞全集群 GC、DML 错删改或串表、悲观事务 <code>FOR UPDATE</code> 静默漏锁、权限校验绕过，以及常规常见 <code>SELECT</code> 容易触发的错结果。",
+        "majHtml": "<b>S1 · Major 严重</b>：非边角但需特定条件触发的 <code>SELECT</code> 错结果、合法常见 SQL 报内部错误（如 <code>ERROR 1105</code>、隐式列解析失败）或统计信息元表死锁阻断执行、核心生产场景出现数量级计划退化。",
+        "modHtml": "<b>S2 · Moderate 中等</b>：边界保留但较难触发的边角错结果、一般性基数/代价估算偏差（计划次优但结果正确且无雪崩）、Plan Cache / SPM 未命中、Hint 导出回放局部失配或低频 MySQL 兼容性边缘差异。",
         "minHtml": "<b>S3 · Minor 轻微</b>：Hint 告警文案、<code>EXPLAIN</code> / <code>SHOW STATS</code> / 慢日志 / 监控指标显示细节或周边诊断工具微瑕。<i>（若 GitHub 原始 <code>severity/*</code> 标签未标或与研判不一致，行内会附注 <code>GH</code> 原标供对照。）</i>"
       }
     },

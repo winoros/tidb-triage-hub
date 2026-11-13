@@ -608,17 +608,21 @@ func runPending(args []string) {
 	tmplNew := make(map[string]model.TriagePatchRequest, len(pending))
 	suggestedExcludesHint := make(map[string]string)
 	for _, pc := range pending {
-		cat := "MEDIUM"
-		sev := "MAJOR"
-		subsys := "logical_rewrite"
+		cat := "TODO: REVIEW"
+		sev := "TODO: REVIEW"
+		subsys := "TODO: REVIEW"
 		borderline := false
 		if pc.SuggestedTriage != nil {
-			cat = pc.SuggestedTriage.Cat
-			sev = pc.SuggestedTriage.Severity
-			subsys = pc.SuggestedTriage.Subsystem
 			borderline = pc.SuggestedTriage.IsBorderlineKept
 			if pc.SuggestedTriage.RecommendedAction == "exclude" && pc.SuggestedTriage.ExcludeReason != "" {
 				suggestedExcludesHint[strconv.Itoa(pc.Number)] = pc.SuggestedTriage.ExcludeReason
+			}
+			if pc.SuggestedTriage.Confidence != "low" && pc.SuggestedTriage.RecommendedAction != "review_carefully" {
+				cat = pc.SuggestedTriage.Cat
+				sev = pc.SuggestedTriage.Severity
+				subsys = pc.SuggestedTriage.Subsystem
+			} else if pc.SuggestedTriage.Subsystem != "" && (len(pc.SuggestedTriage.Signals) == 0 || pc.SuggestedTriage.Signals[0] != "default:logical_rewrite") {
+				subsys = pc.SuggestedTriage.Subsystem
 			}
 		}
 		tmplNew[strconv.Itoa(pc.Number)] = model.TriagePatchRequest{
@@ -653,7 +657,7 @@ func runPending(args []string) {
 	bundle := map[string]any{
 		"pending_count":  len(pending),
 		"retriage_count": len(retriageList),
-		"instructions":   "Review `pending_candidates` and `retriage_candidates` against `triage_rubric`. Submit decisions via `triage-hub triage --stdin` (supports `new_issues`, `exclude_issues`, `overrides`, `ack_retriage`, `manual_pr_links`, `--skip-todo`, and `--dry-run`). Canonical (`sig/planner` + `type/bug`) issues must NEVER be put in `exclude_issues`.",
+		"instructions":   "Independently judge `pending_candidates` (SQL realism/reachability, PR diff, difficulty, and severity — do NOT blindly accept `decisions_template` pre-fills) and `retriage_candidates` against `triage_rubric` (including `retriage_guide`). Submit decisions via `triage-hub triage --stdin` (supports `new_issues`, `exclude_issues`, `overrides`, `ack_retriage`, `manual_pr_links`, `--skip-todo`, and `--dry-run`). Canonical (`sig/planner` + `type/bug`) issues must NEVER be put in `exclude_issues`.",
 		"valid_enums": map[string]any{
 			"cat":       model.ValidCategories,
 			"severity":  model.ValidSeverities,

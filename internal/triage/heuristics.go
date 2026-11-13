@@ -222,13 +222,13 @@ func SuggestTriage(
 	}
 
 	if hasMergedMainline {
-		signals = append(signals, "mainline_pr_already_merged")
+		signals = append(signals, "mainline_pr_already_merged_verify_backport_or_partial")
 		return &model.SuggestedTriage{
 			RecommendedAction: "review_carefully",
 			Cat:               "FILTER_NON_OPT_OR_FIXED",
 			Severity:          "N/A",
 			Subsystem:         subsys,
-			Confidence:        "medium",
+			Confidence:        "low",
 			Signals:           signals,
 		}
 	}
@@ -272,15 +272,18 @@ func SuggestTriage(
 		}
 	}
 
-	if hasFuzzOrigin && !lbs["report/customer"] && !hasPanicOrOOM && len(mainlineDetails) == 0 {
+	if hasFuzzOrigin && !lbs["report/customer"] && len(mainlineDetails) == 0 {
 		signals = append(signals, "origin:fuzzer_or_sqlancer")
+		if hasPanicOrOOM {
+			signals = append(signals, "has_panic_or_oom_needs_ai_judge")
+		}
 		if isCanonical {
 			return &model.SuggestedTriage{
 				RecommendedAction: "review_carefully",
 				Cat:               "FILTER_RANDOM_FUZZ",
 				Severity:          "N/A",
 				Subsystem:         subsys,
-				Confidence:        "medium",
+				Confidence:        "low",
 				Signals:           signals,
 			}
 		}
@@ -298,6 +301,9 @@ func SuggestTriage(
 	// Real Bug grading: Difficulty (EASY / MEDIUM / HARD)
 	cat := "MEDIUM"
 	confidence := "medium"
+	if subSignal == "default:logical_rewrite" && len(mainlineDetails) == 0 {
+		confidence = "low"
+	}
 	if len(mainlineDetails) > 0 {
 		totalFiles := 0
 		totalChangedLines := 0
@@ -313,8 +319,14 @@ func SuggestTriage(
 			cat = "HARD"
 			confidence = "high"
 		case totalFiles >= 1 && totalFiles <= 2 && totalChangedLines > 0 && totalChangedLines <= 55:
-			cat = "EASY"
-			confidence = "high"
+			if subsys == "cbo_cost_join_reorder" || subsys == "name_resolution_group_by" {
+				cat = "MEDIUM"
+				confidence = "low"
+				signals = append(signals, "small_diff_high_risk_subsystem")
+			} else {
+				cat = "EASY"
+				confidence = "high"
+			}
 		default:
 			cat = "MEDIUM"
 			confidence = "high"
@@ -324,7 +336,7 @@ func SuggestTriage(
 		confidence = "low"
 	}
 
-	// Severity grading
+	// Severity grading (weak prior; AI Judge must verify triggerability independently)
 	sev := "MODERATE"
 	switch {
 	case ghSev == "CRITICAL" || hasPanicOrOOM:
@@ -341,6 +353,9 @@ func SuggestTriage(
 		if hasSevereErr {
 			sev = "MAJOR"
 		}
+	}
+	if hasWrongRes || ghSev != "" {
+		signals = append(signals, "severity_needs_ai_judge:check_triggerability")
 	}
 
 	borderline := (hasFuzzOrigin || hasAuditOrigin) && model.IsRealBugCategory(cat)

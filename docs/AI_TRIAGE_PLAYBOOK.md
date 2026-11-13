@@ -39,3 +39,4 @@ Every tracked issue stores an acknowledged snapshot in `issue_triage_state`. Re-
 Resolve flagged items via:
 - **Keep Current**: Web `Keep Current` button, `POST /api/issues/{number}/retriage/ack`, or CLI `triage --ack-retriage <nums>` / `"ack_retriage": [...]`.
 - **Recalibrate**: Save updated category/severity/subsystem/note in Web Calibration Drawer or CLI `"overrides"`.
+- **Exclude (when no longer canonical)**: If `label_scope_changed` removes `sig/planner` and the issue is non-optimizer, move it to `exclude_issues` (or `triage --exclude <num>`).

@@ -214,9 +214,9 @@ SiteI18n.extend("en", {
       },
       "severity": {
         "title": "3. Assessed Severity (Production Impact)",
-        "critHtml": "<b>S0 · Critical</b>: Server panic/crash, <code>ANALYZE</code> or compile-time OOM, permanent background worker exit, cluster-wide GC blocked &gt;12h, silent DML data corruption, missing pessimistic <code>FOR UPDATE</code> locks, or privilege bypass.",
-        "majHtml": "<b>S1 · Major</b>: Wrong results on read-only <code>SELECT</code>, valid production SQL failing with internal errors (e.g., <code>ERROR 1105</code>, unresolved internal column) or stats-table deadlocks, and order-of-magnitude plan regressions on core workloads.",
-        "modHtml": "<b>S2 · Moderate</b>: General cardinality/cost estimation skew (suboptimal plan without catastrophic regression), Plan Cache / SPM misses, hint export/replay mismatches, or minor MySQL edge compatibility gaps.",
+        "critHtml": "<b>S0 · Critical</b>: Server panic/crash, <code>ANALYZE</code> or compile-time OOM, permanent background worker exit, cluster-wide GC blocked &gt;12h, silent DML data corruption, missing pessimistic <code>FOR UPDATE</code> locks, privilege bypass, or common/easily-hit <code>SELECT</code> wrong results.",
+        "majHtml": "<b>S1 · Major</b>: Realistic non-edge-case <code>SELECT</code> wrong results requiring specific conditions, valid production SQL failing with internal errors (e.g., <code>ERROR 1105</code>, unresolved internal column) or stats-table deadlocks, and order-of-magnitude plan regressions on core workloads.",
+        "modHtml": "<b>S2 · Moderate</b>: Corner-case / hard-to-hit wrong results retained as borderline bugs, general cardinality/cost estimation skew (suboptimal plan without catastrophic regression), Plan Cache / SPM misses, hint export/replay mismatches, or minor MySQL edge compatibility gaps.",
         "minHtml": "<b>S3 · Minor</b>: Hint warning text, <code>EXPLAIN</code> / <code>SHOW STATS</code> / slow-log / metric formatting, or peripheral diagnostic tooling polish. <i>(Where the raw GitHub <code>severity/*</code> label is missing or differs, <code>GH</code> is shown inline for reference.)</i>"
       }
     },

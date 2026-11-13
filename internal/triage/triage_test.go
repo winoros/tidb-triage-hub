@@ -2,6 +2,7 @@ package triage
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -239,11 +240,56 @@ func TestValidateAndPrepareDecisions(t *testing.T) {
 func TestDefaultRubricModes(t *testing.T) {
 	full := DefaultRubric(false)
 	compact := DefaultRubric(true)
-	if len(full.FewShotExamples) != 8 {
-		t.Fatalf("expected 8 few-shot examples in full rubric, got %d", len(full.FewShotExamples))
+	if len(full.FewShotExamples) != 12 {
+		t.Fatalf("expected 12 few-shot examples in full rubric, got %d", len(full.FewShotExamples))
 	}
 	if len(compact.FewShotExamples) != 0 {
 		t.Fatalf("expected 0 few-shot examples in compact rubric, got %d", len(compact.FewShotExamples))
+	}
+	expectedRetriageKeys := []string{
+		model.RetriageNewFixPR,
+		model.RetriageFixPRMergedOpen,
+		model.RetriageCustomerReported,
+		model.RetriageGHSeverityEscalated,
+		model.RetriageLabelScopeChanged,
+		model.RetriageSubstantiveComments,
+	}
+	for _, r := range []Rubric{full, compact} {
+		if len(r.RetriageGuide) != len(expectedRetriageKeys) {
+			t.Fatalf("expected %d retriage guide entries, got %d", len(expectedRetriageKeys), len(r.RetriageGuide))
+		}
+		for _, k := range expectedRetriageKeys {
+			if strings.TrimSpace(r.RetriageGuide[k]) == "" {
+				t.Fatalf("missing retriage guide entry for %q", k)
+			}
+		}
+	}
+	for idx, ex := range full.FewShotExamples {
+		numStr := strconv.Itoa(90000 + idx)
+		switch ex.Action {
+		case "accept":
+			dec := model.BatchTriageDecisions{
+				NewIssues: map[string]model.TriagePatchRequest{
+					numStr: {
+						Cat:              ex.Cat,
+						Severity:         ex.Severity,
+						Subsystem:        ex.Subsystem,
+						IsBorderlineKept: ex.IsBorderlineKept,
+						Note:             ex.Note,
+					},
+				},
+			}
+			_, warns, err := ValidateAndPrepareDecisions(dec, ValidateOptions{StrictNotes: true})
+			if err != nil || len(warns) > 0 {
+				t.Fatalf("few-shot example %q failed validation: err=%v warns=%+v", ex.IssueRef, err, warns)
+			}
+		case "exclude":
+			if strings.TrimSpace(ex.ExcludeReason) == "" {
+				t.Fatalf("few-shot exclude example %q missing ExcludeReason", ex.IssueRef)
+			}
+		default:
+			t.Fatalf("unexpected few-shot action %q on %q", ex.Action, ex.IssueRef)
+		}
 	}
 }
 
@@ -438,5 +484,39 @@ func TestRound2PatchMarshalRoundTripAndCluesClosedPRFilter(t *testing.T) {
 	}, clues)
 	if sug.Subsystem != "logical_rewrite" {
 		t.Fatalf("expected subsystem logical_rewrite from active OPEN PR (ignoring CLOSED statistics PR), got %s", sug.Subsystem)
+	}
+
+	// Fuzz + panic without customer report must still require AI Judge review_carefully (low confidence)
+	fuzzPanicSug := SuggestTriage(
+		"panic in planner",
+		[]string{"sig/planner", "type/bug"},
+		nil,
+		nil,
+		&model.PendingClues{
+			OriginSignals:   []string{"fuzzer_or_sqlancer"},
+			ErrorSignatures: []string{"panic"},
+		},
+	)
+	if fuzzPanicSug.RecommendedAction != "review_carefully" || fuzzPanicSug.Confidence != "low" {
+		t.Fatalf("expected fuzz+panic without PR to require review_carefully (low confidence), got %+v", fuzzPanicSug)
+	}
+
+	// Small CBO diff must not be auto-graded EASY with high confidence
+	smallCboSug := SuggestTriage(
+		"wrong cardinality estimate",
+		[]string{"sig/planner", "type/bug"},
+		[]model.LinkedPRRef{{Repo: "pingcap/tidb", Num: 70003, State: "OPEN"}},
+		[]model.PendingPRDetail{{
+			Repo:             "pingcap/tidb",
+			Num:              70003,
+			State:            "OPEN",
+			NonTestFileCount: 1,
+			NonTestAdditions: 10,
+			NonTestFiles:     []string{"pkg/planner/cardinality/selectivity.go"},
+		}},
+		&model.PendingClues{CodePaths: []string{"pkg/planner/cardinality/selectivity.go"}},
+	)
+	if smallCboSug.Cat == "EASY" || smallCboSug.Confidence != "low" {
+		t.Fatalf("expected small CBO diff not to auto-grade EASY, got %+v", smallCboSug)
 	}
 }

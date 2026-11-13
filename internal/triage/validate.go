@@ -180,8 +180,11 @@ func ValidateAndPrepareDecisions(
 			}
 			return out, nil, fmt.Errorf("issue #%d appears in both `new_issues` (with completed note) and `exclude_issues`; keep only one", num)
 		}
-		if opts.SkipTodo && isTodoNote(patch.Note) {
-			continue
+		if isTodoNote(patch.Note) {
+			if opts.SkipTodo {
+				continue
+			}
+			return out, nil, fmt.Errorf("issue #%d: `note` still contains `TODO:` placeholder (complete the note or pass --skip-todo)", num)
 		}
 
 		patch.Severity = model.NormalizeSeverityForCategory(patch.Cat, patch.Severity, "MAJOR")
@@ -213,8 +216,11 @@ func ValidateAndPrepareDecisions(
 			}
 			return out, nil, fmt.Errorf("issue #%d appears in both `overrides` and `exclude_issues`; remove one", num)
 		}
-		if opts.SkipTodo && isTodoNote(patch.Note) {
-			continue
+		if isTodoNote(patch.Note) {
+			if opts.SkipTodo {
+				continue
+			}
+			return out, nil, fmt.Errorf("issue #%d: `note` still contains `TODO:` placeholder (complete the note or pass --skip-todo)", num)
 		}
 		if _, inNew := out.NewIssues[strconv.Itoa(num)]; inNew {
 			return out, nil, fmt.Errorf("issue #%d appears in both `new_issues` and `overrides`; keep only one", num)

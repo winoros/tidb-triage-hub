@@ -44,7 +44,7 @@ SQLite runs in `WAL` mode (`busy_timeout=15000`), so CLI commands safely run con
 ./bin/triage-hub sync-issues
 
 # 3. Export pending & flagged re-triage bundle (with Rubric, PR file stats & smart suggestions)
-./bin/triage-hub pending --compact
+./bin/triage-hub pending
 
 # 4. Validate (--dry-run) and apply triage decisions via stdin (supports --skip-todo)
 ./bin/triage-hub triage --stdin --dry-run < decisions.json
@@ -54,5 +54,5 @@ SQLite runs in `WAL` mode (`busy_timeout=15000`), so CLI commands safely run con
 ./bin/triage-hub sync-prs --pr 73064,pingcap/tiflash#11155
 ./bin/triage-hub triage --ack-retriage 73063
 ./bin/triage-hub triage --exclude 72985 --reason "Dashboard UI issue"
-./bin/triage-hub pending --backfill-notes 10 --compact
+./bin/triage-hub pending --backfill-notes 10
 ```
