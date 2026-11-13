@@ -1,6 +1,13 @@
 package model
 
-import "fmt"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+)
 
 const SchemaVersion = 2
 
@@ -88,6 +95,28 @@ var ValidBallOwners = []string{
 	BallHold,
 }
 
+const (
+	LinkSourceManual   = "manual"
+	LinkSourcePRRef    = "pr_ref"
+	LinkSourceTimeline = "timeline"
+)
+
+const (
+	RetriageNewFixPR            = "new_fix_pr"
+	RetriageFixPRMergedOpen     = "fix_pr_merged_still_open"
+	RetriageCustomerReported    = "customer_reported"
+	RetriageGHSeverityEscalated = "gh_severity_escalated"
+	RetriageLabelScopeChanged   = "label_scope_changed"
+	RetriageSubstantiveComments = "substantive_new_comments"
+)
+
+type RetriageTrigger struct {
+	Code      string `json:"code"`
+	Summary   string `json:"summary"`
+	Actor     string `json:"actor,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+}
+
 type LocalizedNote struct {
 	ZhCN string `json:"zh-CN"`
 	En   string `json:"en"`
@@ -106,6 +135,7 @@ type LinkedPRRef struct {
 	Title        string `json:"title"`
 	IsCherryPick bool   `json:"is_cherry_pick"`
 	UpdatedAt    string `json:"updated_at"`
+	Source       string `json:"source,omitempty"`
 }
 
 func PRKey(repo string, num int) string {
@@ -138,9 +168,13 @@ type IssueRecord struct {
 	HasAnyOpenPR     bool           `json:"has_any_open_pr"`
 	HasMergedPR      bool           `json:"has_merged_pr"`
 
-	// Workbench metadata
-	ManualOverride bool `json:"manual_override,omitempty"`
-	ForceKeep      bool `json:"force_keep,omitempty"`
+	// Workbench & dynamic re-triage metadata
+	ManualOverride  bool              `json:"manual_override,omitempty"`
+	ForceKeep       bool              `json:"force_keep,omitempty"`
+	NeedsRetriage   bool              `json:"needs_retriage,omitempty"`
+	RetriageReasons []string          `json:"retriage_reasons,omitempty"`
+	RetriageDetails []RetriageTrigger `json:"retriage_details,omitempty"`
+	TriagedAt       string            `json:"triaged_at,omitempty"`
 }
 
 type Viewer struct {
@@ -198,6 +232,43 @@ type PRStatus struct {
 	TrackSources       []string      `json:"track_sources,omitempty"`
 }
 
+type DeltaClosedIssue struct {
+	Number       int    `json:"number"`
+	PrevCat      string `json:"prev_cat"`
+	PrevSeverity string `json:"prev_severity"`
+	ClosedAt     string `json:"closed_at,omitempty"`
+	Reason       string `json:"reason"`
+}
+
+type DeltaGraduatedIssue struct {
+	Number        int      `json:"number"`
+	PrevCat       string   `json:"prev_cat"`
+	Reason        string   `json:"reason"`
+	CurrentLabels []string `json:"-"`
+}
+
+type DeltaAddedIssue struct {
+	Number    int    `json:"number"`
+	Cat       string `json:"cat"`
+	Severity  string `json:"severity"`
+	Subsystem string `json:"subsystem"`
+	Reason    string `json:"reason"`
+}
+
+type SnapshotDelta struct {
+	PrevSnapshotDate          string                `json:"prev_snapshot_date"`
+	ClosedIssuesRemoved       []DeltaClosedIssue    `json:"closed_issues_removed"`
+	RelabeledGraduatedRemoved []DeltaGraduatedIssue `json:"relabeled_graduated_removed"`
+	NewOpenCandidatesAdded    []DeltaAddedIssue     `json:"new_open_candidates_added"`
+}
+
+func (d *SnapshotDelta) HasChanges() bool {
+	if d == nil {
+		return false
+	}
+	return len(d.ClosedIssuesRemoved) > 0 || len(d.RelabeledGraduatedRemoved) > 0 || len(d.NewOpenCandidatesAdded) > 0
+}
+
 type SyncMeta struct {
 	SchemaVersion                int            `json:"schema_version"`
 	SupportedLocales             []string       `json:"supported_locales"`
@@ -213,8 +284,9 @@ type SyncMeta struct {
 	PRSnapshotUTC8               string         `json:"pr_snapshot_utc8,omitempty"`
 	OpenPRCount                  int            `json:"open_pr_count,omitempty"`
 	MainlineOpenPRCount          int            `json:"mainline_open_pr_count,omitempty"`
-	DeltaSincePrevSnapshot       map[string]any `json:"delta_since_prev_snapshot,omitempty"`
+	DeltaSincePrevSnapshot       *SnapshotDelta `json:"delta_since_prev_snapshot,omitempty"`
 	PendingCandidateNums         []int          `json:"pending_candidate_nums,omitempty"`
+	RetriageIssueNums            []int          `json:"retriage_issue_nums,omitempty"`
 	ExcludedIssueNums            []int          `json:"excluded_issue_nums,omitempty"`
 }
 
@@ -239,25 +311,147 @@ type PendingComment struct {
 	Body      string `json:"body"`
 }
 
+type PRFileStat struct {
+	Path      string `json:"path"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+}
+
+type PendingPRDetail struct {
+	Repo              string       `json:"repo"`
+	Num               int          `json:"num"`
+	Title             string       `json:"title"`
+	State             string       `json:"state"`
+	UpdatedAt         string       `json:"updated_at,omitempty"`
+	Author            string       `json:"author,omitempty"`
+	BaseRefName       string       `json:"base_ref_name,omitempty"`
+	IsCherryPick      bool         `json:"is_cherry_pick,omitempty"`
+	Additions         int          `json:"additions"`
+	Deletions         int          `json:"deletions"`
+	ChangedFilesCount int          `json:"changed_files_count"`
+	FilesTruncated    bool         `json:"files_truncated,omitempty"`
+	NonTestFileCount  int          `json:"non_test_file_count"`
+	NonTestAdditions  int          `json:"non_test_additions"`
+	NonTestDeletions  int          `json:"non_test_deletions"`
+	NonTestFiles      []string     `json:"non_test_files,omitempty"`
+	TestFileCount     int          `json:"test_file_count"`
+	ChangedFiles      []PRFileStat `json:"changed_files,omitempty"`
+	BodyExcerpt       string       `json:"body_excerpt,omitempty"`
+}
+
+type PendingClues struct {
+	CodePaths       []string `json:"code_paths,omitempty"`
+	TouchedPackages []string `json:"touched_packages,omitempty"`
+	Functions       []string `json:"functions,omitempty"`
+	ErrorSignatures []string `json:"error_signatures,omitempty"`
+	SQLFeatures     []string `json:"sql_features,omitempty"`
+	OriginSignals   []string `json:"origin_signals,omitempty"`
+}
+
+type SuggestedTriage struct {
+	RecommendedAction string   `json:"recommended_action"` // "accept" | "exclude" | "review_carefully"
+	ExcludeReason     string   `json:"exclude_reason,omitempty"`
+	Cat               string   `json:"cat"`
+	Severity          string   `json:"severity"`
+	Subsystem         string   `json:"subsystem"`
+	IsBorderlineKept  bool     `json:"is_borderline_kept"`
+	Confidence        string   `json:"confidence"` // "high" | "medium" | "low"
+	Signals           []string `json:"signals"`
+}
+
 type PendingCandidate struct {
-	Number         int              `json:"number"`
-	URL            string           `json:"url"`
-	Title          string           `json:"title"`
-	Author         string           `json:"author"`
-	Assignees      []string         `json:"assignees,omitempty"`
-	CreatedAt      string           `json:"created_at"`
-	UpdatedAt      string           `json:"updated_at"`
-	Labels         []string         `json:"labels"`
-	MatchedScopes  []string         `json:"matched_scopes"`
-	PRs            []LinkedPRRef    `json:"prs"`
-	Body           string           `json:"body"`
-	RecentComments []PendingComment `json:"recent_comments"`
+	Number          int               `json:"number"`
+	URL             string            `json:"url"`
+	Title           string            `json:"title"`
+	Author          string            `json:"author"`
+	Assignees       []string          `json:"assignees,omitempty"`
+	CreatedAt       string            `json:"created_at"`
+	UpdatedAt       string            `json:"updated_at"`
+	Labels          []string          `json:"labels"`
+	MatchedScopes   []string          `json:"matched_scopes"`
+	PRs             []LinkedPRRef     `json:"prs"`
+	PRDetails       []PendingPRDetail `json:"pr_details,omitempty"`
+	Clues           *PendingClues     `json:"clues,omitempty"`
+	SuggestedTriage *SuggestedTriage  `json:"suggested_triage,omitempty"`
+	Body            string            `json:"body"`
+	RecentComments  []PendingComment  `json:"recent_comments"`
+}
+
+type RetriageCandidate struct {
+	Number           int               `json:"number"`
+	URL              string            `json:"url"`
+	Title            string            `json:"title"`
+	Author           string            `json:"author"`
+	IsCanonical      bool              `json:"is_canonical"`
+	CurrentCat       string            `json:"current_cat"`
+	CurrentSeverity  string            `json:"current_severity"`
+	CurrentSubsys    string            `json:"current_subsystem"`
+	IsBorderlineKept bool              `json:"is_borderline_kept,omitempty"`
+	ForceKeep        bool              `json:"force_keep,omitempty"`
+	CurrentNote      *LocalizedNote    `json:"current_note,omitempty"`
+	Labels           []string          `json:"labels"`
+	PRs              []LinkedPRRef     `json:"prs"`
+	PRDetails        []PendingPRDetail `json:"pr_details,omitempty"`
+	Clues            *PendingClues     `json:"clues,omitempty"`
+	SuggestedTriage  *SuggestedTriage  `json:"suggested_triage,omitempty"`
+	TriagedAt        string            `json:"triaged_at"`
+	Reasons          []string          `json:"retriage_reasons"`
+	Details          []RetriageTrigger `json:"retriage_details"`
+	Body             string            `json:"body,omitempty"`
+	RecentComments   []PendingComment  `json:"recent_comments,omitempty"`
+}
+
+type ExcludedIssueRecord struct {
+	Number         int      `json:"number"`
+	Title          string   `json:"title,omitempty"`
+	Reason         string   `json:"reason"`
+	ExcludedLabels []string `json:"excluded_labels,omitempty"`
+	Source         string   `json:"source,omitempty"`
+	ExcludedAt     string   `json:"excluded_at"`
+}
+
+// FlexIntList unmarshals JSON arrays containing either integers ([73063]) or issue strings (["73063", "#73064"]).
+type FlexIntList []int
+
+func (f *FlexIntList) UnmarshalJSON(data []byte) error {
+	var raw []json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	out := make([]int, 0, len(raw))
+	for _, elem := range raw {
+		trimmed := bytes.TrimSpace(elem)
+		if len(trimmed) == 0 {
+			return fmt.Errorf("empty issue number element")
+		}
+		if trimmed[0] == '"' {
+			var s string
+			if err := json.Unmarshal(trimmed, &s); err != nil {
+				return fmt.Errorf("invalid issue number %s: %w", string(trimmed), err)
+			}
+			n, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(s), "#"))
+			if err != nil || n <= 0 {
+				return fmt.Errorf("invalid issue number %q", s)
+			}
+			out = append(out, n)
+			continue
+		}
+		n, err := strconv.Atoi(string(trimmed))
+		if err != nil || n <= 0 {
+			return fmt.Errorf("invalid issue number %s", string(trimmed))
+		}
+		out = append(out, n)
+	}
+	*f = out
+	return nil
 }
 
 type BatchTriageDecisions struct {
 	NewIssues     map[string]TriagePatchRequest `json:"new_issues,omitempty"`
 	ExcludeIssues map[string]string             `json:"exclude_issues,omitempty"`
 	Overrides     map[string]TriagePatchRequest `json:"overrides,omitempty"`
+	AckRetriage   FlexIntList                   `json:"ack_retriage,omitempty"`
+	ManualPRLinks map[string][]string           `json:"manual_pr_links,omitempty"`
 }
 
 type TriagePatchRequest struct {
@@ -267,6 +461,144 @@ type TriagePatchRequest struct {
 	IsBorderlineKept bool           `json:"is_borderline_kept"`
 	ForceKeep        bool           `json:"force_keep"`
 	Note             *LocalizedNote `json:"note"`
+
+	unmarshaled       bool `json:"-"`
+	hasBorderlineKept bool `json:"-"`
+	hasForceKeep      bool `json:"-"`
+}
+
+func (r *TriagePatchRequest) UnmarshalJSON(data []byte) error {
+	type alias TriagePatchRequest
+	var aux alias
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*r = TriagePatchRequest(aux)
+	r.unmarshaled = true
+	if raw, ok := fields["is_borderline_kept"]; ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		r.hasBorderlineKept = true
+	}
+	if raw, ok := fields["force_keep"]; ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		r.hasForceKeep = true
+	}
+	return nil
+}
+
+func (r TriagePatchRequest) MarshalJSON() ([]byte, error) {
+	if !r.unmarshaled || (r.hasBorderlineKept && r.hasForceKeep) {
+		type alias TriagePatchRequest
+		return json.Marshal(alias(r))
+	}
+	var bdrPtr *bool
+	if r.hasBorderlineKept {
+		v := r.IsBorderlineKept
+		bdrPtr = &v
+	}
+	var fkPtr *bool
+	if r.hasForceKeep {
+		v := r.ForceKeep
+		fkPtr = &v
+	}
+	return json.Marshal(struct {
+		Cat              string         `json:"cat"`
+		Severity         string         `json:"severity"`
+		Subsystem        string         `json:"subsystem"`
+		IsBorderlineKept *bool          `json:"is_borderline_kept,omitempty"`
+		ForceKeep        *bool          `json:"force_keep,omitempty"`
+		Note             *LocalizedNote `json:"note"`
+	}{
+		Cat:              r.Cat,
+		Severity:         r.Severity,
+		Subsystem:        r.Subsystem,
+		IsBorderlineKept: bdrPtr,
+		ForceKeep:        fkPtr,
+		Note:             r.Note,
+	})
+}
+
+// HasBorderlineField reports whether `is_borderline_kept` was explicitly supplied
+// (true for in-memory Go struct literals, or when present in JSON payload).
+func (r TriagePatchRequest) HasBorderlineField() bool {
+	return !r.unmarshaled || r.hasBorderlineKept
+}
+
+// HasForceKeepField reports whether `force_keep` was explicitly supplied.
+func (r TriagePatchRequest) HasForceKeepField() bool {
+	return !r.unmarshaled || r.hasForceKeep
+}
+
+func parseFlexibleRFC3339(ts string) (time.Time, bool) {
+	s := strings.TrimSpace(ts)
+	if s == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t.UTC(), true
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC(), true
+	}
+	return time.Time{}, false
+}
+
+// CompareRFC3339 compares two ISO8601/RFC3339 timestamps chronologically (handling subseconds and offsets).
+func CompareRFC3339(a, b string) int {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == b {
+		return 0
+	}
+	if a == "" {
+		return -1
+	}
+	if b == "" {
+		return 1
+	}
+	ta, oka := parseFlexibleRFC3339(a)
+	tb, okb := parseFlexibleRFC3339(b)
+	if oka && okb {
+		if ta.Before(tb) {
+			return -1
+		}
+		if ta.After(tb) {
+			return 1
+		}
+		return 0
+	}
+	if a < b {
+		return -1
+	}
+	return 1
+}
+
+// NormalizeRFC3339UTC normalizes a timestamp to canonical UTC RFC3339(Nano) string.
+func NormalizeRFC3339UTC(ts string) string {
+	if t, ok := parseFlexibleRFC3339(ts); ok {
+		if t.Nanosecond() > 0 {
+			return t.Format(time.RFC3339Nano)
+		}
+		return t.Format("2006-01-02T15:04:05Z")
+	}
+	return strings.TrimSpace(ts)
+}
+
+// MaxRFC3339 returns the chronologically latest timestamp among vals, normalized to UTC.
+func MaxRFC3339(vals ...string) string {
+	best := ""
+	for _, v := range vals {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if best == "" || CompareRFC3339(v, best) > 0 {
+			best = NormalizeRFC3339UTC(v)
+		}
+	}
+	return best
 }
 
 type PendingResolveRequest struct {
@@ -278,6 +610,23 @@ type PendingResolveRequest struct {
 	ForceKeep        bool           `json:"force_keep,omitempty"`
 	Note             *LocalizedNote `json:"note,omitempty"`
 	ExcludeReason    string         `json:"exclude_reason,omitempty"`
+}
+
+func IsRealBugCategory(cat string) bool {
+	return cat == "EASY" || cat == "MEDIUM" || cat == "HARD"
+}
+
+func NormalizeSeverityForCategory(cat, sev string, defaultBugSev string) string {
+	if !IsRealBugCategory(cat) {
+		return "N/A"
+	}
+	if sev == "" || sev == "N/A" {
+		if defaultBugSev != "" {
+			return defaultBugSev
+		}
+		return "MODERATE"
+	}
+	return sev
 }
 
 func ValidateTriageFields(cat, sev, subsys string) error {

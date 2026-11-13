@@ -107,6 +107,7 @@ type RawPRInput struct {
 	Title              string
 	URL                string
 	Author             string
+	BaseRefName        string
 	State              string // OPEN, CLOSED, MERGED
 	IsDraft            bool
 	Mergeable          string // MERGEABLE, CONFLICTING, UNKNOWN
@@ -131,11 +132,20 @@ func IsCherryPickTitle(title string, labels []string) bool {
 		return true
 	}
 	for _, lb := range labels {
-		if strings.HasPrefix(lb, "type/cherry-pick") {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(lb)), "type/cherry-pick") {
 			return true
 		}
 	}
 	return false
+}
+
+// IsCherryPickPR unifies cherry-pick / release-branch backport detection across prstatus, issuesync, and triage.
+func IsCherryPickPR(title string, labels []string, baseRefName string) bool {
+	if IsCherryPickTitle(title, labels) {
+		return true
+	}
+	base := strings.ToLower(strings.TrimSpace(baseRefName))
+	return strings.HasPrefix(base, "release-")
 }
 
 func FormatPRLabel(repo string, num int) string {
@@ -174,9 +184,12 @@ func ToUTC8Display(isoUTC string) string {
 	if isoUTC == "" {
 		return ""
 	}
-	t, err := time.Parse(time.RFC3339, isoUTC)
+	t, err := time.Parse(time.RFC3339Nano, isoUTC)
 	if err != nil {
-		return isoUTC
+		t, err = time.Parse(time.RFC3339, isoUTC)
+		if err != nil {
+			return isoUTC
+		}
 	}
 	utc8 := time.FixedZone("UTC+8", 8*3600)
 	return t.In(utc8).Format("2006-01-02 15:04")
@@ -209,7 +222,7 @@ func ClassifyPR(in RawPRInput, now time.Time) model.PRStatus {
 		return strings.ToLower(strings.TrimSpace(login)) != authorLower
 	}
 
-	isCP := IsCherryPickTitle(in.Title, in.Labels)
+	isCP := IsCherryPickPR(in.Title, in.Labels, in.BaseRefName)
 	state := in.State
 	if state == "OPEN" && in.IsDraft {
 		state = "DRAFT"
@@ -249,7 +262,7 @@ func ClassifyPR(in RawPRInput, now time.Time) model.PRStatus {
 		lastReviewerActivityAt   string
 	)
 	bumpReviewerActivity := func(ts string) {
-		if ts != "" && ts > lastReviewerActivityAt {
+		if ts != "" && model.CompareRFC3339(ts, lastReviewerActivityAt) > 0 {
 			lastReviewerActivityAt = ts
 		}
 	}
@@ -265,7 +278,7 @@ func ClassifyPR(in RawPRInput, now time.Time) model.PRStatus {
 			lgtmBy = append(lgtmBy, rv.Author)
 			approvedBy = append(approvedBy, rv.Author)
 		case "CHANGES_REQUESTED":
-			if in.LastCommitAt == "" || rv.SubmittedAt == "" || rv.SubmittedAt >= in.LastCommitAt {
+			if in.LastCommitAt == "" || rv.SubmittedAt == "" || model.CompareRFC3339(rv.SubmittedAt, in.LastCommitAt) >= 0 {
 				activeChangesRequestedBy = append(activeChangesRequestedBy, rv.Author)
 			}
 		}
@@ -308,7 +321,7 @@ func ClassifyPR(in RawPRInput, now time.Time) model.PRStatus {
 			if isHumanReviewer(last.Author) {
 				unresolvedBy = append(unresolvedBy, last.Author)
 				bumpReviewerActivity(last.CreatedAt)
-				if in.LastCommitAt == "" || last.CreatedAt == "" || last.CreatedAt >= in.LastCommitAt {
+				if in.LastCommitAt == "" || last.CreatedAt == "" || model.CompareRFC3339(last.CreatedAt, in.LastCommitAt) >= 0 {
 					hasFreshReviewerThread = true
 				}
 			}
@@ -447,7 +460,7 @@ func ClassifyPR(in RawPRInput, now time.Time) model.PRStatus {
 		ballOwner = model.BallReviewer
 		if len(reviewedBy) == 0 && unresolvedThreads == 0 {
 			subReason = "zero_review"
-		} else if in.LastCommitAt != "" && lastReviewerActivityAt != "" && in.LastCommitAt > lastReviewerActivityAt {
+		} else if in.LastCommitAt != "" && lastReviewerActivityAt != "" && model.CompareRFC3339(in.LastCommitAt, lastReviewerActivityAt) > 0 {
 			subReason = "re_review"
 		} else {
 			subReason = "awaiting_review"
@@ -471,7 +484,7 @@ func ClassifyPR(in RawPRInput, now time.Time) model.PRStatus {
 			waitingSince = in.UpdatedAt
 		}
 	case model.BallReviewer:
-		if in.LastCommitAt != "" && in.LastCommitAt > waitingSince {
+		if in.LastCommitAt != "" && model.CompareRFC3339(in.LastCommitAt, waitingSince) > 0 {
 			waitingSince = in.LastCommitAt
 		}
 	default:
@@ -482,7 +495,9 @@ func ClassifyPR(in RawPRInput, now time.Time) model.PRStatus {
 
 	waitingDays := 0
 	if waitingSince != "" {
-		if wt, err := time.Parse(time.RFC3339, waitingSince); err == nil && now.After(wt) {
+		if wt, err := time.Parse(time.RFC3339Nano, waitingSince); err == nil && now.After(wt) {
+			waitingDays = int(now.Sub(wt).Hours() / 24)
+		} else if wt, err := time.Parse(time.RFC3339, waitingSince); err == nil && now.After(wt) {
 			waitingDays = int(now.Sub(wt).Hours() / 24)
 		}
 	}

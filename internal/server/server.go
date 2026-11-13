@@ -3,11 +3,16 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -117,6 +122,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/dataset.json", s.handleGetDatasetJSON)
 	s.mux.HandleFunc("PATCH /api/issues/{number}/triage", s.handlePatchIssueTriage)
 	s.mux.HandleFunc("DELETE /api/issues/{number}/triage", s.handleDeleteIssueTriage)
+	s.mux.HandleFunc("POST /api/issues/{number}/retriage/ack", s.handleAckIssueRetriage)
+	s.mux.HandleFunc("POST /api/retriage/ack-batch", s.handleAckBatchRetriage)
+	s.mux.HandleFunc("POST /api/issues/{number}/exclude", s.handleExcludeIssue)
+	s.mux.HandleFunc("GET /api/excluded", s.handleGetExcluded)
+	s.mux.HandleFunc("DELETE /api/excluded/{number}", s.handleDeleteExcluded)
 	s.mux.HandleFunc("POST /api/pending/{number}/resolve", s.handleResolvePending)
 	s.mux.HandleFunc("POST /api/sync/prs", s.handleSyncPRs)
 	s.mux.HandleFunc("POST /api/sync/issues", s.handleSyncIssues)
@@ -153,6 +163,13 @@ func (s *Server) buildBootstrapPayloadJS(r *http.Request) (string, error) {
 	return fmt.Sprintf("window.TRIAGE_SESSION = %s;\nwindow.REPORT_DATASET = %s;\nwindow.TRIAGE_PENDING = %s;\n", sessJS, dsJS, pendJS), nil
 }
 
+var reInlineScriptClose = regexp.MustCompile(`(?i)</script`)
+
+func sanitizeInlineScript(js string) string {
+	s := reInlineScriptClose.ReplaceAllString(js, `<\/script`)
+	return strings.ReplaceAll(s, "<!--", `<`+`\!--`)
+}
+
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	idxPath := filepath.Join(s.opts.WebDir, "index.html")
 	raw, err := os.ReadFile(idxPath)
@@ -170,8 +187,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("read %s: %v", name, err), http.StatusInternalServerError)
 			return
 		}
-		safeJS := strings.ReplaceAll(string(b), "</script", "<\\/script")
-		bundle.WriteString(safeJS)
+		bundle.WriteString(sanitizeInlineScript(string(b)))
 		bundle.WriteString("\n")
 	}
 	bootJS, err := s.buildBootstrapPayloadJS(r)
@@ -241,9 +257,81 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// guardMutation enforces CSRF defenses on state-changing HTTP endpoints:
+// 1. Sec-Fetch-Site (if sent by browser) must be "same-origin" or "none".
+// 2. Origin (if sent by browser) must match r.Host.
+// 3. Requests carrying a body or Content-Type header must use "application/json"
+//    (blocking cross-origin HTML form / navigator.sendBeacon simple-request CSRF).
+func guardMutation(w http.ResponseWriter, r *http.Request) bool {
+	if sfs := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); sfs != "" {
+		if !strings.EqualFold(sfs, "same-origin") && !strings.EqualFold(sfs, "none") {
+			writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: cross-site %s request blocked", r.Method))
+			return false
+		}
+	}
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		u, err := url.Parse(origin)
+		if origin == "null" || err != nil || u.Host == "" || !strings.EqualFold(u.Host, r.Host) {
+			writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: cross-origin %s request blocked", r.Method))
+			return false
+		}
+	}
+	rawCT := strings.TrimSpace(r.Header.Get("Content-Type"))
+	if r.ContentLength != 0 || rawCT != "" {
+		mediaType, _, err := mime.ParseMediaType(rawCT)
+		if err != nil || !strings.EqualFold(mediaType, "application/json") {
+			writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: application/json Content-Type required"))
+			return false
+		}
+	}
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	}
+	return true
+}
+
+func decodeOptionalJSON(r *http.Request, dst any) error {
+	if r.Body == nil {
+		return nil
+	}
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	} else if err == nil {
+		return fmt.Errorf("unexpected trailing JSON input")
+	}
+	return nil
+}
+
+func (s *Server) syncMissingOpenPRsBestEffort(ctx context.Context) string {
+	if s.syncer == nil {
+		return ""
+	}
+	missing, err := s.store.ListMissingOpenPRTargets()
+	if err != nil || len(missing) == 0 {
+		return ""
+	}
+	prCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if _, syncErr := s.syncer.SyncSpecificPRs(prCtx, missing, 10); syncErr != nil {
+		return syncErr.Error()
+	}
+	return ""
+}
+
 func (s *Server) handlePatchIssueTriage(w http.ResponseWriter, r *http.Request) {
 	if !s.resolveSession(r).Permissions.CanTriage {
 		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: triage permission required"))
+		return
+	}
+	if !guardMutation(w, r) {
 		return
 	}
 	num, err := strconv.Atoi(r.PathValue("number"))
@@ -261,12 +349,34 @@ func (s *Server) handlePatchIssueTriage(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"record": rec})
+	prSyncWarn := s.syncMissingOpenPRsBestEffort(r.Context())
+	ds, err := s.store.BuildDataset(true)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	for _, r0 := range ds.Records {
+		if r0.Number == num {
+			rec = r0
+			break
+		}
+	}
+	resp := map[string]any{
+		"record":  rec,
+		"dataset": ds,
+	}
+	if prSyncWarn != "" {
+		resp["pr_sync_warning"] = prSyncWarn
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleDeleteIssueTriage(w http.ResponseWriter, r *http.Request) {
 	if !s.resolveSession(r).Permissions.CanTriage {
 		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: triage permission required"))
+		return
+	}
+	if !guardMutation(w, r) {
 		return
 	}
 	num, err := strconv.Atoi(r.PathValue("number"))
@@ -279,12 +389,190 @@ func (s *Server) handleDeleteIssueTriage(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"record": rec})
+	prSyncWarn := s.syncMissingOpenPRsBestEffort(r.Context())
+	ds, err := s.store.BuildDataset(true)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	for _, r0 := range ds.Records {
+		if r0.Number == num {
+			rec = r0
+			break
+		}
+	}
+	resp := map[string]any{
+		"record":  rec,
+		"dataset": ds,
+	}
+	if prSyncWarn != "" {
+		resp["pr_sync_warning"] = prSyncWarn
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleAckIssueRetriage(w http.ResponseWriter, r *http.Request) {
+	sess := s.resolveSession(r)
+	if !sess.Permissions.CanTriage {
+		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: triage permission required"))
+		return
+	}
+	if !guardMutation(w, r) {
+		return
+	}
+	num, err := strconv.Atoi(r.PathValue("number"))
+	if err != nil || num <= 0 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid issue number"))
+		return
+	}
+	if _, err := s.store.AcknowledgeBatchRetriage([]int{num}, sess.Viewer.Login); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	ds, err := s.store.BuildDataset(true)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	var rec model.IssueRecord
+	for _, r0 := range ds.Records {
+		if r0.Number == num {
+			rec = r0
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"record":  rec,
+		"dataset": ds,
+	})
+}
+
+func (s *Server) handleAckBatchRetriage(w http.ResponseWriter, r *http.Request) {
+	sess := s.resolveSession(r)
+	if !sess.Permissions.CanTriage {
+		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: triage permission required"))
+		return
+	}
+	if !guardMutation(w, r) {
+		return
+	}
+	var req struct {
+		Numbers model.FlexIntList `json:"numbers"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if len(req.Numbers) == 0 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("numbers list cannot be empty"))
+		return
+	}
+	acked, err := s.store.AcknowledgeBatchRetriage([]int(req.Numbers), sess.Viewer.Login)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	ds, err := s.store.BuildDataset(true)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"acknowledged": acked,
+		"dataset":      ds,
+	})
+}
+
+func (s *Server) handleExcludeIssue(w http.ResponseWriter, r *http.Request) {
+	if !s.resolveSession(r).Permissions.CanTriage {
+		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: triage permission required"))
+		return
+	}
+	if !guardMutation(w, r) {
+		return
+	}
+	num, err := strconv.Atoi(r.PathValue("number"))
+	if err != nil || num <= 0 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid issue number"))
+		return
+	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if err := decodeOptionalJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.store.ExcludeExistingIssue(num, req.Reason, false); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	ds, err := s.store.BuildDataset(true)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	pending, _ := s.store.ListPendingCandidates()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"dataset":            ds,
+		"pending_candidates": pending,
+	})
+}
+
+func (s *Server) handleGetExcluded(w http.ResponseWriter, r *http.Request) {
+	if !s.resolveSession(r).Permissions.CanTriage {
+		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: triage permission required"))
+		return
+	}
+	items, err := s.store.ListExcludedIssues()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"excluded_issues": items,
+	})
+}
+
+func (s *Server) handleDeleteExcluded(w http.ResponseWriter, r *http.Request) {
+	if !s.resolveSession(r).Permissions.CanTriage {
+		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: triage permission required"))
+		return
+	}
+	if !guardMutation(w, r) {
+		return
+	}
+	num, err := strconv.Atoi(r.PathValue("number"))
+	if err != nil || num <= 0 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid issue number"))
+		return
+	}
+	if err := s.store.RestoreExcludedIssue(num); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	items, err := s.store.ListExcludedIssues()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	ds, err := s.store.BuildDataset(true)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"excluded_issues": items,
+		"dataset":         ds,
+	})
 }
 
 func (s *Server) handleResolvePending(w http.ResponseWriter, r *http.Request) {
 	if !s.resolveSession(r).Permissions.CanTriage {
 		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: triage permission required"))
+		return
+	}
+	if !guardMutation(w, r) {
 		return
 	}
 	num, err := strconv.Atoi(r.PathValue("number"))
@@ -297,10 +585,24 @@ func (s *Server) handleResolvePending(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.store.ResolvePendingCandidate(num, req); err != nil {
+	missingTargets, err := s.store.ResolvePendingCandidateWithTargets(num, req)
+	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+
+	var prSyncWarn string
+	if len(missingTargets) > 0 && s.syncer != nil {
+		prCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		_, syncErr := s.syncer.SyncSpecificPRs(prCtx, missingTargets, 10)
+		cancel()
+		if syncErr != nil {
+			prSyncWarn = syncErr.Error()
+		} else if req.Action == "accept" {
+			_ = s.store.RefreshAcceptedIssueBaselines([]int{num})
+		}
+	}
+
 	ds, err := s.store.BuildDataset(true)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -311,15 +613,26 @@ func (s *Server) handleResolvePending(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"dataset":            ds,
 		"pending_candidates": pending,
-	})
+	}
+	if prSyncWarn != "" {
+		resp["pr_sync_warning"] = prSyncWarn
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleSyncPRs(w http.ResponseWriter, r *http.Request) {
 	if !s.resolveSession(r).Permissions.CanSync {
 		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: sync permission required"))
+		return
+	}
+	if !guardMutation(w, r) {
+		return
+	}
+	if s.syncer == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("syncer is not configured"))
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
@@ -348,13 +661,23 @@ func (s *Server) handleSyncIssues(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: sync permission required"))
 		return
 	}
+	if !guardMutation(w, r) {
+		return
+	}
+	if s.syncer == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("syncer is not configured"))
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
 	var body struct {
 		Full bool `json:"full"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := decodeOptionalJSON(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
 
 	res, err := s.syncer.SyncIssuesDualStream(ctx, body.Full)
 	if err != nil {

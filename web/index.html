@@ -798,6 +798,9 @@
   .tag-keep { border-color: var(--enh-bd); color: var(--enh-fg); background: var(--enh-bg); font-weight: 600; }
   .tag-cal { border-color: var(--easy-bd); color: var(--easy-fg); background: var(--easy-bg); font-weight: 600; }
   .tag-repo { border-color: var(--pr-merged-bd); color: var(--pr-merged-fg); background: var(--pr-merged-bg); font-weight: 600; }
+  .tag-retriage { border-color: var(--med-bd); color: var(--med-fg); background: var(--med-bg); font-weight: 600; }
+  .pill.pill-retriage:not(.active) { border-color: var(--med-bd); color: var(--med-fg); background: var(--med-bg); font-weight: 600; }
+  .pill.pill-retriage:not(.active) .p-cnt { color: var(--med-fg); }
   .tag-wait-warn { border-color: var(--med-bd); color: var(--med-fg); background: var(--med-bg); font-weight: 600; }
   .tag-wait-crit { border-color: var(--sev-crit-bd); color: var(--sev-crit-fg); background: var(--sev-crit-bg); font-weight: 600; }
 
@@ -932,6 +935,54 @@
     background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 6px;
     padding: 9px; font-size: 12px; margin-top: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
+  .sug-banner {
+    background: var(--bg-elevated); border: 1px dashed var(--enh-bd); border-radius: 6px;
+    padding: 7px 10px; font-size: 11.5px; color: var(--text-secondary);
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .retriage-banner {
+    background: var(--med-bg); border: 1px solid var(--med-bd); border-radius: 8px;
+    padding: 11px 13px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .retriage-banner-hdr {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+    font-size: 12.5px; font-weight: 700; color: var(--med-fg);
+  }
+  .retriage-list {
+    margin: 0; padding-left: 16px; font-size: 12px; color: var(--text-secondary);
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .exclude-zone {
+    margin-top: 4px; border: 1px dashed var(--hard-bd); border-radius: 8px;
+    padding: 9px 12px; background: var(--surface-subtle);
+  }
+  .exclude-zone summary {
+    cursor: pointer; font-size: 12px; font-weight: 600; color: var(--hard-fg);
+    user-select: none;
+  }
+  .exclude-canonical-note {
+    margin-top: 4px; padding: 8px 11px; border-radius: 6px;
+    border: 1px dashed var(--border); background: var(--surface-subtle);
+    font-size: 11.5px; color: var(--muted);
+  }
+  .inbox-tabs {
+    display: flex; align-items: center; gap: 4px; padding: 8px 18px;
+    border-bottom: 1px solid var(--border); background: var(--bg-elevated);
+  }
+  .inbox-tab {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    height: 30px; padding: 0 12px; border-radius: 6px;
+    border: 1px solid transparent; background: transparent; color: var(--muted);
+    font-size: 12.5px; font-weight: 600; cursor: pointer; white-space: nowrap;
+    font-variant-numeric: tabular-nums; transition: all 0.12s ease;
+  }
+  .inbox-tab:hover { color: var(--text); background: var(--surface); }
+  .inbox-tab.active {
+    background: var(--enh-bg); color: var(--enh-fg); border-color: var(--enh-bd);
+  }
+  .inbox-toolbar {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+  }
 
   .toast-box {
     position: fixed; bottom: 20px; right: 20px; z-index: 130;
@@ -983,6 +1034,7 @@
     .pill[data-cat="FILTER_RANDOM_FUZZ"] { min-width: 116px; }
     .pill[data-cat="FILTER_AI_OBSCURE"] { min-width: 124px; }
     .pill[data-cat="FILTER_NON_OPT_OR_FIXED"] { min-width: 146px; }
+    .pill[data-cat="RETRIAGE"] { min-width: 96px; }
     .pill[data-cat="ALL"] { min-width: 60px; }
 
     .sub-chip { white-space: nowrap; }
@@ -1212,6 +1264,7 @@
           <option value="canonical" id="optScopeCan"></option>
           <option value="customer" id="optScopeCust"></option>
           <option value="borderline" id="optScopeBdr"></option>
+          <option value="retriage" id="optScopeRetriage"></option>
         </select>
         <select id="subSel" data-i18n-aria-label="report.filters.subAria">
           <option value="all" data-i18n="report.filters.subAll"></option>
@@ -1413,6 +1466,7 @@
       </div>
     </div>
     <div class="drawer-body">
+      <div class="retriage-banner" id="editRetriageBanner" hidden></div>
       <div class="drawer-meta-card" id="editIssueMetaCard"></div>
 
       <div id="editFormWrap" style="display:flex;flex-direction:column;gap:12px;">
@@ -1457,6 +1511,18 @@
           <label for="edNoteEn" data-i18n="report.rw.drawer.noteEnLabel"></label>
           <textarea id="edNoteEn" data-i18n-placeholder="report.rw.drawer.notePlaceholderEn"></textarea>
         </div>
+
+        <details class="exclude-zone" id="editExcludeZone" hidden>
+          <summary data-i18n="report.rw.drawer.excludeSummary"></summary>
+          <div style="margin-top:8px;display:flex;flex-direction:column;gap:8px;">
+            <div style="font-size:11.5px;color:var(--muted);line-height:1.45;" data-i18n="report.rw.drawer.excludeHint"></div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+              <input type="text" id="edExcludeReason" style="flex:1;min-width:200px;" data-i18n-placeholder="report.rw.drawer.excludeReasonPlaceholder">
+              <button type="button" class="btn btn-danger-ghost" id="edExcludeConfirmBtn" data-i18n="report.rw.drawer.excludeConfirmBtn"></button>
+            </div>
+          </div>
+        </details>
+        <div class="exclude-canonical-note" id="editCanonicalNote" data-i18n="report.rw.drawer.excludeCanonicalDisabled" hidden></div>
       </div>
     </div>
     <div class="drawer-ftr" id="editDrawerFtr">
@@ -1470,14 +1536,19 @@
   </div>
 </div>
 
-<!-- Slide-over Drawer: Pending Candidate Inbox -->
+<!-- Slide-over Drawer: Triage & Review Inbox -->
 <div class="drawer-backdrop" id="inboxDrawer" hidden>
-  <div class="drawer-panel" role="dialog" aria-modal="true" style="width:640px;">
+  <div class="drawer-panel" role="dialog" aria-modal="true" style="width:660px;">
     <div class="drawer-hdr">
-      <h2 id="inboxDrawerTitle"></h2>
+      <h2 id="inboxDrawerTitle" data-i18n="report.rw.inbox.title"></h2>
       <button type="button" class="btn btn-icon" id="closeInboxDrawerBtn" data-i18n-title="report.rw.drawer.close">
         <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
       </button>
+    </div>
+    <div class="inbox-tabs" id="inboxTabsBar" role="tablist">
+      <button type="button" class="inbox-tab active" data-inbox-tab="pending" id="inboxTabPendingBtn"></button>
+      <button type="button" class="inbox-tab" data-inbox-tab="retriage" id="inboxTabRetriageBtn"></button>
+      <button type="button" class="inbox-tab" data-inbox-tab="excluded" id="inboxTabExcludedBtn"></button>
     </div>
     <div class="drawer-body" id="inboxBody"></div>
   </div>
@@ -1511,6 +1582,12 @@
 
   var esc = SiteI18n.escHtml;
   var t = SiteI18n.t;
+
+  function safeHref(rawUrl) {
+    var s = String(rawUrl || "").trim();
+    if (/^https?:\/\//i.test(s)) return esc(s);
+    return "#";
+  }
 
   var ICONS = {
     sun: '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>',
@@ -1620,8 +1697,32 @@
     }
   } catch (_) {}
 
-  var SCOPE_COUNTS = { all: 0, can: 0, cust: 0, bdr: 0, sup: 0 };
+  var SCOPE_COUNTS = { all: 0, can: 0, cust: 0, bdr: 0, sup: 0, retriage: 0, excluded: 0 };
   var PR_ITEMS = [];
+  var PR_BOARD_KEYS = {};
+  var RETRIAGE_LIST = [];
+  var activeInboxTab = "pending";
+  var inboxTabInitialized = false;
+  var EXCLUDED_ITEMS = null;
+  var excludedLoading = false;
+  var excludedQuery = "";
+  var pendingDrafts = {};
+
+  function formatRetriageReason(code) {
+    var key = "report.rw.retriageReasons." + code;
+    var val = t(key);
+    return (!val || val === key) ? code : val;
+  }
+
+  function hasCanonicalLabels(labels) {
+    var hasPlanner = false, hasBug = false;
+    (labels || []).forEach(function(l) {
+      var low = String(l || "").toLowerCase();
+      if (low === "sig/planner") hasPlanner = true;
+      if (low === "type/bug") hasBug = true;
+    });
+    return hasPlanner && hasBug;
+  }
 
   function showToast(msg, kind) {
     var box = document.getElementById("toastBox");
@@ -1663,6 +1764,11 @@
     SCOPE_COUNTS.cust = DATA.filter(function(r) { return r.is_customer; }).length;
     SCOPE_COUNTS.bdr = DATA.filter(function(r) { return r.is_borderline_kept; }).length;
     SCOPE_COUNTS.sup = SCOPE_COUNTS.all - SCOPE_COUNTS.can;
+    RETRIAGE_LIST = DATA.filter(function(r) { return Boolean(r.needs_retriage); });
+    SCOPE_COUNTS.retriage = RETRIAGE_LIST.length;
+    SCOPE_COUNTS.excluded = Array.isArray(EXCLUDED_ITEMS)
+      ? EXCLUDED_ITEMS.length
+      : ((META.excluded_issue_nums || []).length);
 
     var linkedIssuesMap = {};
     var fallbackRefMap = {};
@@ -1678,12 +1784,33 @@
       }
     }
 
+    function isOnlyLinkedToFilteredFixedOrNonOpt(key, st) {
+      var linked = linkedIssuesMap[key] || [];
+      if (!linked.length) return false;
+      var allFiltered = linked.every(function(iss) {
+        return iss.cat === "FILTER_NON_OPT_OR_FIXED";
+      });
+      if (!allFiltered) return false;
+      if (st && Array.isArray(st.track_sources)) {
+        var hasDirectTrack = st.track_sources.some(function(src) {
+          return src && src !== "issue_linked";
+        });
+        if (hasDirectTrack) return false;
+      }
+      return true;
+    }
+
     var allKeys = {};
-    Object.keys(fallbackRefMap).forEach(function(k) { allKeys[k] = true; });
+    Object.keys(fallbackRefMap).forEach(function(k) {
+      if (!isOnlyLinkedToFilteredFixedOrNonOpt(k, PR_STATUS[k])) allKeys[k] = true;
+    });
     Object.keys(PR_STATUS).forEach(function(k) {
       var st = PR_STATUS[k];
-      if (st && (st.state === "OPEN" || st.state === "DRAFT")) allKeys[k] = true;
+      if (st && (st.state === "OPEN" || st.state === "DRAFT") && !isOnlyLinkedToFilteredFixedOrNonOpt(k, st)) {
+        allKeys[k] = true;
+      }
     });
+    PR_BOARD_KEYS = allKeys;
 
     PR_ITEMS = Object.keys(allKeys).map(function(key) {
       var st = PR_STATUS[key];
@@ -1774,6 +1901,18 @@
     return t("report.prBoard.detail.merge_queue");
   }
 
+  function setSelectIfValid(id, val) {
+    if (!val) return;
+    var el = document.getElementById(id);
+    if (!el || !el.options) return;
+    for (var i = 0; i < el.options.length; i++) {
+      if (el.options[i].value === val) {
+        el.value = val;
+        return;
+      }
+    }
+  }
+
   function initStateFromUrl() {
     try {
       var sp = new URLSearchParams(window.location.search || "");
@@ -1781,27 +1920,30 @@
       if (sp.get("cat")) activeCat = sp.get("cat");
       if (sp.get("mdiff")) mtxDiff = sp.get("mdiff");
       if (sp.get("msev")) mtxSev = sp.get("msev");
-      if (sp.get("scope")) document.getElementById("scopeSel").value = sp.get("scope");
-      if (sp.get("sub")) document.getElementById("subSel").value = sp.get("sub");
-      if (sp.get("sev")) document.getElementById("sevSel").value = sp.get("sev");
-      if (sp.get("pr")) document.getElementById("prSel").value = sp.get("pr");
-      if (sp.get("ass")) document.getElementById("assSel").value = sp.get("ass");
-      if (sp.get("win")) document.getElementById("updWindowSel").value = sp.get("win");
+      setSelectIfValid("scopeSel", sp.get("scope"));
+      if (document.getElementById("scopeSel").value === "retriage" && !sp.get("cat")) {
+        activeCat = "ALL";
+      }
+      setSelectIfValid("subSel", sp.get("sub"));
+      setSelectIfValid("sevSel", sp.get("sev"));
+      setSelectIfValid("prSel", sp.get("pr"));
+      setSelectIfValid("assSel", sp.get("ass"));
+      setSelectIfValid("updWindowSel", sp.get("win"));
       if (sp.get("since")) {
         document.getElementById("sinceDate").value = sp.get("since");
         if (document.getElementById("updWindowSel").value === "all") {
           document.getElementById("updWindowSel").value = "custom";
         }
       }
-      if (sp.get("sort")) document.getElementById("sortSel").value = sp.get("sort");
+      setSelectIfValid("sortSel", sp.get("sort"));
       if (sp.get("q")) document.getElementById("q").value = sp.get("q");
 
       if (sp.get("stage")) activePrStage = sp.get("stage");
-      if (sp.get("pscope")) document.getElementById("prScopeSel").value = sp.get("pscope");
-      if (sp.get("ball")) document.getElementById("prBallSel").value = sp.get("ball");
-      if (sp.get("psev")) document.getElementById("prSevSel").value = sp.get("psev");
-      if (sp.get("psub")) document.getElementById("prSubSel").value = sp.get("psub");
-      if (sp.get("psort")) document.getElementById("prSortSel").value = sp.get("psort");
+      setSelectIfValid("prScopeSel", sp.get("pscope"));
+      setSelectIfValid("prBallSel", sp.get("ball"));
+      setSelectIfValid("prSevSel", sp.get("psev"));
+      setSelectIfValid("prSubSel", sp.get("psub"));
+      setSelectIfValid("prSortSel", sp.get("psort"));
       if (sp.get("pq")) document.getElementById("prQ").value = sp.get("pq");
     } catch (_) {}
   }
@@ -1865,12 +2007,12 @@
 
     var delta = META.delta_since_prev_snapshot || {};
     var addedList = delta.new_open_candidates_added || [];
-    var closedList = delta.closed_issues_removed || [];
+    var removedList = (delta.closed_issues_removed || []).concat(delta.relabeled_graduated_removed || []);
     var deltaWrap = document.getElementById("deltaPopWrap");
-    if (addedList.length || closedList.length) {
+    if (addedList.length || removedList.length) {
       deltaWrap.hidden = false;
       document.getElementById("deltaTriggerBtn").textContent = t("report.sync.deltaBadge", {
-        added: addedList.length, closed: closedList.length
+        added: addedList.length, closed: removedList.length
       });
       var dHtml = "";
       if (addedList.length) {
@@ -1879,9 +2021,9 @@
             return '<li><a href="https://github.com/pingcap/tidb/issues/' + a.number + '" target="_blank" rel="noopener"><b>#' + a.number + '</b></a> · <span class="badge ' + (BADGE_CLS[a.cat] || "badge-other") + '">' + esc(a.cat) + '</span> ' + fmtInlineCode(a.reason || "") + '</li>';
           }).join("") + '</ul></div>';
       }
-      if (closedList.length) {
-        dHtml += '<div class="delta-sec"><h4>' + esc(t("report.sync.deltaClosed", { count: closedList.length })) + '</h4><ul class="delta-list">' +
-          closedList.map(function(c) {
+      if (removedList.length) {
+        dHtml += '<div class="delta-sec"><h4>' + esc(t("report.sync.deltaClosed", { count: removedList.length })) + '</h4><ul class="delta-list">' +
+          removedList.map(function(c) {
             return '<li><a href="https://github.com/pingcap/tidb/issues/' + c.number + '" target="_blank" rel="noopener"><b>#' + c.number + '</b></a> · <span style="color:var(--muted)">' + esc(c.prev_cat || "") + ' / ' + esc(c.reason || "Closed") + '</span></li>';
           }).join("") + '</ul></div>';
       }
@@ -1900,17 +2042,19 @@
 
     var rwBar = document.getElementById("rwBar");
     var pBtn = document.getElementById("pendingInboxBtn");
-    var hasPending = CAN_TRIAGE && PENDING.length > 0;
-    rwBar.hidden = !hasPending;
-    pBtn.hidden = !hasPending;
-    if (hasPending) {
-      document.getElementById("pendingCntBadge").textContent = PENDING.length;
+    var actionCnt = PENDING.length + RETRIAGE_LIST.length;
+    rwBar.hidden = !CAN_TRIAGE;
+    pBtn.hidden = !CAN_TRIAGE;
+    if (CAN_TRIAGE) {
+      document.getElementById("pendingCntBadge").textContent = actionCnt;
+      pBtn.classList.toggle("btn-amber", actionCnt > 0);
     }
 
     document.getElementById("optScopeAll").textContent = t("report.filters.scope.all", { count: SCOPE_COUNTS.all });
     document.getElementById("optScopeCan").textContent = t("report.filters.scope.canonical", { count: SCOPE_COUNTS.can });
     document.getElementById("optScopeCust").textContent = t("report.filters.scope.customer", { count: SCOPE_COUNTS.cust });
     document.getElementById("optScopeBdr").textContent = t("report.filters.scope.borderline", { count: SCOPE_COUNTS.bdr });
+    document.getElementById("optScopeRetriage").textContent = t("report.filters.scope.retriage", { count: SCOPE_COUNTS.retriage });
     document.getElementById("pageSub").textContent = t("report.header.subtitle", {
       totalAll: SCOPE_COUNTS.all,
       totalCan: SCOPE_COUNTS.can,
@@ -1927,6 +2071,7 @@
       if (sc === "canonical") return r.is_canonical;
       if (sc === "customer") return r.is_customer;
       if (sc === "borderline") return r.is_borderline_kept;
+      if (sc === "retriage") return Boolean(r.needs_retriage);
       return true;
     });
   }
@@ -1974,6 +2119,7 @@
       '<div class="funnel-seg" data-lg-cat="ENHANCEMENT" title="Enhancement: ' + enh + '" style="width:' + (enh * 100 / total) + '%;background:var(--enh-fg)"></div>' +
       '<div class="funnel-seg" data-lg-cat="FILTER_RANDOM_FUZZ" title="Filtered: ' + flt + '" style="width:' + (flt * 100 / total) + '%;background:var(--flt-fg)"></div>';
 
+    var retriageScopedCnt = scoped.filter(function(r) { return Boolean(r.needs_retriage); }).length;
     var pillDefs = [
       { k: "REAL_ALL", c: real },
       { k: "EASY", c: easy },
@@ -1983,15 +2129,21 @@
       { k: "ENHANCEMENT", c: enh },
       { k: "FILTER_RANDOM_FUZZ", c: fuzz },
       { k: "FILTER_AI_OBSCURE", c: ai },
-      { k: "FILTER_NON_OPT_OR_FIXED", c: oth },
-      { sep: true },
-      { k: "ALL", c: scoped.length }
+      { k: "FILTER_NON_OPT_OR_FIXED", c: oth }
     ];
+    if (retriageScopedCnt > 0 || activeCat === "RETRIAGE") {
+      pillDefs.push({ sep: true });
+      pillDefs.push({ k: "RETRIAGE", c: retriageScopedCnt, cls: " pill-retriage" });
+    }
+    pillDefs.push({ sep: true });
+    pillDefs.push({ k: "ALL", c: scoped.length });
+
     var effCat = (mtxDiff || mtxSev) ? (mtxDiff && !mtxSev ? mtxDiff : "__MTX__") : activeCat;
     document.getElementById("catPills").innerHTML = pillDefs.map(function(pd) {
       if (pd.sep) return '<span class="pill-sep" aria-hidden="true"></span>';
       var actCls = (effCat === pd.k) ? " active" : "";
-      return '<button type="button" class="pill' + actCls + '" data-cat="' + pd.k + '">' +
+      var extraCls = pd.cls || "";
+      return '<button type="button" class="pill' + extraCls + actCls + '" data-cat="' + pd.k + '">' +
         '<span>' + esc(t("report.pills." + pd.k)) + '</span>' +
         '<span class="p-cnt">' + pd.c + '</span>' +
       '</button>';
@@ -2085,9 +2237,9 @@
     }
 
     var tip = "[" + p.repo + "] " + p.label + " (" + p.state + "): " + p.title + extraTip;
-    var linkHtml = '<a class="pr-chip ' + cls + '" href="' + esc(p.url) + '" target="_blank" rel="noopener" title="' + esc(tip) + '">' + iconSvg + '<span>' + esc(p.label) + ' · ' + esc(stTxt) + '</span></a>';
+    var linkHtml = '<a class="pr-chip ' + cls + '" href="' + safeHref(p.url) + '" target="_blank" rel="noopener" title="' + esc(tip) + '">' + iconSvg + '<span>' + esc(p.label) + ' · ' + esc(stTxt) + '</span></a>';
 
-    if (p.state === "OPEN" || p.state === "DRAFT") {
+    if ((p.state === "OPEN" || p.state === "DRAFT") && PR_BOARD_KEYS[key]) {
       return '<span class="pr-chip-grp">' + linkHtml +
         '<button type="button" class="pr-jump-btn" data-jump-pr="' + esc(p.label) + '" data-pr-key="' + esc(key) + '" data-is-cp="' + (p.is_cherry_pick ? "1" : "0") + '" title="' + esc(t("report.rw.jumpToPr")) + '">' + ICONS.locate + '</button>' +
       '</span>';
@@ -2226,7 +2378,8 @@
         if (mtxSev && r.severity !== mtxSev) return false;
       } else {
         if (activeCat === "REAL_ALL" && !isReal) return false;
-        if (activeCat !== "REAL_ALL" && activeCat !== "ALL" && r.cat !== activeCat) return false;
+        if (activeCat === "RETRIAGE" && !r.needs_retriage) return false;
+        if (activeCat !== "REAL_ALL" && activeCat !== "ALL" && activeCat !== "RETRIAGE" && r.cat !== activeCat) return false;
       }
 
       if (sub !== "all" && r.subsystem !== sub) return false;
@@ -2292,6 +2445,14 @@
 
     var htmlRows = rows.map(function(r) {
       var tags = "";
+      if (r.needs_retriage) {
+        var rReasons = (r.retriage_reasons || []).map(formatRetriageReason);
+        var rTip = (r.retriage_details || []).map(function(d) {
+          return formatRetriageReason(d.code) + ": " + d.summary;
+        }).join("\n") || rReasons.join(", ");
+        var rBadgeTxt = t("report.rw.retriageTag") + (rReasons.length ? (" · " + rReasons[0] + (rReasons.length > 1 ? " +" + (rReasons.length - 1) : "")) : "");
+        tags += '<span class="tag-mini tag-retriage" title="' + esc(rTip) + '">' + esc(rBadgeTxt) + '</span>';
+      }
       if (r.manual_override) tags += '<span class="tag-mini tag-cal">' + esc(t("report.rw.editedTag")) + '</span>';
       if (r.force_keep) tags += '<span class="tag-mini tag-cal">' + esc(t("report.rw.forceKeepTag")) + '</span>';
       if (r.is_customer) tags += '<span class="tag-mini tag-cust">' + esc(t("report.table.tagCustomer")) + '</span>';
@@ -2576,7 +2737,7 @@
         var limit = isExp ? st.failed_checks.length : 3;
         var shown = st.failed_checks.slice(0, limit).map(function(fc) {
           if (fc.url) {
-            return '<a class="ci-fail-chip" href="' + esc(fc.url) + '" target="_blank" rel="noopener" title="' + esc(fc.name) + '">' + ICONS.alert + '<span>' + esc(fc.name) + '</span>' + ICONS.ext + '</a>';
+            return '<a class="ci-fail-chip" href="' + safeHref(fc.url) + '" target="_blank" rel="noopener" title="' + esc(fc.name) + '">' + ICONS.alert + '<span>' + esc(fc.name) + '</span>' + ICONS.ext + '</a>';
           }
           return '<span class="ci-fail-chip" title="' + esc(fc.name) + '">' + ICONS.alert + '<span>' + esc(fc.name) + '</span></span>';
         });
@@ -2596,7 +2757,7 @@
 
       return '<tr data-pr-row="' + esc(it.key) + '">' +
         '<td>' +
-          '<a class="id-num-link" href="' + esc(st.url) + '" target="_blank" rel="noopener">' + esc(st.label) + '</a>' +
+          '<a class="id-num-link" href="' + safeHref(st.url) + '" target="_blank" rel="noopener">' + esc(st.label) + '</a>' +
           '<div class="tag-row">' + repoTag + szTag + cpTag + '</div>' +
           '<div style="margin-top:3px;">' + authorHtml + '</div>' +
         '</td>' +
@@ -2610,7 +2771,7 @@
         '</td>' +
         '<td>' + issuesHtml + '</td>' +
         '<td>' +
-          '<div><a class="iss-title-link" href="' + esc(st.url) + '" target="_blank" rel="noopener">' + fmtInlineCode(st.title) + '</a></div>' +
+          '<div><a class="iss-title-link" href="' + safeHref(st.url) + '" target="_blank" rel="noopener">' + fmtInlineCode(st.title) + '</a></div>' +
           (revTags.length ? '<div class="tag-row">' + revTags.join("") + '</div>' : '') +
           failHtml +
         '</td>' +
@@ -2793,7 +2954,13 @@
   bindSearchInput("q", "qClearBtn", renderIssuesView);
   bindSearchInput("prQ", "prQClearBtn", renderPrsView);
 
-  ["scopeSel", "subSel", "sevSel", "prSel", "assSel", "updWindowSel", "sinceDate", "sortSel"].forEach(function(id) {
+  document.getElementById("scopeSel").addEventListener("change", function() {
+    if (this.value === "retriage" && activeCat === "REAL_ALL") {
+      activeCat = "ALL";
+    }
+    renderIssuesView();
+  });
+  ["subSel", "sevSel", "prSel", "assSel", "updWindowSel", "sinceDate", "sortSel"].forEach(function(id) {
     document.getElementById(id).addEventListener("change", renderIssuesView);
   });
   ["prScopeSel", "prBallSel", "prSevSel", "prSubSel", "prSortSel"].forEach(function(id) {
@@ -2920,6 +3087,8 @@
       var prLbl = jumpPrBtn.getAttribute("data-jump-pr");
       var prKey = jumpPrBtn.getAttribute("data-pr-key");
       var isCp = jumpPrBtn.getAttribute("data-is-cp") === "1";
+      closeEditDrawer();
+      closeInboxDrawer();
       activePrStage = "ALL";
       document.getElementById("prBallSel").value = "all";
       document.getElementById("prSevSel").value = "all";
@@ -2935,6 +3104,8 @@
     var jumpIssBtn = e.target.closest("[data-jump-issue]");
     if (jumpIssBtn) {
       var issNum = jumpIssBtn.getAttribute("data-jump-issue");
+      closeEditDrawer();
+      closeInboxDrawer();
       mtxDiff = null; mtxSev = null; activeCat = "ALL";
       document.getElementById("scopeSel").value = "all";
       document.getElementById("subSel").value = "all";
@@ -2978,6 +3149,30 @@
       ? t("report.rw.drawer.title", { num: num })
       : t("report.rw.drawer.inspectTitle", { num: num });
 
+    var rBanner = document.getElementById("editRetriageBanner");
+    if (rec.needs_retriage) {
+      var details = (rec.retriage_details && rec.retriage_details.length)
+        ? rec.retriage_details
+        : (rec.retriage_reasons || []).map(function(c) { return { code: c, summary: "" }; });
+      var detLi = details.map(function(d) {
+        var lbl = formatRetriageReason(d.code);
+        return '<li><b>' + esc(lbl) + '</b>' + (d.summary ? (' — ' + fmtInlineCode(d.summary)) : '') + '</li>';
+      }).join("");
+      var keepBtn = CAN_TRIAGE
+        ? '<button type="button" class="btn btn-amber" id="drawerAckRetriageBtn">' + ICONS.check + '<span>' + esc(t("report.rw.drawer.keepCurrentBtn")) + '</span></button>'
+        : '';
+      rBanner.innerHTML =
+        '<div class="retriage-banner-hdr">' +
+          '<span>' + ICONS.alert + ' ' + esc(t("report.rw.drawer.retriageBannerTitle")) + '</span>' +
+          keepBtn +
+        '</div>' +
+        (detLi ? '<ul class="retriage-list">' + detLi + '</ul>' : '');
+      rBanner.hidden = false;
+    } else {
+      rBanner.innerHTML = "";
+      rBanner.hidden = true;
+    }
+
     var assDisp = (rec.assignees && rec.assignees.length)
       ? fmtUsers(rec.assignees)
       : t("report.rw.drawer.metaUnassigned");
@@ -3016,6 +3211,21 @@
     ["edCat", "edSev", "edSub", "edBorderline", "edForceKeep", "edNoteZh", "edNoteEn"].forEach(function(id) {
       document.getElementById(id).disabled = !CAN_TRIAGE;
     });
+
+    var exZone = document.getElementById("editExcludeZone");
+    var canNote = document.getElementById("editCanonicalNote");
+    if (CAN_TRIAGE && !rec.is_canonical) {
+      exZone.hidden = false;
+      exZone.open = false;
+      document.getElementById("edExcludeReason").value = "";
+      canNote.hidden = true;
+    } else if (CAN_TRIAGE && rec.is_canonical) {
+      exZone.hidden = true;
+      canNote.hidden = false;
+    } else {
+      exZone.hidden = true;
+      canNote.hidden = true;
+    }
 
     document.getElementById("resetOverrideBtn").hidden = !(CAN_TRIAGE && rec.manual_override);
     document.getElementById("saveOverrideBtn").hidden = !CAN_TRIAGE;
@@ -3081,11 +3291,15 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     }).then(function(resp) {
-      var idx = DATA.findIndex(function(r) { return r.number === num; });
-      if (idx !== -1 && resp.record) DATA[idx] = resp.record;
-      rebuildDerivedIndexes();
+      if (resp.dataset) {
+        setDatasetAndRender(resp.dataset);
+      } else {
+        var idx = DATA.findIndex(function(r) { return r.number === num; });
+        if (idx !== -1 && resp.record) DATA[idx] = resp.record;
+        rebuildDerivedIndexes();
+        renderAll();
+      }
       closeEditDrawer();
-      renderAll();
       showToast(t("report.rw.toastSaved", { num: num }), "success");
     }).catch(function(err) {
       showToast(err.message, "error");
@@ -3104,11 +3318,15 @@
       btn.disabled = true;
       apiFetch("./api/issues/" + num + "/triage", { method: "DELETE" })
         .then(function(resp) {
-          var idx = DATA.findIndex(function(r) { return r.number === num; });
-          if (idx !== -1 && resp.record) DATA[idx] = resp.record;
-          rebuildDerivedIndexes();
+          if (resp.dataset) {
+            setDatasetAndRender(resp.dataset);
+          } else {
+            var idx = DATA.findIndex(function(r) { return r.number === num; });
+            if (idx !== -1 && resp.record) DATA[idx] = resp.record;
+            rebuildDerivedIndexes();
+            renderAll();
+          }
           closeEditDrawer();
-          renderAll();
           showToast(t("report.rw.toastReset", { num: num }), "success");
         }).catch(function(err) {
           showToast(err.message, "error");
@@ -3117,42 +3335,278 @@
         });
     });
 
+    document.getElementById("editRetriageBanner").addEventListener("click", function(e) {
+      var ackBtn = e.target.closest("#drawerAckRetriageBtn");
+      if (!ackBtn || !editingIssueNum) return;
+      var num = editingIssueNum;
+      ackBtn.disabled = true;
+      apiFetch("./api/issues/" + num + "/retriage/ack", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      })
+        .then(function(resp) {
+          setDatasetAndRender(resp.dataset);
+          closeEditDrawer();
+          showToast(t("report.rw.toastRetriageAcked", { num: num }), "success");
+        }).catch(function(err) {
+          showToast(err.message, "error");
+          ackBtn.disabled = false;
+        });
+    });
+
+    document.getElementById("edExcludeConfirmBtn").addEventListener("click", function() {
+      if (!editingIssueNum) return;
+      var num = editingIssueNum;
+      var reason = document.getElementById("edExcludeReason").value.trim();
+      var btn = this;
+      btn.disabled = true;
+      apiFetch("./api/issues/" + num + "/exclude", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: reason })
+      }).then(function(resp) {
+        EXCLUDED_ITEMS = null;
+        setDatasetAndRender(resp.dataset, resp.pending_candidates);
+        closeEditDrawer();
+        showToast(t("report.rw.toastIssueExcluded", { num: num }), "success");
+      }).catch(function(err) {
+        showToast(err.message, "error");
+      }).finally(function() {
+        btn.disabled = false;
+      });
+    });
+
+    function updateInboxTabsHeader() {
+      var exCnt = Array.isArray(EXCLUDED_ITEMS) ? EXCLUDED_ITEMS.length : SCOPE_COUNTS.excluded;
+      var btnP = document.getElementById("inboxTabPendingBtn");
+      var btnR = document.getElementById("inboxTabRetriageBtn");
+      var btnE = document.getElementById("inboxTabExcludedBtn");
+      btnP.textContent = t("report.rw.inbox.tabPending", { count: PENDING.length });
+      btnR.textContent = t("report.rw.inbox.tabRetriage", { count: RETRIAGE_LIST.length });
+      btnE.textContent = t("report.rw.inbox.tabExcluded", { count: exCnt });
+      btnP.classList.toggle("active", activeInboxTab === "pending");
+      btnR.classList.toggle("active", activeInboxTab === "retriage");
+      btnE.classList.toggle("active", activeInboxTab === "excluded");
+    }
+
+    function renderExcludedListInto(container) {
+      if (!container) return;
+      if (excludedLoading || !Array.isArray(EXCLUDED_ITEMS)) {
+        container.innerHTML = '<div class="empty-state"><p>Loading…</p></div>';
+        return;
+      }
+      var q = (excludedQuery || "").trim().toLowerCase();
+      var filtered = EXCLUDED_ITEMS.filter(function(item) {
+        if (!q) return true;
+        var hay = ("#" + item.number + " " + (item.title || "") + " " + (item.reason || "") + " " + (item.excluded_labels || []).join(" ") + " " + (item.source || "")).toLowerCase();
+        return hay.indexOf(q) !== -1;
+      });
+      if (!filtered.length) {
+        container.innerHTML = '<div class="empty-state"><h3>' + esc(t("report.rw.inbox.excludedEmptyTitle")) + '</h3><p>' + esc(t("report.rw.inbox.excludedEmpty")) + '</p></div>';
+        return;
+      }
+      container.innerHTML = filtered.map(function(item) {
+        var issUrl = "https://github.com/pingcap/tidb/issues/" + item.number;
+        var titleDisp = item.title ? (" · " + fmtInlineCode(item.title)) : "";
+        var lblHtml = (item.excluded_labels || []).map(function(l) {
+          return '<span class="tag-mini">' + esc(l) + '</span>';
+        }).join("");
+        var dateDisp = (item.excluded_at || "").slice(0, 10) || "—";
+        var srcDisp = item.source || "manual";
+        return '<div class="pend-card" data-ex-num="' + item.number + '">' +
+          '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">' +
+            '<div><a class="iss-title-link" href="' + issUrl + '" target="_blank" rel="noopener">#' + item.number + titleDisp + '</a></div>' +
+            '<button type="button" class="btn x-restore-btn">' + ICONS.reset + '<span>' + esc(t("report.rw.inbox.restoreBtn")) + '</span></button>' +
+          '</div>' +
+          (item.reason ? '<div class="note-callout" style="margin-top:0;">' + fmtInlineCode(item.reason) + '</div>' : '') +
+          (lblHtml ? '<div class="tag-row" style="margin-top:0;">' + lblHtml + '</div>' : '') +
+          '<div style="font-size:11.5px;color:var(--muted);">' + esc(t("report.rw.inbox.excludedMeta", { date: dateDisp, source: srcDisp })) + '</div>' +
+        '</div>';
+      }).join("");
+    }
+
+    function ensureExcludedLoaded() {
+      if (Array.isArray(EXCLUDED_ITEMS) || excludedLoading) return;
+      excludedLoading = true;
+      apiFetch("./api/excluded").then(function(resp) {
+        EXCLUDED_ITEMS = resp.excluded_issues || [];
+        SCOPE_COUNTS.excluded = EXCLUDED_ITEMS.length;
+      }).catch(function(err) {
+        showToast(err.message, "error");
+        EXCLUDED_ITEMS = [];
+      }).finally(function() {
+        excludedLoading = false;
+        updateInboxTabsHeader();
+        if (activeInboxTab === "excluded" && !document.getElementById("inboxDrawer").hidden) {
+          renderExcludedListInto(document.getElementById("inboxExList"));
+        }
+      });
+    }
+
     function openInboxDrawer() {
+      if (!inboxTabInitialized) {
+        if (PENDING.length > 0) activeInboxTab = "pending";
+        else if (RETRIAGE_LIST.length > 0) activeInboxTab = "retriage";
+        else activeInboxTab = "pending";
+        inboxTabInitialized = true;
+      } else if (activeInboxTab === "pending" && !PENDING.length && RETRIAGE_LIST.length > 0) {
+        activeInboxTab = "retriage";
+      }
       renderInboxDrawer();
       document.getElementById("inboxDrawer").hidden = false;
       syncBodyDrawerLock();
     }
 
+    function capturePendingCardDrafts(container) {
+      if (!container) return;
+      var cards = container.querySelectorAll("[data-pend-num]");
+      for (var i = 0; i < cards.length; i++) {
+        var c = cards[i];
+        var key = c.getAttribute("data-pend-num");
+        if (!key) continue;
+        pendingDrafts[key] = {
+          cat: c.querySelector(".p-cat") ? c.querySelector(".p-cat").value : null,
+          sev: c.querySelector(".p-sev") ? c.querySelector(".p-sev").value : null,
+          sub: c.querySelector(".p-sub") ? c.querySelector(".p-sub").value : null,
+          bdr: c.querySelector(".p-bdr") ? c.querySelector(".p-bdr").checked : null,
+          fk: c.querySelector(".p-fk") ? c.querySelector(".p-fk").checked : null,
+          noteZh: c.querySelector(".p-note-zh") ? c.querySelector(".p-note-zh").value : "",
+          noteEn: c.querySelector(".p-note-en") ? c.querySelector(".p-note-en").value : "",
+          exReason: c.querySelector(".p-ex-reason") ? c.querySelector(".p-ex-reason").value : ""
+        };
+      }
+    }
+
     renderInboxDrawer = function() {
-      document.getElementById("inboxDrawerTitle").textContent = t("report.rw.inbox.title", { count: PENDING.length });
+      document.getElementById("inboxDrawerTitle").textContent = t("report.rw.inbox.title");
+      updateInboxTabsHeader();
       var body = document.getElementById("inboxBody");
+      capturePendingCardDrafts(body);
+      var livePendingKeys = Object.create(null);
+      for (var pi = 0; pi < PENDING.length; pi++) {
+        livePendingKeys[String(PENDING[pi].number)] = true;
+      }
+      Object.keys(pendingDrafts).forEach(function(k) {
+        if (!livePendingKeys[k]) delete pendingDrafts[k];
+      });
+      var loc = SiteI18n.getLocale();
+
+      if (activeInboxTab === "retriage") {
+        if (!RETRIAGE_LIST.length) {
+          body.innerHTML = '<div class="empty-state"><h3>' + esc(t("report.rw.inbox.retriageEmptyTitle")) + '</h3><p>' + esc(t("report.rw.inbox.retriageEmpty")) + '</p></div>';
+          return;
+        }
+        var hdrHtml = '<div class="inbox-toolbar">' +
+          '<span style="font-size:12px;color:var(--muted);">' + esc(t("report.filters.scope.retriage", { count: RETRIAGE_LIST.length })) + '</span>' +
+          '<button type="button" class="btn btn-amber" id="inboxKeepAllBtn">' + ICONS.check + '<span>' + esc(t("report.rw.inbox.keepAllBtn", { count: RETRIAGE_LIST.length })) + '</span></button>' +
+        '</div>';
+        var cardsHtml = RETRIAGE_LIST.map(function(rec) {
+          var issUrl = "https://github.com/pingcap/tidb/issues/" + rec.number;
+          var sevPill = rec.severity !== "N/A"
+            ? '<span class="sev-badge ' + (SEV_CLS[rec.severity] || "sev-na") + '">' + esc(t("report.enums.severityShort." + rec.severity)) + '</span>'
+            : '';
+          var catPill = '<span class="badge ' + (BADGE_CLS[rec.cat] || "badge-other") + '">' + esc(t("report.enums.catShort." + rec.cat)) + '</span>';
+          var subTxt = '<span class="tag-mini">' + esc(t("report.enums.subsystem." + rec.subsystem)) + '</span>';
+          var details = (rec.retriage_details && rec.retriage_details.length)
+            ? rec.retriage_details
+            : (rec.retriage_reasons || []).map(function(c) { return { code: c, summary: "" }; });
+          var detLi = details.map(function(d) {
+            return '<li><b>' + esc(formatRetriageReason(d.code)) + '</b>' + (d.summary ? (' — ' + fmtInlineCode(d.summary)) : '') + '</li>';
+          }).join("");
+          var noteStr = getNoteText(rec, loc);
+          var prsHtml = rec.prs && rec.prs.length ? '<div class="pr-row" style="margin-top:2px;">' + rec.prs.map(formatPrChip).join("") + '</div>' : '';
+
+          return '<div class="pend-card" data-retriage-num="' + rec.number + '">' +
+            '<div><a class="iss-title-link" href="' + issUrl + '" target="_blank" rel="noopener">#' + rec.number + ' · ' + fmtInlineCode(rec.title) + '</a> <span style="color:var(--muted);font-size:12px;">@' + esc(rec.author) + '</span></div>' +
+            '<div class="cls-line">' + sevPill + catPill + subTxt + '</div>' +
+            (noteStr ? '<div class="note-callout" style="margin-top:0;">' + fmtInlineCode(noteStr) + '</div>' : '') +
+            '<ul class="retriage-list" style="background:var(--med-bg);border:1px solid var(--med-bd);border-radius:6px;padding:7px 10px 7px 24px;">' + detLi + '</ul>' +
+            prsHtml +
+            '<div class="ctrl-row" style="justify-content:flex-end;margin-top:2px;">' +
+              '<button type="button" class="btn r-cal-btn">' + ICONS.edit + '<span>' + esc(t("report.rw.inbox.recalibrateBtn")) + '</span></button>' +
+              '<button type="button" class="btn btn-primary r-keep-btn">' + ICONS.check + '<span>' + esc(t("report.rw.inbox.keepCurrentBtn")) + '</span></button>' +
+            '</div>' +
+          '</div>';
+        }).join("");
+        body.innerHTML = hdrHtml + cardsHtml;
+        return;
+      }
+
+      if (activeInboxTab === "excluded") {
+        body.innerHTML =
+          '<div class="search-wrap" style="flex:0 0 auto;">' +
+            '<span class="search-ico" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg></span>' +
+            '<input type="search" id="inboxExSearch" value="' + esc(excludedQuery) + '" placeholder="' + esc(t("report.rw.inbox.excludedSearchPlaceholder")) + '">' +
+          '</div>' +
+          '<div id="inboxExList" style="display:flex;flex-direction:column;gap:10px;"></div>';
+        ensureExcludedLoaded();
+        renderExcludedListInto(document.getElementById("inboxExList"));
+        return;
+      }
+
       if (!PENDING.length) {
         body.innerHTML = '<div class="empty-state"><h3>' + esc(t("report.rw.inbox.emptyTitle")) + '</h3><p>' + esc(t("report.rw.inbox.empty")) + '</p></div>';
         return;
       }
       var enums = window.REPORT_DATASET.enums;
       body.innerHTML = PENDING.map(function(pc) {
+        var sug = pc.suggested_triage || null;
+        var draft = pendingDrafts[String(pc.number)] || null;
+        var defCat = (draft && draft.cat) ? draft.cat : ((sug && sug.cat) ? sug.cat : "MEDIUM");
+        var defSev = (draft && draft.sev) ? draft.sev : ((sug && sug.severity) ? sug.severity : ((defCat === "EASY" || defCat === "MEDIUM" || defCat === "HARD") ? "MAJOR" : "N/A"));
+        var defSub = (draft && draft.sub) ? draft.sub : ((sug && sug.subsystem) ? sug.subsystem : enums.subsystems[0]);
+        var defBdr = (draft && draft.bdr !== null) ? draft.bdr : Boolean(sug && sug.is_borderline_kept);
+        var defFk = Boolean(draft && draft.fk);
+        var defNoteZh = (draft && draft.noteZh) || "";
+        var defNoteEn = (draft && draft.noteEn) || "";
+        var defExReason = draft ? draft.exReason : ((sug && sug.exclude_reason) ? sug.exclude_reason : "");
+        var isCanon = hasCanonicalLabels(pc.labels);
+
         var catOpts = enums.categories.map(function(v) {
-          return '<option value="' + esc(v) + '"' + (v === "MEDIUM" ? " selected" : "") + '>' + esc(t("report.enums.cat." + v)) + '</option>';
+          return '<option value="' + esc(v) + '"' + (v === defCat ? " selected" : "") + '>' + esc(t("report.enums.cat." + v)) + '</option>';
         }).join("");
         var sevOpts = enums.severities.map(function(v) {
-          return '<option value="' + esc(v) + '"' + (v === "MAJOR" ? " selected" : "") + '>' + esc(t("report.enums.severity." + v)) + '</option>';
+          return '<option value="' + esc(v) + '"' + (v === defSev ? " selected" : "") + '>' + esc(t("report.enums.severity." + v)) + '</option>';
         }).join("");
         var subOpts = enums.subsystems.map(function(v) {
-          return '<option value="' + esc(v) + '">' + esc(t("report.enums.subsystem." + v)) + '</option>';
+          return '<option value="' + esc(v) + '"' + (v === defSub ? " selected" : "") + '>' + esc(t("report.enums.subsystem." + v)) + '</option>';
         }).join("");
+
+        var sugLines = [];
+        if (sug) {
+          var actTag = sug.recommended_action === "exclude"
+            ? '<span class="tag-mini tag-cust">' + esc(sug.recommended_action) + '</span>'
+            : '<span class="tag-mini tag-keep">' + esc(t("report.rw.inbox.suggestedBadge", { confidence: sug.confidence || "low" })) + '</span>';
+          var sigTxt = (sug.signals && sug.signals.length) ? ('<span>' + esc(sug.signals.join(" · ")) + '</span>') : '';
+          sugLines.push('<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">' + actTag + sigTxt + '</div>');
+        }
+        (pc.pr_details || []).forEach(function(pd) {
+          if (pd.is_cherry_pick) return;
+          var filesPreview = (pd.non_test_files || []).slice(0, 4).map(function(f) { return '<code>' + esc(f) + '</code>'; }).join(" ");
+          sugLines.push('<div>' + esc(t("report.rw.inbox.prFilesSummary", {
+            num: pd.num,
+            nonTest: pd.non_test_file_count || 0,
+            add: pd.non_test_additions || 0,
+            del: pd.non_test_deletions || 0,
+            test: pd.test_file_count || 0
+          })) + (filesPreview ? (' · ' + filesPreview) : '') + '</div>');
+        });
+        var sugHtml = sugLines.length ? ('<div class="sug-banner">' + sugLines.join("") + '</div>') : '';
 
         var cmtsTxt = (pc.recent_comments || []).map(function(c) {
           return "--- @" + c.author + " (" + (c.created_at || "").slice(0, 16) + ") ---\n" + c.body;
         }).join("\n\n");
         var fullPreview = (pc.body || "(empty body)") + (cmtsTxt ? ("\n\n" + cmtsTxt) : "");
+        var exTip = isCanon ? (' title="' + esc(t("report.rw.inbox.canonicalExcludeTip")) + '" disabled') : '';
 
         return '<div class="pend-card" data-pend-num="' + pc.number + '">' +
-          '<div><a class="iss-title-link" href="' + esc(pc.url) + '" target="_blank" rel="noopener">#' + pc.number + ' · ' + fmtInlineCode(pc.title) + '</a> <span style="color:var(--muted);font-size:12px;">@' + esc(pc.author) + '</span></div>' +
+          '<div><a class="iss-title-link" href="' + safeHref(pc.url) + '" target="_blank" rel="noopener">#' + pc.number + ' · ' + fmtInlineCode(pc.title) + '</a> <span style="color:var(--muted);font-size:12px;">@' + esc(pc.author) + '</span></div>' +
           '<div class="tag-row" style="margin-top:0;">' +
             '<span class="tag-mini tag-keep">' + esc(t("report.rw.inbox.scopesLabel")) + ': ' + esc((pc.matched_scopes || []).join(", ")) + '</span>' +
             (pc.labels || []).map(function(l) { return '<span class="tag-mini">' + esc(l) + '</span>'; }).join("") +
           '</div>' +
+          sugHtml +
           '<details><summary style="cursor:pointer;font-size:12px;font-weight:600;color:var(--link)">' + esc(t("report.rw.inbox.bodySummary", { comments: (pc.recent_comments || []).length })) + '</summary>' +
             '<div class="pend-pre">' + esc(fullPreview) + '</div>' +
           '</details>' +
@@ -3162,16 +3616,16 @@
             '<select class="p-sub">' + subOpts + '</select>' +
           '</div>' +
           '<div class="ctrl-row" style="font-size:12px;color:var(--text-secondary);gap:14px;">' +
-            '<label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;"><input type="checkbox" class="p-bdr"><span>' + esc(t("report.table.tagBorderline")) + '</span></label>' +
-            '<label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;"><input type="checkbox" class="p-fk"><span>' + esc(t("report.rw.forceKeepTag")) + '</span></label>' +
+            '<label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;"><input type="checkbox" class="p-bdr"' + (defBdr ? " checked" : "") + '><span>' + esc(t("report.table.tagBorderline")) + '</span></label>' +
+            '<label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;"><input type="checkbox" class="p-fk"' + (defFk ? " checked" : "") + '><span>' + esc(t("report.rw.forceKeepTag")) + '</span></label>' +
           '</div>' +
-          '<input type="text" class="p-note-zh" placeholder="' + esc(t("report.rw.drawer.notePlaceholderZh")) + '">' +
-          '<input type="text" class="p-note-en" placeholder="' + esc(t("report.rw.drawer.notePlaceholderEn")) + '">' +
+          '<input type="text" class="p-note-zh" value="' + esc(defNoteZh) + '" placeholder="' + esc(t("report.rw.drawer.notePlaceholderZh")) + '">' +
+          '<input type="text" class="p-note-en" value="' + esc(defNoteEn) + '" placeholder="' + esc(t("report.rw.drawer.notePlaceholderEn")) + '">' +
           '<div class="ctrl-row" style="justify-content:space-between;margin-top:2px;">' +
             '<button type="button" class="btn btn-primary p-accept-btn">' + ICONS.check + '<span>' + esc(t("report.rw.inbox.acceptBtn")) + '</span></button>' +
             '<div style="display:flex;gap:6px;flex:1;justify-content:flex-end;">' +
-              '<input type="text" class="p-ex-reason" style="flex:1;max-width:220px;" placeholder="' + esc(t("report.rw.inbox.excludeReasonPlaceholder")) + '">' +
-              '<button type="button" class="btn btn-danger-ghost p-exclude-btn">' + esc(t("report.rw.inbox.excludeBtn")) + '</button>' +
+              '<input type="text" class="p-ex-reason" style="flex:1;max-width:220px;" value="' + esc(defExReason) + '" placeholder="' + esc(t("report.rw.inbox.excludeReasonPlaceholder")) + '"' + exTip + '>' +
+              '<button type="button" class="btn btn-danger-ghost p-exclude-btn"' + exTip + '>' + esc(t("report.rw.inbox.excludeBtn")) + '</button>' +
             '</div>' +
           '</div>' +
         '</div>';
@@ -3182,6 +3636,20 @@
     document.getElementById("closeInboxDrawerBtn").addEventListener("click", closeInboxDrawer);
     document.getElementById("inboxDrawer").addEventListener("click", function(e) {
       if (e.target === this) closeInboxDrawer();
+    });
+
+    document.getElementById("inboxTabsBar").addEventListener("click", function(e) {
+      var tabBtn = e.target.closest("[data-inbox-tab]");
+      if (!tabBtn) return;
+      activeInboxTab = tabBtn.getAttribute("data-inbox-tab") || "pending";
+      renderInboxDrawer();
+    });
+
+    document.getElementById("inboxBody").addEventListener("input", function(e) {
+      if (e.target && e.target.id === "inboxExSearch") {
+        excludedQuery = e.target.value || "";
+        renderExcludedListInto(document.getElementById("inboxExList"));
+      }
     });
 
     document.getElementById("inboxBody").addEventListener("change", function(e) {
@@ -3197,6 +3665,73 @@
     });
 
     document.getElementById("inboxBody").addEventListener("click", function(e) {
+      if (e.target.closest("#inboxKeepAllBtn")) {
+        var keepAllBtn = e.target.closest("#inboxKeepAllBtn");
+        var nums = RETRIAGE_LIST.map(function(r) { return r.number; });
+        if (!nums.length) return;
+        keepAllBtn.disabled = true;
+        apiFetch("./api/retriage/ack-batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ numbers: nums })
+        }).then(function(resp) {
+          setDatasetAndRender(resp.dataset);
+          renderInboxDrawer();
+          var ackCnt = Array.isArray(resp.acknowledged) ? resp.acknowledged.length : (resp.acknowledged || nums.length);
+          showToast(t("report.rw.toastRetriageBatchAcked", { count: ackCnt }), "success");
+        }).catch(function(err) {
+          showToast(err.message, "error");
+          keepAllBtn.disabled = false;
+        });
+        return;
+      }
+
+      var rCard = e.target.closest("[data-retriage-num]");
+      if (rCard) {
+        var rNum = parseInt(rCard.getAttribute("data-retriage-num"), 10);
+        if (e.target.closest(".r-cal-btn")) {
+          closeInboxDrawer();
+          openEditDrawer(rNum);
+          return;
+        }
+        if (e.target.closest(".r-keep-btn")) {
+          var rKeepBtn = e.target.closest(".r-keep-btn");
+          rKeepBtn.disabled = true;
+          apiFetch("./api/issues/" + rNum + "/retriage/ack", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}"
+          })
+            .then(function(resp) {
+              setDatasetAndRender(resp.dataset);
+              renderInboxDrawer();
+              showToast(t("report.rw.toastRetriageAcked", { num: rNum }), "success");
+            }).catch(function(err) {
+              showToast(err.message, "error");
+              rKeepBtn.disabled = false;
+            });
+          return;
+        }
+      }
+
+      var xCard = e.target.closest("[data-ex-num]");
+      if (xCard && e.target.closest(".x-restore-btn")) {
+        var xNum = parseInt(xCard.getAttribute("data-ex-num"), 10);
+        var xBtn = e.target.closest(".x-restore-btn");
+        xBtn.disabled = true;
+        apiFetch("./api/excluded/" + xNum, { method: "DELETE" })
+          .then(function(resp) {
+            EXCLUDED_ITEMS = resp.excluded_issues || [];
+            setDatasetAndRender(resp.dataset);
+            renderInboxDrawer();
+            showToast(t("report.rw.toastExcludedRestored", { num: xNum }), "success");
+          }).catch(function(err) {
+            showToast(err.message, "error");
+            xBtn.disabled = false;
+          });
+        return;
+      }
+
       var card = e.target.closest("[data-pend-num]");
       if (!card) return;
       var num = parseInt(card.getAttribute("data-pend-num"), 10);
@@ -3220,9 +3755,14 @@
             }
           })
         }).then(function(resp) {
+          delete pendingDrafts[String(num)];
           setDatasetAndRender(resp.dataset, resp.pending_candidates);
           renderInboxDrawer();
-          showToast(t("report.rw.toastPendingResolved", { num: num }), "success");
+          if (resp.pr_sync_warning) {
+            showToast(t("report.rw.toastPendingSyncWarn", { num: num, warn: resp.pr_sync_warning }), "success");
+          } else {
+            showToast(t("report.rw.toastPendingResolved", { num: num }), "success");
+          }
         }).catch(function(err) {
           showToast(err.message, "error");
           btn.disabled = false;
@@ -3238,6 +3778,8 @@
             exclude_reason: card.querySelector(".p-ex-reason").value.trim()
           })
         }).then(function(resp) {
+          delete pendingDrafts[String(num)];
+          EXCLUDED_ITEMS = null;
           setDatasetAndRender(resp.dataset, resp.pending_candidates);
           renderInboxDrawer();
           showToast(t("report.rw.toastPendingResolved", { num: num }), "success");
@@ -3293,7 +3835,29 @@
   SiteI18n.onChange(function() {
     renderAll();
     if (!document.getElementById("inboxDrawer").hidden) renderInboxDrawer();
-    if (editingIssueNum) openEditDrawer(editingIssueNum);
+    if (editingIssueNum) {
+      var edDraft = {
+        cat: document.getElementById("edCat").value,
+        sev: document.getElementById("edSev").value,
+        sub: document.getElementById("edSub").value,
+        bdr: document.getElementById("edBorderline").checked,
+        fk: document.getElementById("edForceKeep").checked,
+        noteZh: document.getElementById("edNoteZh").value,
+        noteEn: document.getElementById("edNoteEn").value,
+        exOpen: document.getElementById("editExcludeZone").open,
+        exReason: document.getElementById("edExcludeReason").value
+      };
+      openEditDrawer(editingIssueNum);
+      document.getElementById("edCat").value = edDraft.cat;
+      document.getElementById("edSev").value = edDraft.sev;
+      document.getElementById("edSub").value = edDraft.sub;
+      document.getElementById("edBorderline").checked = edDraft.bdr;
+      document.getElementById("edForceKeep").checked = edDraft.fk;
+      document.getElementById("edNoteZh").value = edDraft.noteZh;
+      document.getElementById("edNoteEn").value = edDraft.noteEn;
+      document.getElementById("editExcludeZone").open = edDraft.exOpen;
+      document.getElementById("edExcludeReason").value = edDraft.exReason;
+    }
   });
   SiteI18n.onThemeChange(updateThemeBtnUI);
 

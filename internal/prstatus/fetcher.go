@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/winoros/tidb-triage-hub/internal/ghgql"
 	"github.com/winoros/tidb-triage-hub/internal/model"
 )
 
@@ -19,6 +19,7 @@ fragment PRStatusFields on PullRequest {
   number
   title
   url
+  baseRefName
   state
   isDraft
   mergeable
@@ -105,14 +106,15 @@ type PRTarget struct {
 }
 
 type gqlPRNode struct {
-	Number    int    `json:"number"`
-	Title     string `json:"title"`
-	URL       string `json:"url"`
-	State     string `json:"state"`
-	IsDraft   bool   `json:"isDraft"`
-	Mergeable string `json:"mergeable"`
-	CreatedAt string `json:"createdAt"`
-	UpdatedAt string `json:"updatedAt"`
+	Number      int    `json:"number"`
+	Title       string `json:"title"`
+	URL         string `json:"url"`
+	BaseRefName string `json:"baseRefName"`
+	State       string `json:"state"`
+	IsDraft     bool   `json:"isDraft"`
+	Mergeable   string `json:"mergeable"`
+	CreatedAt   string `json:"createdAt"`
+	UpdatedAt   string `json:"updatedAt"`
 	Author    *struct {
 		Login string `json:"login"`
 	} `json:"author"`
@@ -294,6 +296,7 @@ func toRawPRInput(repo string, sources []string, n gqlPRNode) RawPRInput {
 		Title:              n.Title,
 		URL:                n.URL,
 		Author:             author,
+		BaseRefName:        n.BaseRefName,
 		State:              n.State,
 		IsDraft:            n.IsDraft,
 		Mergeable:          n.Mergeable,
@@ -311,84 +314,10 @@ func toRawPRInput(repo string, sources []string, n gqlPRNode) RawPRInput {
 	}
 }
 
-func runGHGraphQL(ctx context.Context, query string) ([]byte, error) {
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		cmd := exec.CommandContext(ctx, "gh", "api", "graphql", "-f", "query="+query)
-		out, err := cmd.Output()
-		if err == nil {
-			return out, nil
-		}
-		if ee, ok := err.(*exec.ExitError); ok {
-			lastErr = fmt.Errorf("gh api graphql exit: %w (%s)", err, strings.TrimSpace(string(ee.Stderr)))
-		} else {
-			lastErr = err
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(time.Duration(attempt+1) * 1200 * time.Millisecond):
-		}
-	}
-	return nil, lastErr
-}
-
-type RateLimitInfo struct {
-	ViewerLogin string `json:"viewer_login"`
-	Limit       int    `json:"limit"`
-	Remaining   int    `json:"remaining"`
-	Used        int    `json:"used"`
-	ResetAtUTC  string `json:"reset_at_utc"`
-	ResetAtUTC8 string `json:"reset_at_utc8"`
-}
+type RateLimitInfo = ghgql.RateLimitInfo
 
 func CheckGHQuota(ctx context.Context, minRemaining int) (RateLimitInfo, error) {
-	if _, err := exec.LookPath("gh"); err != nil {
-		return RateLimitInfo{}, fmt.Errorf("gh CLI not found in PATH: %w", err)
-	}
-	raw, err := runGHGraphQL(ctx, `query { viewer { login } rateLimit { limit remaining used resetAt } }`)
-	if err != nil {
-		return RateLimitInfo{}, fmt.Errorf("gh GraphQL authentication/network check failed: %w", err)
-	}
-	var resp struct {
-		Data struct {
-			Viewer struct {
-				Login string `json:"login"`
-			} `json:"viewer"`
-			RateLimit struct {
-				Limit     int    `json:"limit"`
-				Remaining int    `json:"remaining"`
-				Used      int    `json:"used"`
-				ResetAt   string `json:"resetAt"`
-			} `json:"rateLimit"`
-		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return RateLimitInfo{}, fmt.Errorf("decode rateLimit response: %w", err)
-	}
-	if resp.Data.RateLimit.Limit == 0 && len(resp.Errors) > 0 {
-		return RateLimitInfo{}, fmt.Errorf("gh GraphQL error: %s", resp.Errors[0].Message)
-	}
-	info := RateLimitInfo{
-		ViewerLogin: resp.Data.Viewer.Login,
-		Limit:       resp.Data.RateLimit.Limit,
-		Remaining:   resp.Data.RateLimit.Remaining,
-		Used:        resp.Data.RateLimit.Used,
-		ResetAtUTC:  resp.Data.RateLimit.ResetAt,
-	}
-	if info.ResetAtUTC != "" {
-		info.ResetAtUTC8 = ToUTC8Display(info.ResetAtUTC) + " (UTC+8)"
-	}
-	if minRemaining > 0 && info.Remaining < minRemaining {
-		return info, fmt.Errorf(
-			"insufficient GitHub GraphQL quota for @%s: remaining %d/%d points (need >= %d, resets at %s)",
-			info.ViewerLogin, info.Remaining, info.Limit, minRemaining, info.ResetAtUTC8,
-		)
-	}
-	return info, nil
+	return ghgql.CheckQuota(ctx, nil, minRemaining)
 }
 
 func ParsePRSpecs(spec string, defaultRepo string) ([]PRTarget, error) {
@@ -445,6 +374,18 @@ type FetchStats struct {
 }
 
 func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize int) ([]model.PRStatus, FetchStats, error) {
+	return FetchAndClassifyBatchWithRunner(ctx, nil, targets, batchSize)
+}
+
+func FetchAndClassifyBatchWithRunner(
+	ctx context.Context,
+	runner ghgql.Runner,
+	targets []PRTarget,
+	batchSize int,
+) ([]model.PRStatus, FetchStats, error) {
+	if runner == nil {
+		runner = ghgql.DefaultRunner()
+	}
 	start := time.Now()
 	if batchSize <= 0 {
 		batchSize = 20
@@ -521,6 +462,11 @@ func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize in
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			case <-ctx.Done():
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = ctx.Err()
+				}
+				mu.Unlock()
 				return
 			}
 
@@ -535,7 +481,7 @@ func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize in
 				prFieldsFragment, jb.owner, jb.name, aliases.String(),
 			)
 
-			rawBytes, err := runGHGraphQL(ctx, gql)
+			rawBytes, err := runner.Query(ctx, gql, nil)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -546,7 +492,7 @@ func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize in
 			}
 
 			var resp struct {
-				Data struct {
+				Data *struct {
 					RateLimit *struct {
 						Limit     int    `json:"limit"`
 						Cost      int    `json:"cost"`
@@ -556,6 +502,7 @@ func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize in
 					Repository map[string]*gqlPRNode `json:"repository"`
 				} `json:"data"`
 				Errors []struct {
+					Type    string `json:"type"`
 					Message string `json:"message"`
 				} `json:"errors"`
 			}
@@ -567,10 +514,26 @@ func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize in
 				mu.Unlock()
 				return
 			}
-			if resp.Data.Repository == nil && len(resp.Errors) > 0 {
+			for _, ge := range resp.Errors {
+				isNotFound := strings.EqualFold(ge.Type, "NOT_FOUND") ||
+					(ge.Type == "" && strings.Contains(ge.Message, "Could not resolve to a"))
+				if !isNotFound {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("graphql error (%s): %s", ge.Type, ge.Message)
+					}
+					mu.Unlock()
+					return
+				}
+			}
+			if resp.Data == nil || resp.Data.Repository == nil {
 				mu.Lock()
 				if firstErr == nil {
-					firstErr = fmt.Errorf("graphql error: %s", resp.Errors[0].Message)
+					if len(resp.Errors) > 0 {
+						firstErr = fmt.Errorf("graphql error: %s", resp.Errors[0].Message)
+					} else {
+						firstErr = fmt.Errorf("graphql returned empty repository node")
+					}
 				}
 				mu.Unlock()
 				return
@@ -604,6 +567,9 @@ func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize in
 		}()
 	}
 	wg.Wait()
+	if firstErr == nil && ctx.Err() != nil {
+		firstErr = ctx.Err()
+	}
 
 	if firstErr != nil {
 		return nil, FetchStats{}, firstErr

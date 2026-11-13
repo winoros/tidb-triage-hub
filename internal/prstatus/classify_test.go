@@ -1,6 +1,9 @@
 package prstatus
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -213,5 +216,63 @@ func TestParsePRSpecs(t *testing.T) {
 
 	if _, err := ParsePRSpecs("not-a-pr", "pingcap/tidb"); err == nil {
 		t.Fatal("expected error on invalid PR spec")
+	}
+}
+
+type fnRunner func(ctx context.Context, gql string, vars map[string]string) ([]byte, error)
+
+func (f fnRunner) Query(ctx context.Context, gql string, vars map[string]string) ([]byte, error) {
+	return f(ctx, gql, vars)
+}
+
+func TestCherryPickBaseRefAndBatchRunnerErrorHandling(t *testing.T) {
+	if !IsCherryPickPR("planner: fix index merge", []string{"sig/planner"}, "release-8.5") {
+		t.Fatal("expected PR targeting release-8.5 branch to be detected as cherry-pick")
+	}
+	if IsCherryPickPR("planner: fix index merge", []string{"sig/planner", "needs-cherry-pick-release-8.5"}, "master") {
+		t.Fatal("expected mainline PR targeting master with needs-cherry-pick-* label NOT to be marked cherry-pick")
+	}
+	if !IsCherryPickPR("planner: fix index merge", []string{"type/cherry-pick-for-release-8.5"}, "master") {
+		t.Fatal("expected type/cherry-pick-for-release-* label to be marked cherry-pick")
+	}
+
+	// 1. Partial NOT_FOUND succeeds for valid alias while skipping missing alias
+	partialRunner := fnRunner(func(_ context.Context, _ string, _ map[string]string) ([]byte, error) {
+		return []byte(`{
+			"data": {
+				"rateLimit": {"limit": 5000, "cost": 1, "remaining": 4999, "resetAt": "2026-11-13T05:00:00Z"},
+				"repository": {
+					"p73064": {"number": 73064, "title": "planner: fix", "url": "https://github.com/pingcap/tidb/pull/73064", "baseRefName": "release-8.5", "state": "OPEN", "isDraft": false, "mergeable": "MERGEABLE", "createdAt": "2026-11-12T00:00:00Z", "updatedAt": "2026-11-12T01:00:00Z.123Z"},
+					"p99999": null
+				}
+			},
+			"errors": [{"type": "NOT_FOUND", "message": "Could not resolve to a PullRequest with the number of 99999."}]
+		}`), nil
+	})
+	statuses, _, err := FetchAndClassifyBatchWithRunner(context.Background(), partialRunner, []PRTarget{
+		{Repo: "pingcap/tidb", Number: 73064, TrackSources: []string{"issue_linked"}},
+		{Repo: "pingcap/tidb", Number: 99999, TrackSources: []string{"issue_linked"}},
+	}, 20)
+	if err != nil {
+		t.Fatalf("expected partial NOT_FOUND to succeed, got %v", err)
+	}
+	if len(statuses) != 1 || statuses[0].Num != 73064 || !statuses[0].IsCherryPick {
+		t.Fatalf("expected 1 cherry-pick PR #73064, got %+v", statuses)
+	}
+
+	// 2. Non-NOT_FOUND GraphQL error surfaces an error instead of silently returning empty
+	forbiddenRunner := fnRunner(func(_ context.Context, _ string, _ map[string]string) ([]byte, error) {
+		return []byte(`{"data":{"repository":null},"errors":[{"type":"FORBIDDEN","message":"Resource not accessible"}]}`), nil
+	})
+	if _, _, err := FetchAndClassifyBatchWithRunner(context.Background(), forbiddenRunner, []PRTarget{{Repo: "pingcap/tidb", Number: 73064}}, 20); err == nil || !strings.Contains(err.Error(), "FORBIDDEN") {
+		t.Fatalf("expected FORBIDDEN GraphQL error to surface, got %v", err)
+	}
+
+	// 3. Pre-cancelled context returns context.Canceled instead of silent partial success
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err = FetchAndClassifyBatchWithRunner(ctx, partialRunner, []PRTarget{{Repo: "pingcap/tidb", Number: 73064}}, 1)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled on cancelled context, got %v", err)
 	}
 }

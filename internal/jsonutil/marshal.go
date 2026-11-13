@@ -14,7 +14,10 @@ func MarshalCompactJS(v any) (string, error) {
 		return "", err
 	}
 	s := strings.TrimSuffix(buf.String(), "\n")
-	s = strings.ReplaceAll(s, "</", "<\\/")
+	s = strings.ReplaceAll(s, "</", `\u003c/`)
+	s = strings.ReplaceAll(s, "<!--", `\u003c!--`)
+	s = strings.ReplaceAll(s, "\u2028", `\u2028`)
+	s = strings.ReplaceAll(s, "\u2029", `\u2029`)
 	return s, nil
 }
 
