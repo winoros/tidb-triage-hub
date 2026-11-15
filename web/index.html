@@ -603,14 +603,14 @@
   }
   .search-clear:hover { color: var(--text); background: var(--surface-hover); }
 
-  select, input[type="date"], input[type="text"], textarea {
+  select, input[type="date"], input[type="text"], input[type="password"], textarea {
     background: var(--surface-subtle); color: var(--text);
     border: 1px solid var(--border); border-radius: 6px;
     padding: 5px 9px; font-size: 12px; line-height: 18px; min-width: 0; max-width: 100%;
     transition: border-color 0.12s ease;
   }
-  select, input[type="text"] { height: 32px; padding-top: 0; padding-bottom: 0; }
-  select:hover, input[type="date"]:hover { border-color: var(--border-strong); }
+  select, input[type="text"], input[type="password"] { height: 32px; padding-top: 0; padding-bottom: 0; }
+  select:hover, input[type="date"]:hover, input[type="text"]:hover, input[type="password"]:hover { border-color: var(--border-strong); }
   .date-grp {
     display: inline-flex; align-items: center; gap: 5px;
     height: 32px; font-size: 12px; line-height: 1; color: var(--muted);
@@ -912,7 +912,7 @@
   .fld-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .fld { display: flex; flex-direction: column; gap: 4px; }
   .fld label { font-size: 12px; font-weight: 600; color: var(--text-secondary); }
-  .fld select, .fld textarea, .fld input[type="text"] { width: 100%; }
+  .fld select, .fld textarea, .fld input[type="text"], .fld input[type="password"] { width: 100%; }
   .fld textarea { min-height: 72px; resize: vertical; line-height: 1.48; }
   .chk-card {
     display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px;
@@ -1106,8 +1106,25 @@
           <span data-i18n="report.rw.pendingBtn">Inbox</span>
           <span class="btn-badge" id="pendingCntBadge">0</span>
         </button>
+        <button type="button" class="btn" id="syncPrsBtn" hidden>
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+          <span id="syncPrsBtnLbl" data-i18n="report.rw.syncPrsBtn">Sync PRs</span>
+        </button>
+        <button type="button" class="btn" id="syncIssuesBtn" hidden>
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"></path><path d="M16 16h5v5"></path></svg>
+          <span id="syncIssuesBtnLbl" data-i18n="report.rw.syncIssuesBtn">Sync Issues</span>
+        </button>
+        <button type="button" class="btn" id="authLogoutBtn" hidden>
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+          <span class="hide-xs" data-i18n="report.rw.lockBtn">Lock</span>
+        </button>
         <span class="hdr-divider"></span>
       </div>
+
+      <button type="button" class="btn" id="authUnlockBtn" hidden>
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 9.9-1"></path></svg>
+        <span data-i18n="report.rw.unlockBtn">Unlock RW</span>
+      </button>
 
       <button type="button" class="btn" id="toggleOverviewBtn">
         <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
@@ -1554,6 +1571,29 @@
   </div>
 </div>
 
+<!-- Modal: Maintainer Token Login -->
+<div class="drawer-backdrop" id="authModal" style="justify-content:center;align-items:center;padding:16px;" hidden>
+  <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="authModalTitle" style="width:100%;max-width:420px;height:auto;border-radius:12px;border:1px solid var(--border);">
+    <div class="drawer-hdr">
+      <h2 id="authModalTitle" data-i18n="report.rw.authModalTitle"></h2>
+      <button type="button" class="btn btn-icon" id="closeAuthModalBtn" data-i18n-title="report.rw.drawer.close">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+      </button>
+    </div>
+    <div class="drawer-body" style="gap:12px;">
+      <p style="margin:0;font-size:12.5px;color:var(--muted);line-height:1.5;" data-i18n="report.rw.authModalHint"></p>
+      <div class="fld">
+        <input type="password" id="authTokenInput" autocomplete="current-password" data-i18n-placeholder="report.rw.authTokenPlaceholder">
+      </div>
+      <div id="authErrorMsg" style="font-size:12px;color:var(--sev-crit-fg);" hidden></div>
+    </div>
+    <div class="drawer-ftr" style="justify-content:flex-end;gap:8px;">
+      <button type="button" class="btn" id="authCancelBtn" data-i18n="report.rw.authCancelBtn"></button>
+      <button type="button" class="btn btn-primary" id="authSubmitBtn" data-i18n="report.rw.authSubmitBtn"></button>
+    </div>
+  </div>
+</div>
+
 <div class="toast-box" id="toastBox" role="status" aria-live="polite" hidden></div>
 <button type="button" class="back-top-btn" id="backTopBtn" data-i18n-title="common.backToTop" hidden>
   <svg class="ico ico-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
@@ -1579,6 +1619,9 @@
     permissions: { can_triage: false, can_sync: false }
   };
   var CAN_TRIAGE = Boolean(SESSION.permissions && SESSION.permissions.can_triage);
+  var CAN_SYNC = Boolean(SESSION.permissions && SESSION.permissions.can_sync);
+  var AUTH_REQUIRED = Boolean(SESSION.auth_required);
+  var IS_AUTHENTICATED = Boolean(SESSION.authenticated);
 
   var esc = SiteI18n.escHtml;
   var t = SiteI18n.t;
@@ -1705,6 +1748,7 @@
   var inboxTabInitialized = false;
   var EXCLUDED_ITEMS = null;
   var excludedLoading = false;
+  var excludedLoadError = "";
   var excludedQuery = "";
   var pendingDrafts = {};
 
@@ -2032,23 +2076,10 @@
       deltaWrap.hidden = true;
     }
 
-    var permBadge = document.getElementById("permBadge");
-    permBadge.textContent = CAN_TRIAGE ? t("report.rw.modeBadge") : t("report.rw.readonlyBadge");
-    permBadge.classList.toggle("ro", !CAN_TRIAGE);
-
     var mainlineCnt = PR_ITEMS.filter(function(it) { return !it.st.is_cherry_pick; }).length;
     document.getElementById("tabIssuesCnt").textContent = SCOPE_COUNTS.all;
     document.getElementById("tabPrsCnt").textContent = mainlineCnt;
-
-    var rwBar = document.getElementById("rwBar");
-    var pBtn = document.getElementById("pendingInboxBtn");
-    var actionCnt = PENDING.length + RETRIAGE_LIST.length;
-    rwBar.hidden = !CAN_TRIAGE;
-    pBtn.hidden = !CAN_TRIAGE;
-    if (CAN_TRIAGE) {
-      document.getElementById("pendingCntBadge").textContent = actionCnt;
-      pBtn.classList.toggle("btn-amber", actionCnt > 0);
-    }
+    applySessionChrome();
 
     document.getElementById("optScopeAll").textContent = t("report.filters.scope.all", { count: SCOPE_COUNTS.all });
     document.getElementById("optScopeCan").textContent = t("report.filters.scope.canonical", { count: SCOPE_COUNTS.can });
@@ -3134,23 +3165,41 @@
   }
 
   function syncBodyDrawerLock() {
-    var anyOpen = !document.getElementById("editDrawer").hidden || !document.getElementById("inboxDrawer").hidden;
+    var anyOpen = !document.getElementById("editDrawer").hidden ||
+      !document.getElementById("inboxDrawer").hidden ||
+      !document.getElementById("authModal").hidden;
     document.body.classList.toggle("drawer-open", anyOpen);
   }
 
-  function openEditDrawer(num) {
-    var rec = DATA.find(function(r) { return r.number === num; });
-    if (!rec) return;
-    editingIssueNum = num;
+  function applySessionChrome() {
+    var permBadge = document.getElementById("permBadge");
+    if (permBadge) {
+      permBadge.textContent = CAN_TRIAGE ? t("report.rw.modeBadge") : t("report.rw.readonlyBadge");
+      permBadge.classList.toggle("ro", !CAN_TRIAGE);
+    }
+    var rwBar = document.getElementById("rwBar");
+    var pBtn = document.getElementById("pendingInboxBtn");
+    var syncPrsBtn = document.getElementById("syncPrsBtn");
+    var syncIssuesBtn = document.getElementById("syncIssuesBtn");
+    var authUnlockBtn = document.getElementById("authUnlockBtn");
+    var authLogoutBtn = document.getElementById("authLogoutBtn");
+    var actionCnt = PENDING.length + RETRIAGE_LIST.length;
+    if (rwBar) rwBar.hidden = !(CAN_TRIAGE || CAN_SYNC || (AUTH_REQUIRED && IS_AUTHENTICATED));
+    if (pBtn) pBtn.hidden = !CAN_TRIAGE;
+    if (syncPrsBtn) syncPrsBtn.hidden = !CAN_SYNC;
+    if (syncIssuesBtn) syncIssuesBtn.hidden = !CAN_SYNC;
+    if (authUnlockBtn) authUnlockBtn.hidden = !(AUTH_REQUIRED && !IS_AUTHENTICATED);
+    if (authLogoutBtn) authLogoutBtn.hidden = !(AUTH_REQUIRED && IS_AUTHENTICATED);
+    if (CAN_TRIAGE && pBtn) {
+      document.getElementById("pendingCntBadge").textContent = actionCnt;
+      pBtn.classList.toggle("btn-amber", actionCnt > 0);
+    }
+  }
 
-    var issUrl = "https://github.com/pingcap/tidb/issues/" + rec.number;
-    document.getElementById("drawerGhLink").setAttribute("href", issUrl);
-    document.getElementById("editDrawerTitle").textContent = CAN_TRIAGE
-      ? t("report.rw.drawer.title", { num: num })
-      : t("report.rw.drawer.inspectTitle", { num: num });
-
+  function renderDrawerRetriageBanner(rec) {
     var rBanner = document.getElementById("editRetriageBanner");
-    if (rec.needs_retriage) {
+    if (!rBanner) return;
+    if (rec && rec.needs_retriage) {
       var details = (rec.retriage_details && rec.retriage_details.length)
         ? rec.retriage_details
         : (rec.retriage_reasons || []).map(function(c) { return { code: c, summary: "" }; });
@@ -3172,6 +3221,69 @@
       rBanner.innerHTML = "";
       rBanner.hidden = true;
     }
+  }
+
+  function syncOpenEditDrawerSessionUI(resetExcludeDraft) {
+    if (!editingIssueNum || document.getElementById("editDrawer").hidden) return;
+    var rec = DATA.find(function(r) { return r.number === editingIssueNum; });
+    if (!rec) return;
+    document.getElementById("editDrawerTitle").textContent = CAN_TRIAGE
+      ? t("report.rw.drawer.title", { num: editingIssueNum })
+      : t("report.rw.drawer.inspectTitle", { num: editingIssueNum });
+    renderDrawerRetriageBanner(rec);
+
+    ["edCat", "edSev", "edSub", "edBorderline", "edForceKeep", "edNoteZh", "edNoteEn"].forEach(function(id) {
+      document.getElementById(id).disabled = !CAN_TRIAGE;
+    });
+
+    var exZone = document.getElementById("editExcludeZone");
+    var canNote = document.getElementById("editCanonicalNote");
+    if (CAN_TRIAGE && !rec.is_canonical) {
+      exZone.hidden = false;
+      if (resetExcludeDraft) {
+        exZone.open = false;
+        document.getElementById("edExcludeReason").value = "";
+      }
+      canNote.hidden = true;
+    } else if (CAN_TRIAGE && rec.is_canonical) {
+      exZone.hidden = true;
+      canNote.hidden = false;
+    } else {
+      exZone.hidden = true;
+      canNote.hidden = true;
+    }
+
+    document.getElementById("resetOverrideBtn").hidden = !(CAN_TRIAGE && rec.manual_override);
+    document.getElementById("saveOverrideBtn").hidden = !CAN_TRIAGE;
+    document.getElementById("saveShortcutHint").hidden = !CAN_TRIAGE;
+  }
+
+  function applySessionState(nextSession) {
+    SESSION = nextSession || {
+      viewer: { login: "anonymous", role: "viewer" },
+      permissions: { can_triage: false, can_sync: false }
+    };
+    window.TRIAGE_SESSION = SESSION;
+    CAN_TRIAGE = Boolean(SESSION.permissions && SESSION.permissions.can_triage);
+    CAN_SYNC = Boolean(SESSION.permissions && SESSION.permissions.can_sync);
+    AUTH_REQUIRED = Boolean(SESSION.auth_required);
+    IS_AUTHENTICATED = Boolean(SESSION.authenticated);
+
+    applySessionChrome();
+    syncOpenEditDrawerSessionUI(false);
+    if (!CAN_TRIAGE && !document.getElementById("inboxDrawer").hidden) {
+      closeInboxDrawer();
+    }
+    renderAll();
+  }
+
+  function openEditDrawer(num) {
+    var rec = DATA.find(function(r) { return r.number === num; });
+    if (!rec) return;
+    editingIssueNum = num;
+
+    var issUrl = "https://github.com/pingcap/tidb/issues/" + rec.number;
+    document.getElementById("drawerGhLink").setAttribute("href", issUrl);
 
     var assDisp = (rec.assignees && rec.assignees.length)
       ? fmtUsers(rec.assignees)
@@ -3208,30 +3320,8 @@
     document.getElementById("edNoteZh").value = (rec.note && rec.note["zh-CN"]) || "";
     document.getElementById("edNoteEn").value = (rec.note && rec.note.en) || "";
 
-    ["edCat", "edSev", "edSub", "edBorderline", "edForceKeep", "edNoteZh", "edNoteEn"].forEach(function(id) {
-      document.getElementById(id).disabled = !CAN_TRIAGE;
-    });
-
-    var exZone = document.getElementById("editExcludeZone");
-    var canNote = document.getElementById("editCanonicalNote");
-    if (CAN_TRIAGE && !rec.is_canonical) {
-      exZone.hidden = false;
-      exZone.open = false;
-      document.getElementById("edExcludeReason").value = "";
-      canNote.hidden = true;
-    } else if (CAN_TRIAGE && rec.is_canonical) {
-      exZone.hidden = true;
-      canNote.hidden = false;
-    } else {
-      exZone.hidden = true;
-      canNote.hidden = true;
-    }
-
-    document.getElementById("resetOverrideBtn").hidden = !(CAN_TRIAGE && rec.manual_override);
-    document.getElementById("saveOverrideBtn").hidden = !CAN_TRIAGE;
-    document.getElementById("saveShortcutHint").hidden = !CAN_TRIAGE;
-
     document.getElementById("editDrawer").hidden = false;
+    syncOpenEditDrawerSessionUI(true);
     syncBodyDrawerLock();
   }
 
@@ -3260,11 +3350,42 @@
     if (e.target === this) closeEditDrawer();
   });
 
+  function openAuthModal() {
+    var inp = document.getElementById("authTokenInput");
+    if (!inp) return;
+    inp.value = "";
+    document.getElementById("authErrorMsg").hidden = true;
+    document.getElementById("authModal").hidden = false;
+    syncBodyDrawerLock();
+    setTimeout(function() { inp.focus(); }, 20);
+  }
+
   function apiFetch(subpath, opts) {
     return fetch(appUrl(subpath), opts).then(function(res) {
-      return res.json().then(function(body) {
-        if (!res.ok) throw new Error((body && body.error) || ("HTTP " + res.status));
-        return body;
+      return res.text().then(function(raw) {
+        var body = null;
+        if (raw) {
+          try { body = JSON.parse(raw); } catch (_) { body = null; }
+        }
+        if (!res.ok) {
+          var errMsg = (body && typeof body.error === "string") ? body.error : "";
+          var isAuthFailure = res.status === 401 ||
+            (res.status === 403 && (!IS_AUTHENTICATED || errMsg.indexOf("permission required") !== -1));
+          if (isAuthFailure && AUTH_REQUIRED && String(subpath || "").indexOf("api/session/") === -1) {
+            applySessionState({
+              viewer: { login: "viewer", role: "viewer" },
+              permissions: { can_triage: false, can_sync: false },
+              auth_required: true,
+              authenticated: false
+            });
+            openAuthModal();
+          }
+          var msg = errMsg || ("HTTP " + res.status + (res.statusText ? " " + res.statusText : ""));
+          var err = new Error(msg);
+          err.status = res.status;
+          throw err;
+        }
+        return body || {};
       });
     });
   }
@@ -3308,11 +3429,11 @@
     });
   }
 
-  if (CAN_TRIAGE) {
+  {
     document.getElementById("saveOverrideBtn").addEventListener("click", submitCurrentOverride);
 
     document.getElementById("resetOverrideBtn").addEventListener("click", function() {
-      if (!editingIssueNum) return;
+      if (!CAN_TRIAGE || !editingIssueNum) return;
       var num = editingIssueNum;
       var btn = this;
       btn.disabled = true;
@@ -3337,7 +3458,7 @@
 
     document.getElementById("editRetriageBanner").addEventListener("click", function(e) {
       var ackBtn = e.target.closest("#drawerAckRetriageBtn");
-      if (!ackBtn || !editingIssueNum) return;
+      if (!CAN_TRIAGE || !ackBtn || !editingIssueNum) return;
       var num = editingIssueNum;
       ackBtn.disabled = true;
       apiFetch("./api/issues/" + num + "/retriage/ack", {
@@ -3356,7 +3477,7 @@
     });
 
     document.getElementById("edExcludeConfirmBtn").addEventListener("click", function() {
-      if (!editingIssueNum) return;
+      if (!CAN_TRIAGE || !editingIssueNum) return;
       var num = editingIssueNum;
       var reason = document.getElementById("edExcludeReason").value.trim();
       var btn = this;
@@ -3392,8 +3513,12 @@
 
     function renderExcludedListInto(container) {
       if (!container) return;
-      if (excludedLoading || !Array.isArray(EXCLUDED_ITEMS)) {
+      if (excludedLoading) {
         container.innerHTML = '<div class="empty-state"><p>Loading…</p></div>';
+        return;
+      }
+      if (!Array.isArray(EXCLUDED_ITEMS)) {
+        container.innerHTML = '<div class="empty-state"><p>' + esc(excludedLoadError || "Loading…") + '</p></div>';
         return;
       }
       var q = (excludedQuery || "").trim().toLowerCase();
@@ -3429,12 +3554,14 @@
     function ensureExcludedLoaded() {
       if (Array.isArray(EXCLUDED_ITEMS) || excludedLoading) return;
       excludedLoading = true;
+      excludedLoadError = "";
       apiFetch("./api/excluded").then(function(resp) {
         EXCLUDED_ITEMS = resp.excluded_issues || [];
         SCOPE_COUNTS.excluded = EXCLUDED_ITEMS.length;
       }).catch(function(err) {
-        showToast(err.message, "error");
-        EXCLUDED_ITEMS = [];
+        excludedLoadError = (err && err.message) || "Failed to load excluded issues";
+        showToast(excludedLoadError, "error");
+        EXCLUDED_ITEMS = null;
       }).finally(function() {
         excludedLoading = false;
         updateInboxTabsHeader();
@@ -3445,6 +3572,7 @@
     }
 
     function openInboxDrawer() {
+      if (!CAN_TRIAGE) return;
       if (!inboxTabInitialized) {
         if (PENDING.length > 0) activeInboxTab = "pending";
         else if (RETRIAGE_LIST.length > 0) activeInboxTab = "retriage";
@@ -3756,6 +3884,7 @@
           })
         }).then(function(resp) {
           delete pendingDrafts[String(num)];
+          EXCLUDED_ITEMS = null;
           setDatasetAndRender(resp.dataset, resp.pending_candidates);
           renderInboxDrawer();
           if (resp.pr_sync_warning) {
@@ -3791,11 +3920,125 @@
     });
   }
 
+  {
+    function bindHeaderSyncAction(btnId, lblId, idleI18nKey, endpoint, invalidateExcluded, onSuccess) {
+      document.getElementById(btnId).addEventListener("click", function() {
+        if (!CAN_SYNC) return;
+        var btn = this;
+        var lbl = document.getElementById(lblId);
+        if (btn.disabled) return;
+        btn.disabled = true;
+        lbl.setAttribute("data-i18n", "report.rw.syncing");
+        lbl.textContent = t("report.rw.syncing");
+        apiFetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}"
+        }).then(function(resp) {
+          if (invalidateExcluded) EXCLUDED_ITEMS = null;
+          if (resp.dataset) setDatasetAndRender(resp.dataset, resp.pending_candidates);
+          var inboxDrawer = document.getElementById("inboxDrawer");
+          if (inboxDrawer && !inboxDrawer.hidden) {
+            renderInboxDrawer();
+          }
+          onSuccess(resp);
+        }).catch(function(err) {
+          showToast(err.message, "error");
+        }).finally(function() {
+          btn.disabled = false;
+          lbl.setAttribute("data-i18n", idleI18nKey);
+          lbl.textContent = t(idleI18nKey);
+        });
+      });
+    }
+
+    bindHeaderSyncAction("syncPrsBtn", "syncPrsBtnLbl", "report.rw.syncPrsBtn", "./api/sync/prs", false, function(resp) {
+      var st = resp.stats || {};
+      showToast(t("report.rw.toastPrSynced", {
+        open: st.open_count || 0,
+        calls: st.graphql_calls || 0,
+        ms: st.duration_ms || 0
+      }), "success");
+    });
+
+    bindHeaderSyncAction("syncIssuesBtn", "syncIssuesBtnLbl", "report.rw.syncIssuesBtn", "./api/sync/issues", true, function(resp) {
+      var r = resp.result || {};
+      showToast(t("report.rw.toastIssueSynced", {
+        pending: r.pending_count || 0
+      }), "success");
+    });
+  }
+
+  function closeAuthModal() {
+    document.getElementById("authModal").hidden = true;
+    document.getElementById("authErrorMsg").hidden = true;
+    syncBodyDrawerLock();
+  }
+
+  function submitAuthLogin() {
+    var inp = document.getElementById("authTokenInput");
+    var errEl = document.getElementById("authErrorMsg");
+    var btn = document.getElementById("authSubmitBtn");
+    var tok = (inp.value || "").trim();
+    if (!tok || btn.disabled) return;
+    btn.disabled = true;
+    errEl.hidden = true;
+    apiFetch("./api/session/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: tok })
+    }).then(function(nextSess) {
+      applySessionState(nextSess);
+      return apiFetch("./api/state").catch(function() { return null; });
+    }).then(function(stateResp) {
+      if (stateResp) {
+        if (stateResp.dataset) setDatasetAndRender(stateResp.dataset, stateResp.pending_candidates);
+        if (stateResp.session) applySessionState(stateResp.session);
+      }
+      btn.disabled = false;
+      closeAuthModal();
+    }).catch(function(err) {
+      errEl.textContent = (err && err.status === 401) ? t("report.rw.authInvalidToken") : ((err && err.message) || t("report.rw.authInvalidToken"));
+      errEl.hidden = false;
+      btn.disabled = false;
+    });
+  }
+
+  document.getElementById("authUnlockBtn").addEventListener("click", openAuthModal);
+  document.getElementById("closeAuthModalBtn").addEventListener("click", closeAuthModal);
+  document.getElementById("authCancelBtn").addEventListener("click", closeAuthModal);
+  document.getElementById("authModal").addEventListener("click", function(e) {
+    if (e.target === this) closeAuthModal();
+  });
+  document.getElementById("authSubmitBtn").addEventListener("click", submitAuthLogin);
+  document.getElementById("authTokenInput").addEventListener("keydown", function(e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submitAuthLogin();
+    }
+  });
+  document.getElementById("authLogoutBtn").addEventListener("click", function() {
+    var btn = this;
+    btn.disabled = true;
+    apiFetch("./api/session/logout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    }).then(function(nextSess) {
+      applySessionState(nextSess);
+      window.location.reload();
+    }).catch(function(err) {
+      showToast(err.message, "error");
+      btn.disabled = false;
+    });
+  });
+
   // Global keyboard shortcuts
   document.addEventListener("keydown", function(e) {
     if (e.key === "Escape") {
       closeEditDrawer();
       closeInboxDrawer();
+      closeAuthModal();
       document.getElementById("syncPopover").hidden = true;
       return;
     }
@@ -3806,7 +4049,7 @@
     }
     var tag = e.target && e.target.tagName;
     if (e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey && tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") {
-      if (!document.getElementById("editDrawer").hidden || !document.getElementById("inboxDrawer").hidden) return;
+      if (!document.getElementById("editDrawer").hidden || !document.getElementById("inboxDrawer").hidden || !document.getElementById("authModal").hidden) return;
       e.preventDefault();
       var targetSearch = document.getElementById(activeView === "prs" ? "prQ" : "q");
       if (targetSearch) targetSearch.focus();

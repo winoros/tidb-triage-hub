@@ -7,7 +7,9 @@ description: Incrementally sync, inspect, triage, re-triage, and backfill root-c
 
 Use this workflow whenever syncing GitHub issues/PRs or performing AI-assisted triage, dynamic re-triage, or note backfill in `tidb-triage-hub`.
 
-**Prerequisites**: Ensure `gh` CLI is authenticated (used by `sync-issues`, `pending`, `triage --sync-new-prs`, and `gh pr diff`) and `./bin/triage-hub` is up to date (`go build -o bin/triage-hub ./cmd/triage-hub` if missing or after Go code changes).
+**Prerequisites**:
+- Ensure `gh` CLI is authenticated (used on the AI worker for `gh pr diff` / `gh issue view`, or by local `triage-hub` when `GITHUB_TOKEN` is unset) and `./bin/triage-hub` is up to date (`go build -o bin/triage-hub ./cmd/triage-hub` if missing or after Go code changes).
+- **Local vs. Remote Split Mode**: All `./bin/triage-hub` commands below work identically against a local SQLite DB (default) **or** against a remote Machine A web server when `TRIAGE_HUB_URL` + `TRIAGE_HUB_TOKEN` (or `--remote` + `--token`) are set. In remote mode, `triage` automatically skips items modified concurrently on the Web UI (`--skip-conflicts=true` by default) and downloads a local disaster-recovery snapshot to `data/remote_backup.db`.
 
 ## 1. End-to-End Triage Loop (Zero Temp Files)
 
@@ -36,10 +38,11 @@ Use this workflow whenever syncing GitHub issues/PRs or performing AI-assisted t
        ```
      - When an issue has no PR yet, inspect full comments (`gh issue view <num> --repo pingcap/tidb --comments`) and, if a local TiDB checkout is available (note: `tidb-triage-hub` does **not** contain TiDB source), inspect `pkg/planner/`, `pkg/statistics/`, `pkg/bindinfo/`, `pkg/util/ranger/`.
      - Grade `cat` (Difficulty) and `severity` independently using Section 2.4 and `triage_rubric.severity_guide` (low-confidence items pre-fill `"TODO: REVIEW"` in `decisions_template`).
-5. **Dry-run & apply decisions via stdin** (no temporary files needed):
+5. **Dry-run & apply decisions via stdin** (no temporary files needed; **always carry `base_exported_at`** from the `pending` bundle's `exported_at_utc` — and `if_unmodified_since` from `retriage_candidates[].triaged_at` when overriding — so concurrent Web UI calibrations are protected):
    ```bash
    ./bin/triage-hub triage --stdin --dry-run <<'EOF'
    {
+     "base_exported_at": "2026-11-13T15:00:00.000000000Z",
      "new_issues": {
        "73100": {
          "cat": "EASY",

@@ -4,8 +4,8 @@ Standalone pure-Go workbench (`Go` + `modernc.org/sqlite` + zero-dependency bili
 
 ## Directory Layout
 
-- `cmd/triage-hub/main.go` — HTTP server & CLI entrypoint (`serve`, `status`, `sync-issues`, `sync-prs`, `pending`, `triage`)
-- `internal/ghgql/` — Shared GitHub GraphQL v4 client (`gh api graphql`), retry runner, quota pre-flight & `CostTracker`
+- `cmd/triage-hub/` — Single-binary HTTP server & CLI entrypoint (`serve`, `status`, `sync-issues`, `sync-prs`, `pending`, `triage`, `backup`) supporting both local SQLite and remote HTTP (`--remote` / `TRIAGE_HUB_URL`)
+- `internal/ghgql/` — Shared GitHub GraphQL v4 client (pure-Go `net/http` `HTTPRunner` via `GITHUB_TOKEN`/`GH_TOKEN`, falling back to `gh api graphql`), retry runner, quota pre-flight & `CostTracker`
 - `internal/issuesync/` — Pure-Go Dual-Stream sync engine (`>800`-hit time-window bisection, 7-repo PR reverse index, Tier-1/Tier-2 optimizer-affinity discovery & label-delta re-admission)
 - `internal/triage/` — Embedded triage rubric + few-shot examples, PR non-test file enrichment, clue extraction, heuristic pre-suggestions, 6-trigger dynamic re-triage evaluator & bilingual note validator
 - `internal/prstatus/` — Batched GitHub GraphQL fetcher + 9-stage `pingcap/tidb` PR blocker classifier
@@ -55,4 +55,31 @@ SQLite runs in `WAL` mode (`busy_timeout=15000`), so CLI commands safely run con
 ./bin/triage-hub triage --ack-retriage 73063
 ./bin/triage-hub triage --exclude 72985 --reason "Dashboard UI issue"
 ./bin/triage-hub pending --backfill-notes 10
+```
+
+## Split Deployment (Machine A Web/Sync + Machine B AI Triage)
+
+`bin/triage-hub` embeds `web/` and `seed/initial_dataset.json`, and uses a pure-Go HTTP GraphQL client whenever `GITHUB_TOKEN` (or `GH_TOKEN`) is set — so **Machine A** needs only the single binary (`1 vCPU / 512 MB RAM` is sufficient, no `gh` CLI required) and owns the single SQLite source of truth.
+
+```bash
+# Machine A (Web Dashboard + SQLite + GitHub Sync):
+# Anonymous visitors see Read-Only mode; maintainers click "Unlock RW" in browser; Machine B uses Bearer token.
+GITHUB_TOKEN=ghp_xxx \
+TRIAGE_HUB_TOKEN=your-strong-secret \
+./bin/triage-hub serve \
+  --addr 0.0.0.0:8787 \
+  --db /var/lib/triage-hub/tidb_triage.db \
+  --sync-prs-interval 30m \
+  --sync-issues-interval 2h
+
+# Machine B (AI Triage Worker with local TiDB repo & gh CLI — zero local SQLite state):
+export TRIAGE_HUB_URL="http://machine-a:8787"
+export TRIAGE_HUB_TOKEN="your-strong-secret"
+
+./bin/triage-hub status
+./bin/triage-hub sync-issues
+./bin/triage-hub pending
+./bin/triage-hub triage --stdin --dry-run < decisions.json
+./bin/triage-hub triage --stdin < decisions.json   # conflict-safe + auto-saves snapshot to data/remote_backup.db
+./bin/triage-hub backup --out data/remote_backup.db
 ```
