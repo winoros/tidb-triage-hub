@@ -81,24 +81,35 @@ type LiveIssueUpdate struct {
 	RecentComments    []model.PendingComment
 }
 
+type SyncAppliedOutcome struct {
+	ClosedRemovedNums    []int
+	GraduatedRemovedNums []int
+	RestoredNums         []int
+	PendingQueueNums     []int
+}
+
 type SyncPlan struct {
-	ModeUsed           string
-	SnapshotUTC        string
-	SinceUTC           string
-	Stats              ghgql.CallStats
-	UpdatedIssues      []LiveIssueUpdate
-	RestoredIssues     []LiveIssueUpdate
-	ClosedRemovals     []model.DeltaClosedIssue
-	GraduatedRemovals  []model.DeltaGraduatedIssue
-	StreamBPRRefs      map[int][]model.LinkedPRRef
-	UnlinkedStreamBPRs map[int][]string
-	DirectPRUpdates    map[string]model.LinkedPRRef
-	UpsertPending      []model.PendingCandidate
-	DeletePendingNums  []int
-	ReadmittedNums     []int
-	ClearedRecheckNums []int
-	PRChangedNums      []int
-	MetaChangedNums    []int
+	ModeUsed              string
+	PlanStartedUTC        string
+	SnapshotUTC           string
+	SinceUTC              string
+	Stats                 ghgql.CallStats
+	UpdatedIssues         []LiveIssueUpdate
+	RestoredIssues        []LiveIssueUpdate
+	ClosedRemovals        []model.DeltaClosedIssue
+	ClosedPendingRemovals []model.DeltaClosedIssue
+	GraduatedRemovals     []model.DeltaGraduatedIssue
+	PendingLiveUpdates    map[int]LiveIssueUpdate
+	StreamBPRRefs         map[int][]model.LinkedPRRef
+	UnlinkedStreamBPRs    map[int][]string
+	DirectPRUpdates       map[string]model.LinkedPRRef
+	UpsertPending         []model.PendingCandidate
+	DeletePendingNums     []int
+	ReadmittedNums        []int
+	ClearedRecheckNums    []int
+	PRChangedNums         []int
+	MetaChangedNums       []int
+	Applied               *SyncAppliedOutcome
 }
 
 type Engine struct {
@@ -1151,9 +1162,11 @@ func (e *Engine) PlanSync(ctx context.Context, state SyncState, opts Options) (S
 	sort.Slice(pendingToCheck, func(i, j int) bool { return pendingToCheck[i] > pendingToCheck[j] })
 
 	var (
-		upsertPending     []model.PendingCandidate
-		deletePendingNums []int
-		readmittedNums    []int
+		upsertPending         []model.PendingCandidate
+		deletePendingNums     []int
+		closedPendingRemovals []model.DeltaClosedIssue
+		pendingLiveUpdates    = make(map[int]LiveIssueUpdate)
+		readmittedNums        []int
 	)
 	if len(pendingToCheck) > 0 {
 		liveNew, err := e.fetchIssuesBatch(ctx, tracker, pendingToCheck, true)
@@ -1165,10 +1178,26 @@ func (e *Engine) PlanSync(ctx context.Context, state SyncState, opts Options) (S
 			if !ok || !strings.EqualFold(it.State, "OPEN") {
 				if _, wasPending := pendingScopes[n]; wasPending {
 					deletePendingNums = append(deletePendingNums, n)
+					cr := model.DeltaClosedIssue{
+						Number: n,
+						Reason: "Transferred or converted (NOT_FOUND on GitHub)",
+					}
+					if ok {
+						reason := it.StateReason
+						if reason == "" {
+							reason = "COMPLETED"
+						}
+						cr.ClosedAt = it.ClosedAt
+						cr.Reason = fmt.Sprintf("Closed (%s)", reason)
+					}
+					closedPendingRemovals = append(closedPendingRemovals, cr)
 				}
 				continue
 			}
 			upd := it.toLiveUpdate()
+			if _, wasPending := pendingScopes[n]; wasPending {
+				pendingLiveUpdates[n] = upd
+			}
 			prTitles := make([]string, 0, len(upd.TimelinePRs)+len(streamBPRTitlesByIssue[n]))
 			for _, p := range upd.TimelinePRs {
 				prTitles = append(prTitles, p.Title)
@@ -1325,23 +1354,25 @@ func (e *Engine) PlanSync(ctx context.Context, state SyncState, opts Options) (S
 	}
 
 	return SyncPlan{
-		ModeUsed:           modeUsed,
-		SnapshotUTC:        now.Format("2006-01-02T15:04:05Z"),
-		SinceUTC:           sinceTime.Format("2006-01-02T15:04:05Z"),
-		Stats:              tracker.Snapshot(),
-		UpdatedIssues:      updatedIssues,
-		RestoredIssues:     restoredIssues,
-		ClosedRemovals:     closedRemovals,
-		GraduatedRemovals:  graduatedRemovals,
-		StreamBPRRefs:      filteredStreamB,
-		UnlinkedStreamBPRs: unlinkedStreamB,
-		DirectPRUpdates:    directPRUpdates,
-		UpsertPending:      upsertPending,
-		DeletePendingNums:  deletePendingNums,
-		ReadmittedNums:     readmittedNums,
-		ClearedRecheckNums: clearedRecheckNums,
-		PRChangedNums:      prChangedNums,
-		MetaChangedNums:    metaChangedNums,
+		ModeUsed:              modeUsed,
+		SnapshotUTC:           now.Format("2006-01-02T15:04:05Z"),
+		SinceUTC:              sinceTime.Format("2006-01-02T15:04:05Z"),
+		Stats:                 tracker.Snapshot(),
+		UpdatedIssues:         updatedIssues,
+		RestoredIssues:        restoredIssues,
+		ClosedRemovals:        closedRemovals,
+		ClosedPendingRemovals: closedPendingRemovals,
+		GraduatedRemovals:     graduatedRemovals,
+		PendingLiveUpdates:    pendingLiveUpdates,
+		StreamBPRRefs:         filteredStreamB,
+		UnlinkedStreamBPRs:    unlinkedStreamB,
+		DirectPRUpdates:       directPRUpdates,
+		UpsertPending:         upsertPending,
+		DeletePendingNums:     deletePendingNums,
+		ReadmittedNums:        readmittedNums,
+		ClearedRecheckNums:    clearedRecheckNums,
+		PRChangedNums:         prChangedNums,
+		MetaChangedNums:       metaChangedNums,
 	}, nil
 }
 
@@ -1431,21 +1462,38 @@ func FormatSyncSummary(plan SyncPlan, prevDs, nextDs model.Dataset) string {
 	fmt.Fprintf(&sb, "  New Snapshot  : %s (%s)\n", nextDs.SyncMeta.SnapshotUTC8, nextDs.SyncMeta.SnapshotUTC)
 	fmt.Fprintf(&sb, "  Max Updated   : %s (%s)\n", nextDs.SyncMeta.MaxIssueUpdatedUTC8, nextDs.SyncMeta.MaxIssueUpdatedUTC)
 
-	closedNums := make([]int, 0, len(plan.ClosedRemovals))
-	for _, x := range plan.ClosedRemovals {
-		closedNums = append(closedNums, x.Number)
+	var closedNums, gradNums, restoredNums, pendNums []int
+	if plan.Applied != nil {
+		closedNums = append(closedNums, plan.Applied.ClosedRemovedNums...)
+		gradNums = append(gradNums, plan.Applied.GraduatedRemovedNums...)
+		restoredNums = append(restoredNums, plan.Applied.RestoredNums...)
+		pendNums = append(pendNums, plan.Applied.PendingQueueNums...)
+	} else {
+		closedNums = make([]int, 0, len(plan.ClosedRemovals))
+		for _, x := range plan.ClosedRemovals {
+			closedNums = append(closedNums, x.Number)
+		}
+		gradNums = make([]int, 0, len(plan.GraduatedRemovals))
+		for _, x := range plan.GraduatedRemovals {
+			gradNums = append(gradNums, x.Number)
+		}
+		restoredNums = make([]int, 0, len(plan.RestoredIssues))
+		for _, x := range plan.RestoredIssues {
+			restoredNums = append(restoredNums, x.Number)
+		}
+		pendNums = make([]int, 0, len(plan.UpsertPending))
+		for _, x := range plan.UpsertPending {
+			pendNums = append(pendNums, x.Number)
+		}
 	}
-	gradNums := make([]int, 0, len(plan.GraduatedRemovals))
-	for _, x := range plan.GraduatedRemovals {
-		gradNums = append(gradNums, x.Number)
+	if closedNums == nil {
+		closedNums = []int{}
 	}
-	restoredNums := make([]int, 0, len(plan.RestoredIssues))
-	for _, x := range plan.RestoredIssues {
-		restoredNums = append(restoredNums, x.Number)
+	if gradNums == nil {
+		gradNums = []int{}
 	}
-	pendNums := make([]int, 0, len(plan.UpsertPending))
-	for _, x := range plan.UpsertPending {
-		pendNums = append(pendNums, x.Number)
+	if pendNums == nil {
+		pendNums = []int{}
 	}
 
 	fmt.Fprintf(&sb, "  Closed Removed: %v\n", closedNums)

@@ -2,8 +2,11 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -983,5 +986,887 @@ func TestWatermarkIntegrityOverrideSemanticsAndAtomicBatch(t *testing.T) {
 	}
 	if archSyncState.ArchivedIssues[75010].Cat != "ENHANCEMENT" {
 		t.Fatalf("expected ArchivedIssues[75010].Cat == ENHANCEMENT from override, got %+v", archSyncState.ArchivedIssues[75010])
+	}
+}
+
+func TestBootstrapFallbackBackupAndConflictSafeBatchApply(t *testing.T) {
+	tmp := t.TempDir()
+	fallbackJSON := []byte(`{
+  "sync_meta": {
+    "schema_version": 2,
+    "snapshot_utc": "2026-11-12T10:00:00Z",
+    "max_issue_updated_utc": "2026-11-12T09:50:00Z"
+  },
+  "records": [
+    {
+      "number": 76001,
+      "title": "planner: issue calibrated on Web UI",
+      "author": "u1",
+      "created": "2026-11-12",
+      "created_at": "2026-11-12T08:00:00Z",
+      "updated_at": "2026-11-12T09:00:00Z",
+      "labels": ["sig/planner", "type/bug"],
+      "is_canonical": true,
+      "cat": "MEDIUM",
+      "severity": "MAJOR",
+      "gh_severity": "major",
+      "subsystem": "logical_rewrite",
+      "note": {"zh-CN": "初始中文", "en": "Initial EN"}
+    },
+    {
+      "number": 76002,
+      "title": "planner: issue untouched on Web UI",
+      "author": "u2",
+      "created": "2026-11-12",
+      "created_at": "2026-11-12T08:05:00Z",
+      "updated_at": "2026-11-12T09:05:00Z",
+      "labels": ["sig/planner", "type/bug"],
+      "is_canonical": true,
+      "cat": "MEDIUM",
+      "severity": "MODERATE",
+      "gh_severity": "moderate",
+      "subsystem": "statistics",
+      "note": {"zh-CN": "初始统计中文", "en": "Initial stats EN"}
+    }
+  ]
+}`)
+
+	st, err := Open(filepath.Join(tmp, "main.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// 1. BootstrapIfEmptyWithFallback falls back cleanly when seed path is missing
+	seeded, err := st.BootstrapIfEmptyWithFallback(filepath.Join(tmp, "missing_seed.json"), fallbackJSON)
+	if err != nil || !seeded {
+		t.Fatalf("expected BootstrapIfEmptyWithFallback seeded=true, got seeded=%v err=%v", seeded, err)
+	}
+
+	// Queue two pending issues (#76101 and #76102)
+	ds0, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var triagedAt76001, triagedAt76002 string
+	for _, r := range ds0.Records {
+		if r.Number == 76001 {
+			triagedAt76001 = r.TriagedAt
+		}
+		if r.Number == 76002 {
+			triagedAt76002 = r.TriagedAt
+		}
+	}
+	if err := st.IngestSyncedDataset(ds0, []model.PendingCandidate{
+		{
+			Number:    76101,
+			Title:     "planner: resolved concurrently on Web UI",
+			Author:    "alice",
+			CreatedAt: "2026-11-12T10:10:00Z",
+			UpdatedAt: "2026-11-12T10:15:00Z",
+			Labels:    []string{"sig/planner", "type/bug"},
+		},
+		{
+			Number:    76102,
+			Title:     "planner: still pending for Machine B",
+			Author:    "bob",
+			CreatedAt: "2026-11-12T10:20:00Z",
+			UpdatedAt: "2026-11-12T10:25:00Z",
+			Labels:    []string{"sig/planner", "type/bug"},
+		},
+		{
+			Number:    76103,
+			Title:     "mview: non-canonical pending accepted on Web UI while Machine B excludes",
+			Author:    "dave",
+			CreatedAt: "2026-11-12T10:30:00Z",
+			UpdatedAt: "2026-11-12T10:35:00Z",
+			Labels:    []string{"type/bug"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	exportedAt := model.NowRFC3339Nano()
+	time.Sleep(2 * time.Millisecond)
+
+	// 2. Simulate concurrent Web UI activity AFTER Machine B exported pending:
+	//    - Human accepts #76101 and #76103 on Web UI
+	//    - Human calibrates #76001 on Web UI to HARD / CRITICAL
+	if err := st.ResolvePendingCandidate(76101, model.PendingResolveRequest{
+		Action:    "accept",
+		Cat:       "HARD",
+		Severity:  "CRITICAL",
+		Subsystem: "logical_rewrite",
+		Note:      &model.LocalizedNote{ZhCN: "网页人工入库", En: "Accepted via Web UI"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ResolvePendingCandidate(76103, model.PendingResolveRequest{
+		Action:    "accept",
+		Cat:       "MEDIUM",
+		Severity:  "MAJOR",
+		Subsystem: "logical_rewrite",
+		Note:      &model.LocalizedNote{ZhCN: "网页人工保留非canonical", En: "Kept supplemental issue via Web UI"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveIssueOverride(76001, model.TriagePatchRequest{
+		Cat:       "HARD",
+		Severity:  "CRITICAL",
+		Subsystem: "logical_rewrite",
+		Note:      &model.LocalizedNote{ZhCN: "网页人工校准", En: "Calibrated via Web UI"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	batch := model.BatchTriageDecisions{
+		BaseExportedAt: exportedAt,
+		NewIssues: map[string]model.TriagePatchRequest{
+			"76101": {
+				Cat:       "EASY",
+				Severity:  "MINOR",
+				Subsystem: "statistics",
+				Note:      &model.LocalizedNote{ZhCN: "机器B旧结果", En: "Stale Machine B result"},
+			},
+			"76102": {
+				Cat:       "EASY",
+				Severity:  "MAJOR",
+				Subsystem: "statistics",
+				Note:      &model.LocalizedNote{ZhCN: "机器B新入库", En: "Fresh Machine B accept"},
+			},
+		},
+		ExcludeIssues: map[string]string{
+			"76103": "Stale Machine B exclude that must NOT remove human-accepted #76103",
+		},
+		Overrides: map[string]model.TriagePatchRequest{
+			"76001": {
+				Cat:               "EASY",
+				Severity:          "MINOR",
+				Subsystem:         "logical_rewrite",
+				Note:              &model.LocalizedNote{ZhCN: "机器B过期覆盖", En: "Stale Machine B override"},
+				IfUnmodifiedSince: triagedAt76001,
+			},
+			"76002": {
+				Cat:               "EASY",
+				Severity:          "MAJOR",
+				Subsystem:         "statistics",
+				Note:              &model.LocalizedNote{ZhCN: "机器B正常覆盖", En: "Valid Machine B override"},
+				IfUnmodifiedSince: triagedAt76002,
+			},
+		},
+		ManualPRLinks: map[string][]string{
+			"76101": {"79999"}, // must be skipped along with conflict-skipped #76101!
+		},
+	}
+
+	// Strict mode (SkipConflicts=false) rejects stale batch (including BaseExportedAt conflicts)
+	if _, err := st.ValidateBatchDecisionsWithOptions(batch, BatchApplyOptions{SkipConflicts: false}); err == nil {
+		t.Fatal("expected strict ValidateBatchDecisionsWithOptions to fail on already-resolved pending #76101")
+	}
+	baseOnlyStale := model.BatchTriageDecisions{
+		BaseExportedAt: exportedAt,
+		ExcludeIssues:  map[string]string{"76103": "stale exclude"},
+	}
+	if _, err := st.ValidateBatchDecisionsWithOptions(baseOnlyStale, BatchApplyOptions{SkipConflicts: false}); err == nil {
+		t.Fatal("expected strict ValidateBatchDecisionsWithOptions to fail on BaseExportedAt exclude conflict")
+	}
+
+	// Conflict-skip dry-run reports 4 conflicts (#76101 new_issues, #76103 exclude_issues, #76001 overrides, #76101 companion manual_pr_links) without mutating DB
+	dryConflicts, err := st.ValidateBatchDecisionsWithOptions(batch, BatchApplyOptions{SkipConflicts: true})
+	if err != nil {
+		t.Fatalf("expected SkipConflicts validation to succeed, got %v", err)
+	}
+	if len(dryConflicts) != 4 {
+		t.Fatalf("expected 4 skipped conflicts in dry-run, got %+v", dryConflicts)
+	}
+
+	// Genuine typo issue in new_issues still fails even with SkipConflicts=true
+	typoBatch := model.BatchTriageDecisions{
+		NewIssues: map[string]model.TriagePatchRequest{
+			"99999999": {Cat: "EASY", Severity: "MAJOR", Subsystem: "statistics"},
+		},
+	}
+	if _, err := st.ValidateBatchDecisionsWithOptions(typoBatch, BatchApplyOptions{SkipConflicts: true}); err == nil {
+		t.Fatal("expected unknown issue #99999999 to fail validation even with SkipConflicts=true")
+	}
+
+	// Live apply with SkipConflicts=true commits #76102 + #76002 while preserving Web UI #76101, #76103, and #76001!
+	res, err := st.ApplyBatchTriageDecisionsWithOptions(batch, BatchApplyOptions{SkipConflicts: true})
+	if err != nil {
+		t.Fatalf("ApplyBatchTriageDecisionsWithOptions failed: %v", err)
+	}
+	if len(res.AcceptedIssues) != 1 || res.AcceptedIssues[0] != 76102 {
+		t.Fatalf("expected AcceptedIssues=[76102], got %v", res.AcceptedIssues)
+	}
+	if len(res.ExcludedIssues) != 0 {
+		t.Fatalf("expected ExcludedIssues=[] (stale #76103 skipped), got %v", res.ExcludedIssues)
+	}
+	if res.ManualPRsLinked != 0 {
+		t.Fatalf("expected companion manual_pr_links on skipped #76101 to be skipped, got %d", res.ManualPRsLinked)
+	}
+	if len(res.OverriddenIssues) != 1 || res.OverriddenIssues[0] != 76002 {
+		t.Fatalf("expected OverriddenIssues=[76002], got %v", res.OverriddenIssues)
+	}
+	if len(res.SkippedConflicts) != 4 {
+		t.Fatalf("expected 4 SkippedConflicts, got %+v", res.SkippedConflicts)
+	}
+
+	dsFinal, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byNum := make(map[int]model.IssueRecord)
+	for _, r := range dsFinal.Records {
+		byNum[r.Number] = r
+	}
+	if byNum[76101].Cat != "HARD" || byNum[76101].Note.En != "Accepted via Web UI" || len(byNum[76101].PRs) != 0 {
+		t.Fatalf("expected Web UI accept on #76101 preserved without stale manual PR, got %+v", byNum[76101])
+	}
+	if byNum[76103].Cat != "MEDIUM" || byNum[76103].Note.En != "Kept supplemental issue via Web UI" {
+		t.Fatalf("expected Web UI accept on #76103 preserved (not excluded), got %+v", byNum[76103])
+	}
+	if byNum[76001].Cat != "HARD" || byNum[76001].Note.En != "Calibrated via Web UI" {
+		t.Fatalf("expected Web UI override on #76001 preserved, got %+v", byNum[76001])
+	}
+	if byNum[76002].Cat != "EASY" || byNum[76002].Note.En != "Valid Machine B override" {
+		t.Fatalf("expected Machine B override on #76002 applied, got %+v", byNum[76002])
+	}
+	if byNum[76102].Cat != "EASY" {
+		t.Fatalf("expected Machine B new issue #76102 accepted, got %+v", byNum[76102])
+	}
+
+	// DeleteIssueOverride advances triaged_at so stale overrides before reset are skipped
+	beforeReset := model.NowRFC3339Nano()
+	time.Sleep(2 * time.Millisecond)
+	if _, err := st.DeleteIssueOverride(76002); err != nil {
+		t.Fatalf("DeleteIssueOverride(#76002) failed: %v", err)
+	}
+	staleAfterReset, err := st.ValidateBatchDecisionsWithOptions(model.BatchTriageDecisions{
+		BaseExportedAt: beforeReset,
+		Overrides: map[string]model.TriagePatchRequest{
+			"76002": {Cat: "HARD", Severity: "MAJOR", Subsystem: "statistics"},
+		},
+	}, BatchApplyOptions{SkipConflicts: true})
+	if err != nil || len(staleAfterReset) != 1 {
+		t.Fatalf("expected DeleteIssueOverride to advance triaged_at and skip stale override, got conflicts=%+v err=%v", staleAfterReset, err)
+	}
+
+	// 3. Online SQLite BackupTo rejects self-overwrite and produces a standalone valid snapshot
+	if err := st.BackupTo(filepath.Join(tmp, "main.db")); err == nil {
+		t.Fatal("expected BackupTo onto live DB path to fail")
+	}
+	backupPath := filepath.Join(tmp, "snapshots", "backup.db")
+	if err := st.BackupTo(backupPath); err != nil {
+		t.Fatalf("BackupTo failed: %v", err)
+	}
+	bakStore, err := Open(backupPath)
+	if err != nil {
+		t.Fatalf("Open(backupPath) failed: %v", err)
+	}
+	defer bakStore.Close()
+	bakDS, err := bakStore.BuildDataset(true)
+	if err != nil {
+		t.Fatalf("bakStore.BuildDataset failed: %v", err)
+	}
+	if len(bakDS.Records) != len(dsFinal.Records) {
+		t.Fatalf("expected %d records in backup DB, got %d", len(dsFinal.Records), len(bakDS.Records))
+	}
+
+	// 4. BootstrapIfEmptyWithFallback("", nil) leaves empty DB empty without error
+	emptySt, err := Open(filepath.Join(tmp, "empty_no_seed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer emptySt.Close()
+	if seededEmpty, err := emptySt.BootstrapIfEmptyWithFallback("", nil); err != nil || seededEmpty {
+		t.Fatalf("expected BootstrapIfEmptyWithFallback('', nil) -> (false, nil), got (%v, %v)", seededEmpty, err)
+	}
+}
+
+func TestRound2SpecialDBPathSyncRacesReconcileAndTypoDetection(t *testing.T) {
+	// 1. Open handles special URI characters (#, ?, %, spaces) in path and BackupTo works cleanly
+	specialDir := filepath.Join(t.TempDir(), "dir #1?%20 space")
+	specialDB := filepath.Join(specialDir, "hub#main?test.db")
+	st, err := Open(specialDB)
+	if err != nil {
+		t.Fatalf("Open(specialDB) failed: %v", err)
+	}
+	defer st.Close()
+
+	seed := model.Dataset{
+		SyncMeta: model.SyncMeta{
+			SchemaVersion:      2,
+			SnapshotUTC:        "2026-11-12T10:00:00Z",
+			MaxIssueUpdatedUTC: "2026-11-12T09:50:00Z",
+			DeltaSincePrevSnapshot: &model.SnapshotDelta{
+				PrevSnapshotDate:       "2026-11-11",
+				NewOpenCandidatesAdded: []model.DeltaAddedIssue{},
+			},
+		},
+		Enums: model.DatasetEnums{
+			Categories: model.ValidCategories,
+			Severities: model.ValidSeverities,
+			Subsystems: model.ValidSubsystems,
+		},
+		Records: []model.IssueRecord{
+			{
+				Number:           78001,
+				Title:            "planner: borderline issue with initial open PR",
+				Author:           "alice",
+				Created:          "2026-11-01",
+				CreatedAt:        "2026-11-01T00:00:00Z",
+				UpdatedAt:        "2026-11-12T09:50:00Z",
+				Labels:           []string{"sig/planner", "type/bug"},
+				IsCanonical:      true,
+				Cat:              "MEDIUM",
+				Severity:         "MAJOR",
+				GHSeverity:       "major",
+				Subsystem:        "logical_rewrite",
+				IsBorderlineKept: true,
+				ForceKeep:        true,
+				PRs:              []model.LinkedPRRef{{Repo: "pingcap/tidb", Num: 78901, State: "OPEN"}},
+			},
+			{
+				Number:      78200,
+				Title:       "supplemental issue excluded then re-excluded concurrently",
+				Author:      "bob",
+				Created:     "2026-11-02",
+				CreatedAt:   "2026-11-02T00:00:00Z",
+				UpdatedAt:   "2026-11-12T09:40:00Z",
+				Labels:      []string{"component/mview", "type/bug"},
+				IsCanonical: false,
+				Cat:         "FILTER_NON_OPT_OR_FIXED",
+				Severity:    "N/A",
+				GHSeverity:  "minor",
+				Subsystem:   "logical_rewrite",
+			},
+		},
+	}
+	if err := st.IngestSyncedDataset(seed, []model.PendingCandidate{
+		{
+			Number:    78101,
+			Title:     "pending issue that closes on GitHub while human accepts it",
+			Author:    "carol",
+			CreatedAt: "2026-11-12T10:01:00Z",
+			UpdatedAt: "2026-11-12T10:02:00Z",
+			Labels:    []string{"sig/planner", "type/bug"},
+		},
+		{
+			Number:    78102,
+			Title:     "pending issue that gains PR on GitHub while human accepts it",
+			Author:    "dave",
+			CreatedAt: "2026-11-12T10:03:00Z",
+			UpdatedAt: "2026-11-12T10:04:00Z",
+			Labels:    []string{"sig/planner", "type/bug"},
+		},
+		{
+			Number:    78103,
+			Title:     "pending issue accepted locally during sync",
+			Author:    "erin",
+			CreatedAt: "2026-11-12T10:05:00Z",
+			UpdatedAt: "2026-11-12T10:06:00Z",
+			Labels:    []string{"sig/planner", "type/bug"},
+		},
+		{
+			Number:    78104,
+			Title:     "pending issue closed on GitHub before Machine B submits batch",
+			Author:    "frank",
+			CreatedAt: "2026-11-12T10:07:00Z",
+			UpdatedAt: "2026-11-12T10:08:00Z",
+			Labels:    []string{"sig/planner", "type/bug"},
+		},
+	}); err != nil {
+		t.Fatalf("IngestSyncedDataset: %v", err)
+	}
+
+	specialBackup := filepath.Join(specialDir, "backup#copy?.db")
+	if err := st.BackupTo(specialBackup); err != nil {
+		t.Fatalf("BackupTo(specialBackup) failed: %v", err)
+	}
+
+	// Initial exclusion of #78200 BEFORE sync PlanStartedUTC
+	if err := st.ExcludeExistingIssue(78200, "initial exclude", false); err != nil {
+		t.Fatalf("ExcludeExistingIssue(78200): %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	planStarted := model.NowRFC3339Nano()
+	time.Sleep(2 * time.Millisecond)
+
+	// Simulate concurrent human actions AFTER PlanStartedUTC but BEFORE ApplyIssueSync commits:
+	// - Accept #78101, #78102, and #78103
+	for _, num := range []int{78101, 78102, 78103} {
+		if err := st.ResolvePendingCandidate(num, model.PendingResolveRequest{
+			Action:    "accept",
+			Cat:       "MEDIUM",
+			Severity:  "MAJOR",
+			Subsystem: "statistics",
+			Note:      &model.LocalizedNote{ZhCN: "并发入库", En: "Concurrent accept"},
+		}); err != nil {
+			t.Fatalf("ResolvePendingCandidate(%d): %v", num, err)
+		}
+	}
+	// - Re-exclude #78200 AFTER PlanStartedUTC
+	if err := st.ExcludeExistingIssue(78200, "fresher human exclude", false); err != nil {
+		t.Fatalf("re-ExcludeExistingIssue(78200): %v", err)
+	}
+
+	// 2. ApplyIssueSync commits a SyncPlan computed from pre-accept state:
+	//    - #78101 closed on GitHub (ClosedPendingRemovals) -> must archive concurrently accepted #78101!
+	//    - #78102 & #78103 updated in UpsertPending (#78102 gained timeline PR #78999) -> must stay in issues (NOT resurrected in pending) AND #78102 gets PR #78999!
+	//    - #78104 closed on GitHub -> removed from pending and recorded in removed_pending_nums!
+	//    - #78200 in ReadmittedNums -> blocked by fresher excluded_at > PlanStartedUTC!
+	plan := issuesync.SyncPlan{
+		ModeUsed:       "incremental",
+		PlanStartedUTC: planStarted,
+		SnapshotUTC:    "2026-11-12T12:00:00Z",
+		ClosedPendingRemovals: []model.DeltaClosedIssue{
+			{Number: 78101, ClosedAt: "2026-11-12T11:55:00Z", Reason: "closed on GitHub"},
+			{Number: 78104, ClosedAt: "2026-11-12T11:55:00Z", Reason: "closed on GitHub"},
+		},
+		DeletePendingNums: []int{78101, 78104},
+		ReadmittedNums:    []int{78200},
+		UpsertPending: []model.PendingCandidate{
+			{
+				Number:    78102,
+				Title:     "pending issue that gains PR on GitHub while human accepts it (updated title)",
+				Author:    "dave",
+				CreatedAt: "2026-11-12T10:03:00Z",
+				UpdatedAt: "2026-11-12T11:55:00Z",
+				Labels:    []string{"sig/planner", "type/bug"},
+				PRs:       []model.LinkedPRRef{{Repo: "pingcap/tidb", Num: 78999, Label: "#78999", URL: "https://github.com/pingcap/tidb/pull/78999", State: "OPEN", UpdatedAt: "2026-11-12T11:55:00Z"}},
+			},
+			{
+				Number:    78103,
+				Title:     "pending issue accepted locally during sync",
+				Author:    "erin",
+				CreatedAt: "2026-11-12T10:05:00Z",
+				UpdatedAt: "2026-11-12T10:06:00Z",
+				Labels:    []string{"sig/planner", "type/bug"},
+			},
+			{
+				Number:    78200,
+				Title:     "stale readmission candidate",
+				Author:    "bob",
+				CreatedAt: "2026-11-02T00:00:00Z",
+				UpdatedAt: "2026-11-12T11:50:00Z",
+				Labels:    []string{"sig/planner", "type/bug"},
+			},
+		},
+	}
+	if _, err := st.ApplyIssueSync(plan); err != nil {
+		t.Fatalf("ApplyIssueSync failed: %v", err)
+	}
+
+	pendAfter, err := st.ListPendingCandidates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pendAfter) != 0 {
+		t.Fatalf("expected 0 pending candidates (no resurrection of #78102/#78103 and no stale readmission of #78200), got %+v", pendAfter)
+	}
+
+	dsAfterSync, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recMap := make(map[int]model.IssueRecord)
+	for _, r := range dsAfterSync.Records {
+		recMap[r.Number] = r
+	}
+	if _, stillActive := recMap[78101]; stillActive {
+		t.Fatalf("expected concurrently accepted #78101 to be archived by ClosedPendingRemovals")
+	}
+	if r78102, ok := recMap[78102]; !ok || len(r78102.PRs) != 1 || r78102.PRs[0].Num != 78999 {
+		t.Fatalf("expected concurrently accepted #78102 to receive live PR #78999 from UpsertPending, got %+v", recMap[78102])
+	}
+	foundDelta78103 := false
+	if dsAfterSync.SyncMeta.DeltaSincePrevSnapshot != nil {
+		for _, d := range dsAfterSync.SyncMeta.DeltaSincePrevSnapshot.NewOpenCandidatesAdded {
+			if d.Number == 78103 {
+				foundDelta78103 = true
+			}
+		}
+	}
+	if !foundDelta78103 {
+		t.Fatalf("expected concurrent local accept #78103 preserved in SyncMeta.DeltaSincePrevSnapshot, got %+v", dsAfterSync.SyncMeta.DeltaSincePrevSnapshot)
+	}
+
+	// 3. Batch validation with BaseExportedAt != "" and SkipConflicts=true:
+	//    - Closed/removed pending #78104 IS skipped as a conflict (via removed_pending_nums)
+	//    - Genuine typo #88888888 in new_issues or exclude_issues FAILS with ErrIssueNotFound!
+	cfl78104, err := st.ValidateBatchDecisionsWithOptions(model.BatchTriageDecisions{
+		BaseExportedAt: planStarted,
+		NewIssues: map[string]model.TriagePatchRequest{
+			"78104": {Cat: "EASY", Severity: "MINOR", Subsystem: "statistics"},
+		},
+	}, BatchApplyOptions{SkipConflicts: true})
+	if err != nil || len(cfl78104) != 1 {
+		t.Fatalf("expected closed pending #78104 to be skipped via removed_pending_nums, got cfl=%+v err=%v", cfl78104, err)
+	}
+	if _, err := st.ValidateBatchDecisionsWithOptions(model.BatchTriageDecisions{
+		BaseExportedAt: planStarted,
+		NewIssues: map[string]model.TriagePatchRequest{
+			"88888888": {Cat: "EASY", Severity: "MINOR", Subsystem: "statistics"},
+		},
+	}, BatchApplyOptions{SkipConflicts: true}); !errors.Is(err, ErrIssueNotFound) {
+		t.Fatalf("expected typo #88888888 in new_issues to fail with ErrIssueNotFound even when BaseExportedAt is set, got %v", err)
+	}
+	if _, err := st.ValidateBatchDecisionsWithOptions(model.BatchTriageDecisions{
+		BaseExportedAt: planStarted,
+		ExcludeIssues:  map[string]string{"88888888": "typo"},
+	}, BatchApplyOptions{SkipConflicts: true}); !errors.Is(err, ErrIssueNotFound) {
+		t.Fatalf("expected typo #88888888 in exclude_issues to fail with ErrIssueNotFound even when BaseExportedAt is set, got %v", err)
+	}
+
+	// 4. NewTemplateOverridePatch omits booleans (preserving IsBorderlineKept & ForceKeep),
+	//    ApplyIssueOverride enforces IfUnmodifiedSince (ErrOverrideConflict),
+	//    and ReconcileNewlySyncedPRBaselines fixes merged initial PR across override + auto_baseline!
+	r78001 := recMap[78001]
+	tplPatch := model.NewTemplateOverridePatch("HARD", "CRITICAL", "logical_rewrite", r78001.TriagedAt, &model.LocalizedNote{
+		ZhCN: "模板覆盖保留边界与强留标记",
+		En:   "Template override preserves borderline and force_keep flags",
+	})
+	if _, err := st.ApplyIssueOverride(78001, tplPatch); err != nil {
+		t.Fatalf("ApplyIssueOverride(78001) failed: %v", err)
+	}
+	// Stale IfUnmodifiedSince must fail with ErrOverrideConflict
+	stalePatch := model.NewTemplateOverridePatch("EASY", "MINOR", "statistics", "2020-01-01T00:00:00.000000000Z", nil)
+	if _, err := st.ApplyIssueOverride(78001, stalePatch); !errors.Is(err, ErrOverrideConflict) {
+		t.Fatalf("expected ErrOverrideConflict on stale IfUnmodifiedSince, got %v", err)
+	}
+
+	// Simulate post-override PR sync discovering #78901 was actually MERGED!
+	if err := st.UpsertPRStatuses([]model.PRStatus{{
+		Repo:      "pingcap/tidb",
+		Num:       78901,
+		Title:     "planner: already merged fix",
+		State:     "MERGED",
+		UpdatedAt: "2026-11-12T12:00:00Z",
+	}}, time.Now().UTC()); err != nil {
+		t.Fatalf("UpsertPRStatuses(78901=MERGED): %v", err)
+	}
+	// UpsertPRStatuses atomically reconciles unverified #78901 from open->merged in both baseline and auto_baseline!
+	dsReconciled, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range dsReconciled.Records {
+		if r.Number == 78001 {
+			if !r.IsBorderlineKept || !r.ForceKeep {
+				t.Fatalf("expected NewTemplateOverridePatch to preserve IsBorderlineKept=true & ForceKeep=true, got %+v", r)
+			}
+			if r.NeedsRetriage {
+				t.Fatalf("expected atomic UpsertPRStatuses reconciliation to clear spurious fix_pr_merged_still_open on #78001, got reasons=%v", r.RetriageReasons)
+			}
+		}
+	}
+	// Even after ResetIssueOverride restores auto_baseline_json, #78901 stays reconciled (no spurious retriage)!
+	if _, err := st.ResetIssueOverride(78001); err != nil {
+		t.Fatalf("ResetIssueOverride(78001): %v", err)
+	}
+	dsAfterReset, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range dsAfterReset.Records {
+		if r.Number == 78001 && r.NeedsRetriage {
+			t.Fatalf("expected auto_baseline_json on #78001 to also have reconciled PR #78901 after ResetIssueOverride, got reasons=%v", r.RetriageReasons)
+		}
+	}
+}
+
+func TestConvergenceInvariantsMonotonicFreshnessRevisionAndChunking(t *testing.T) {
+	tmp := t.TempDir()
+
+	// 1. file: URI Open resolves physical DB path via PRAGMA database_list and blocks BackupTo self-overwrite
+	uriDBPath := filepath.Join(tmp, "uri_target.db")
+	stURI, err := Open("file:" + filepath.ToSlash(uriDBPath))
+	if err != nil {
+		t.Fatalf("Open(file: URI) failed: %v", err)
+	}
+	defer stURI.Close()
+	if strings.TrimSpace(stURI.DBPath()) == "" {
+		t.Fatalf("expected non-empty DBPath() for file: URI SQLite database")
+	}
+	if err := stURI.BackupTo(uriDBPath); err == nil || !strings.Contains(err.Error(), "cannot be the active SQLite database") {
+		t.Fatalf("expected BackupTo self-overwrite rejection on file: URI DB, got %v", err)
+	}
+
+	// 2. Monotonic PR freshness: out-of-order older or same-second OPEN snapshots never clobber fresher MERGED
+	dbPath := filepath.Join(tmp, "monotonic.db")
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.IngestSyncedDataset(model.Dataset{
+		SyncMeta: model.SyncMeta{SchemaVersion: 2, SnapshotUTC: "2026-11-12T10:00:00Z"},
+		Records: []model.IssueRecord{{
+			Number:    81001,
+			Title:     "planner: issue with fix PR",
+			Author:    "alice",
+			Created:   "2026-11-12",
+			CreatedAt: "2026-11-12T10:00:00Z",
+			UpdatedAt: "2026-11-12T10:00:00Z",
+			Labels:    []string{"sig/planner", "type/bug"},
+			Cat:       "MEDIUM",
+			Severity:  "MAJOR",
+			Subsystem: "logical_rewrite",
+			Note:      &model.LocalizedNote{ZhCN: "单调新鲜度测试", En: "Monotonic freshness test"},
+			PRs: []model.LinkedPRRef{{
+				Repo:      "pingcap/tidb",
+				Num:       81901,
+				Label:     "#81901",
+				URL:       "https://github.com/pingcap/tidb/pull/81901",
+				State:     "OPEN",
+				Title:     "planner: fix 81001",
+				UpdatedAt: "2026-11-12T10:00:00Z",
+			}},
+		}},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Targeted sync commits MERGED at t=10:10:00Z
+	if err := st.UpsertPRStatuses([]model.PRStatus{{
+		Repo:         "pingcap/tidb",
+		Num:          81901,
+		Title:        "planner: fix 81001",
+		State:        "MERGED",
+		UpdatedAt:    "2026-11-12T10:10:00Z",
+		TrackSources: []string{"issue_linked"},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AcknowledgeIssueRetriage(81001, "maintainer"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Concurrent slower full PR sync submits stale OPEN (t=10:05:00Z) and same-second OPEN (t=10:10:00Z)
+	for _, staleUpd := range []string{"2026-11-12T10:05:00Z", "2026-11-12T10:10:00Z"} {
+		if err := st.UpsertPRStatuses([]model.PRStatus{{
+			Repo:         "pingcap/tidb",
+			Num:          81901,
+			Title:        "planner: stale open snapshot",
+			State:        "OPEN",
+			UpdatedAt:    staleUpd,
+			TrackSources: []string{"sig_planner"},
+		}}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Stale ApplyIssueSync also tries to regress #81901 via UpdatedIssues & DirectPRUpdates
+	if _, err := st.ApplyIssueSync(issuesync.SyncPlan{
+		SnapshotUTC: "2026-11-12T10:11:00Z",
+		UpdatedIssues: []issuesync.LiveIssueUpdate{{
+			Number:    81001,
+			Title:     "planner: issue with fix PR",
+			Author:    "alice",
+			Created:   "2026-11-12",
+			CreatedAt: "2026-11-12T10:00:00Z",
+			UpdatedAt: "2026-11-12T10:09:00Z",
+			Labels:    []string{"sig/planner", "type/bug"},
+			TimelinePRs: []model.LinkedPRRef{{
+				Repo:      "pingcap/tidb",
+				Num:       81901,
+				Label:     "#81901",
+				URL:       "https://github.com/pingcap/tidb/pull/81901",
+				State:     "OPEN",
+				UpdatedAt: "2026-11-12T10:05:00Z",
+			}},
+		}},
+		DirectPRUpdates: map[string]model.LinkedPRRef{
+			"pingcap/tidb#81901": {
+				Repo:      "pingcap/tidb",
+				Num:       81901,
+				State:     "OPEN",
+				UpdatedAt: "2026-11-12T10:05:00Z",
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var cachedState, cachedStatusJSON string
+	if err := st.db.QueryRow(`SELECT state, status_json FROM pull_requests WHERE repo = 'pingcap/tidb' AND number = 81901`).Scan(&cachedState, &cachedStatusJSON); err != nil {
+		t.Fatal(err)
+	}
+	if cachedState != "MERGED" {
+		t.Fatalf("expected PR #81901 to remain MERGED against stale snapshots, got %s", cachedState)
+	}
+	var cachedSt model.PRStatus
+	_ = json.Unmarshal([]byte(cachedStatusJSON), &cachedSt)
+	if len(cachedSt.TrackSources) != 2 {
+		t.Fatalf("expected TrackSources merged even when stale snapshot skipped, got %v", cachedSt.TrackSources)
+	}
+
+	dsMono, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range dsMono.Records {
+		if r.Number == 81001 {
+			if len(r.PRs) != 1 || r.PRs[0].State != "MERGED" {
+				t.Fatalf("expected issue #81001 PR link to remain MERGED, got %+v", r.PRs)
+			}
+			if r.NeedsRetriage {
+				t.Fatalf("expected no spurious retriage regression on #81001, got %v", r.RetriageReasons)
+			}
+		}
+	}
+
+	// 3. pending_candidates.revision CAS protects same-timestamp PR discovery from stale UpdatePendingCandidates
+	if _, _, err := st.ApplyIssueSyncWithOutcome(issuesync.SyncPlan{
+		SnapshotUTC: "2026-11-12T11:00:00Z",
+		UpsertPending: []model.PendingCandidate{{
+			Number:    82001,
+			Title:     "planner: pending candidate",
+			Author:    "bob",
+			CreatedAt: "2026-11-12T11:00:00Z",
+			UpdatedAt: "2026-11-12T11:00:00Z",
+			Labels:    []string{"sig/planner", "type/bug"},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pendBefore, err := st.ListPendingCandidates()
+	if err != nil || len(pendBefore) != 1 || pendBefore[0].Revision != 1 {
+		t.Fatalf("expected 1 pending candidate at revision 1, got %+v err=%v", pendBefore, err)
+	}
+	staleEnrich := pendBefore[0]
+
+	// Stream B discovers PR #82901 without changing issue updated_at -> revision bumps to 2
+	if _, _, err := st.ApplyIssueSyncWithOutcome(issuesync.SyncPlan{
+		SnapshotUTC: "2026-11-12T11:05:00Z",
+		UpsertPending: []model.PendingCandidate{{
+			Number:    82001,
+			Title:     "planner: pending candidate",
+			Author:    "bob",
+			CreatedAt: "2026-11-12T11:00:00Z",
+			UpdatedAt: "2026-11-12T11:00:00Z",
+			Labels:    []string{"sig/planner", "type/bug"},
+			PRs:       []model.LinkedPRRef{{Repo: "pingcap/tidb", Num: 82901, State: "OPEN"}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdatePendingCandidates([]model.PendingCandidate{staleEnrich}); err != nil {
+		t.Fatal(err)
+	}
+	pendAfter, err := st.ListPendingCandidates()
+	if err != nil || len(pendAfter) != 1 || len(pendAfter[0].PRs) != 1 || pendAfter[0].PRs[0].Num != 82901 {
+		t.Fatalf("expected revision CAS to protect newly discovered PR #82901 from stale UpdatePendingCandidates, got %+v err=%v", pendAfter, err)
+	}
+
+	// 4. ApplyIssueSyncWithOutcome + FormatSyncSummary reports concurrent ClosedPendingRemovals & PendingLiveUpdates graduations
+	if _, err := st.ApplyBatchTriageDecisions(model.BatchTriageDecisions{
+		NewIssues: map[string]model.TriagePatchRequest{
+			"82001": {
+				Cat:       "MEDIUM",
+				Severity:  "MAJOR",
+				Subsystem: "logical_rewrite",
+				Note:      &model.LocalizedNote{ZhCN: "并发接受后关闭归档测试", En: "Concurrent accept then closed removal test"},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	planConc := issuesync.SyncPlan{
+		ModeUsed:       "incremental",
+		SnapshotUTC:    "2026-11-12T11:10:00Z",
+		PlanStartedUTC: "2026-11-12T11:08:00Z",
+		ClosedPendingRemovals: []model.DeltaClosedIssue{{
+			Number: 82001,
+			Reason: "Closed on GitHub",
+		}},
+	}
+	dsConc, appliedConc, err := st.ApplyIssueSyncWithOutcome(planConc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planConc.Applied = &appliedConc
+	sumTxt := issuesync.FormatSyncSummary(planConc, dsMono, dsConc)
+	if !strings.Contains(sumTxt, "Closed Removed: [82001]") {
+		t.Fatalf("expected FormatSyncSummary to reflect post-commit ClosedPendingRemovals [82001], got:\n%s", sumTxt)
+	}
+
+	// 5. Chunked ListRetriageCandidates handles > sqlInChunkSize (400) issues without dropping bodies or comments
+	chunkDB := filepath.Join(tmp, "chunked.db")
+	stChunk, err := Open(chunkDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stChunk.Close()
+	bulkRecs := make([]model.IssueRecord, 0, 455)
+	for i := 1; i <= 455; i++ {
+		num := 90000 + i
+		bulkRecs = append(bulkRecs, model.IssueRecord{
+			Number:    num,
+			Title:     fmt.Sprintf("planner: bulk issue %d", num),
+			Author:    "alice",
+			Created:   "2026-11-12",
+			CreatedAt: "2026-11-12T10:00:00Z",
+			UpdatedAt: "2026-11-12T10:00:00Z",
+			Labels:    []string{"sig/planner", "type/bug"},
+			Cat:       "EASY",
+			Severity:  "MINOR",
+			Subsystem: "statistics",
+			Note:      &model.LocalizedNote{ZhCN: "批量分块查询测试", En: "Chunked query test"},
+		})
+	}
+	if err := stChunk.IngestSyncedDataset(model.Dataset{
+		SyncMeta: model.SyncMeta{SchemaVersion: 2, SnapshotUTC: "2026-11-12T10:00:00Z"},
+		Records:  bulkRecs,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stChunk.ApplyIssueSync(issuesync.SyncPlan{
+		SnapshotUTC: "2026-11-12T10:05:00Z",
+		UpdatedIssues: []issuesync.LiveIssueUpdate{
+			{
+				Number:         90001,
+				Title:          "planner: bulk issue 90001",
+				Author:         "alice",
+				Created:        "2026-11-12",
+				CreatedAt:      "2026-11-12T10:00:00Z",
+				UpdatedAt:      "2026-11-12T10:05:00Z",
+				Labels:         []string{"sig/planner", "type/bug"},
+				HasBody:        true,
+				Body:           "body-first-chunk",
+				HasComments:    true,
+				RecentComments: []model.PendingComment{{Author: "dev1", CreatedAt: "2026-11-12T10:04:00Z", Body: "cmt-first"}},
+			},
+			{
+				Number:         90455,
+				Title:          "planner: bulk issue 90455",
+				Author:         "alice",
+				Created:        "2026-11-12",
+				CreatedAt:      "2026-11-12T10:00:00Z",
+				UpdatedAt:      "2026-11-12T10:05:00Z",
+				Labels:         []string{"sig/planner", "type/bug"},
+				HasBody:        true,
+				Body:           "body-second-chunk",
+				HasComments:    true,
+				RecentComments: []model.PendingComment{{Author: "dev2", CreatedAt: "2026-11-12T10:04:00Z", Body: "cmt-second"}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cands, err := stChunk.ListRetriageCandidates(false, nil)
+	if err != nil || len(cands) != 455 {
+		t.Fatalf("expected 455 retriage candidates across chunks, got len=%d err=%v", len(cands), err)
+	}
+	foundFirst, foundSecond := false, false
+	for _, c := range cands {
+		if c.Number == 90001 && c.Body == "body-first-chunk" && len(c.RecentComments) == 1 {
+			foundFirst = true
+		}
+		if c.Number == 90455 && c.Body == "body-second-chunk" && len(c.RecentComments) == 1 {
+			foundSecond = true
+		}
+	}
+	if !foundFirst || !foundSecond {
+		t.Fatalf("expected chunked ListRetriageCandidates to populate bodies & comments across both chunks (first=%v, second=%v)", foundFirst, foundSecond)
 	}
 }

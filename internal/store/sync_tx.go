@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -286,13 +287,194 @@ func removeRecheckNumInTx(tx *sql.Tx, nums ...int) error {
 	return saveRecheckNumsInTx(tx, set)
 }
 
-func syncClosedPRStatusInTx(tx *sql.Tx, repo string, num int, state string) error {
+const maxRemovedPendingHistory = 500
+
+func loadRemovedPendingNums(q sqlExecQuerier) (map[int]bool, error) {
+	var raw string
+	err := q.QueryRow(`SELECT val_json FROM kv_meta WHERE key = 'removed_pending_nums'`).Scan(&raw)
+	if err == sql.ErrNoRows || raw == "" {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var nums []int
+	if err := json.Unmarshal([]byte(raw), &nums); err != nil {
+		return nil, err
+	}
+	if len(nums) == 0 {
+		return nil, nil
+	}
+	out := make(map[int]bool, len(nums))
+	for _, n := range nums {
+		if n > 0 {
+			out[n] = true
+		}
+	}
+	return out, nil
+}
+
+func addRemovedPendingNumsInTx(tx *sql.Tx, nums ...int) error {
+	if len(nums) == 0 {
+		return nil
+	}
+	var existing []int
+	var raw string
+	if err := tx.QueryRow(`SELECT val_json FROM kv_meta WHERE key = 'removed_pending_nums'`).Scan(&raw); err == nil && raw != "" {
+		_ = json.Unmarshal([]byte(raw), &existing)
+	}
+	combined := append(existing, nums...)
+	seen := make(map[int]bool, len(combined))
+	dedupRev := make([]int, 0, len(combined))
+	for i := len(combined) - 1; i >= 0; i-- {
+		n := combined[i]
+		if n > 0 && !seen[n] {
+			seen[n] = true
+			dedupRev = append(dedupRev, n)
+			if len(dedupRev) >= maxRemovedPendingHistory {
+				break
+			}
+		}
+	}
+	for i, j := 0, len(dedupRev)-1; i < j; i, j = i+1, j-1 {
+		dedupRev[i], dedupRev[j] = dedupRev[j], dedupRev[i]
+	}
+	b, err := json.Marshal(dedupRev)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`
+INSERT INTO kv_meta(key, val_json) VALUES('removed_pending_nums', ?)
+ON CONFLICT(key) DO UPDATE SET val_json = excluded.val_json`, string(b))
+	return err
+}
+
+func liveUpdateFromPendingCandidate(pc model.PendingCandidate) issuesync.LiveIssueUpdate {
+	isCan := isCanonicalLabelList(pc.Labels)
+	ghSev := "unlabeled"
+	isCust := false
+	for _, lb := range pc.Labels {
+		if strings.HasPrefix(lb, "severity/") && ghSev == "unlabeled" {
+			ghSev = strings.SplitN(lb, "/", 2)[1]
+		}
+		if lb == "report/customer" {
+			isCust = true
+		}
+	}
+	created := pc.CreatedAt
+	if len(created) >= 10 {
+		created = created[:10]
+	}
+	var tlPRs []model.LinkedPRRef
+	for _, p := range pc.PRs {
+		if p.Source == "" || p.Source == model.LinkSourceTimeline {
+			tlPRs = append(tlPRs, p)
+		}
+	}
+	return issuesync.LiveIssueUpdate{
+		Number:         pc.Number,
+		Title:          pc.Title,
+		Author:         pc.Author,
+		Assignees:      pc.Assignees,
+		Created:        created,
+		CreatedAt:      pc.CreatedAt,
+		UpdatedAt:      pc.UpdatedAt,
+		Labels:         pc.Labels,
+		IsCanonical:    isCan,
+		IsCustomer:     isCust,
+		GHSeverity:     ghSev,
+		TimelinePRs:    tlPRs,
+		HasBody:        pc.Body != "",
+		Body:           pc.Body,
+		HasComments:    pc.RecentComments != nil,
+		RecentComments: pc.RecentComments,
+	}
+}
+
+func syncClosedPRStatusInTx(tx *sql.Tx, repo string, num int, state string, updatedAt string) error {
 	if state != "MERGED" && state != "CLOSED" {
 		return nil
 	}
-	_, err := tx.Exec(`UPDATE pull_requests SET state = ? WHERE repo = ? AND number = ? AND state IN ('OPEN', 'DRAFT')`,
-		state, repo, num)
+	var curState, curUpd string
+	err := tx.QueryRow(`SELECT state, updated_at FROM pull_requests WHERE repo = ? AND number = ?`, repo, num).Scan(&curState, &curUpd)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if isIncomingPRSnapshotStale(curState, curUpd, state, updatedAt) {
+		return nil
+	}
+	if curState != "OPEN" && curState != "DRAFT" {
+		return nil
+	}
+	_, err = tx.Exec(`UPDATE pull_requests SET state = ?, updated_at = CASE WHEN ? != '' THEN ? ELSE updated_at END WHERE repo = ? AND number = ?`,
+		state, updatedAt, updatedAt, repo, num)
 	return err
+}
+
+func upsertIssuePRLinkMonotonicInTx(tx *sql.Tx, issueNum int, p model.LinkedPRRef, linkSource string) error {
+	effState := p.State
+	effTitle := p.Title
+	effIsCP := p.IsCherryPick
+	effUpdAt := p.UpdatedAt
+
+	// Never regress behind an already-cached fresher `pull_requests` snapshot.
+	var prState, prUpdAt, rawStatus string
+	var prIsCP int
+	if err := tx.QueryRow(`SELECT state, is_cherry_pick, updated_at, status_json FROM pull_requests WHERE repo = ? AND number = ?`,
+		p.Repo, p.Num).Scan(&prState, &prIsCP, &prUpdAt, &rawStatus); err == nil {
+		if isIncomingPRSnapshotStale(prState, prUpdAt, effState, effUpdAt) {
+			effState = prState
+			effIsCP = prIsCP != 0
+			effUpdAt = prUpdAt
+			var st model.PRStatus
+			if json.Unmarshal([]byte(rawStatus), &st) == nil && st.Title != "" {
+				effTitle = st.Title
+			}
+		}
+	}
+
+	// Never regress behind an existing fresher `issue_pr_links` row.
+	var curState, curTitle, curUpdAt string
+	var curIsCP int
+	if err := tx.QueryRow(`SELECT state, title, is_cherry_pick, updated_at FROM issue_pr_links WHERE issue_repo = ? AND issue_num = ? AND pr_repo = ? AND pr_num = ?`,
+		DefaultRepo, issueNum, p.Repo, p.Num).Scan(&curState, &curTitle, &curIsCP, &curUpdAt); err == nil {
+		if isIncomingPRSnapshotStale(curState, curUpdAt, effState, effUpdAt) {
+			effState = curState
+			if curTitle != "" {
+				effTitle = curTitle
+			}
+			effIsCP = curIsCP != 0
+			effUpdAt = curUpdAt
+		}
+	}
+
+	sourceExpr := `CASE WHEN issue_pr_links.source = 'manual' THEN 'manual' ELSE 'timeline' END`
+	if linkSource == model.LinkSourcePRRef {
+		sourceExpr = `CASE WHEN issue_pr_links.source IN ('manual', 'timeline') THEN issue_pr_links.source ELSE 'pr_ref' END`
+	} else if linkSource == model.LinkSourceManual {
+		sourceExpr = `'manual'`
+	}
+
+	if _, err := tx.Exec(`
+INSERT INTO issue_pr_links(
+  issue_repo, issue_num, pr_repo, pr_num, label, url, state, title, is_cherry_pick, updated_at, source
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(issue_repo, issue_num, pr_repo, pr_num) DO UPDATE SET
+  label=excluded.label,
+  url=excluded.url,
+  state=excluded.state,
+  title=CASE WHEN excluded.title != '' THEN excluded.title ELSE issue_pr_links.title END,
+  is_cherry_pick=excluded.is_cherry_pick,
+  updated_at=CASE WHEN excluded.updated_at != '' THEN excluded.updated_at ELSE issue_pr_links.updated_at END,
+  source=`+sourceExpr,
+		DefaultRepo, issueNum, p.Repo, p.Num, p.Label, p.URL, effState, effTitle, boolToInt(effIsCP), effUpdAt, linkSource,
+	); err != nil {
+		return err
+	}
+	return syncClosedPRStatusInTx(tx, p.Repo, p.Num, effState, effUpdAt)
 }
 
 func reconcileIssueTimelineLinksInTx(
@@ -306,23 +488,7 @@ func reconcileIssueTimelineLinksInTx(
 	timelineKeys := make(map[string]bool, len(timelinePRs))
 	for _, p := range timelinePRs {
 		timelineKeys[model.PRKey(p.Repo, p.Num)] = true
-		if _, err := tx.Exec(`
-INSERT INTO issue_pr_links(
-  issue_repo, issue_num, pr_repo, pr_num, label, url, state, title, is_cherry_pick, updated_at, source
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'timeline')
-ON CONFLICT(issue_repo, issue_num, pr_repo, pr_num) DO UPDATE SET
-  label=excluded.label,
-  url=excluded.url,
-  state=excluded.state,
-  title=excluded.title,
-  is_cherry_pick=excluded.is_cherry_pick,
-  updated_at=CASE WHEN excluded.updated_at != '' THEN excluded.updated_at ELSE issue_pr_links.updated_at END,
-  source=CASE WHEN issue_pr_links.source = 'manual' THEN 'manual' ELSE 'timeline' END`,
-			DefaultRepo, issueNum, p.Repo, p.Num, p.Label, p.URL, p.State, p.Title, boolToInt(p.IsCherryPick), p.UpdatedAt,
-		); err != nil {
-			return err
-		}
-		if err := syncClosedPRStatusInTx(tx, p.Repo, p.Num, p.State); err != nil {
+		if err := upsertIssuePRLinkMonotonicInTx(tx, issueNum, p, model.LinkSourceTimeline); err != nil {
 			return err
 		}
 	}
@@ -332,23 +498,7 @@ ON CONFLICT(issue_repo, issue_num, pr_repo, pr_num) DO UPDATE SET
 		if timelineKeys[key] {
 			continue
 		}
-		if _, err := tx.Exec(`
-INSERT INTO issue_pr_links(
-  issue_repo, issue_num, pr_repo, pr_num, label, url, state, title, is_cherry_pick, updated_at, source
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pr_ref')
-ON CONFLICT(issue_repo, issue_num, pr_repo, pr_num) DO UPDATE SET
-  label=excluded.label,
-  url=excluded.url,
-  state=excluded.state,
-  title=excluded.title,
-  is_cherry_pick=excluded.is_cherry_pick,
-  updated_at=CASE WHEN excluded.updated_at != '' THEN excluded.updated_at ELSE issue_pr_links.updated_at END,
-  source=CASE WHEN issue_pr_links.source IN ('manual', 'timeline') THEN issue_pr_links.source ELSE 'pr_ref' END`,
-			DefaultRepo, issueNum, p.Repo, p.Num, p.Label, p.URL, p.State, p.Title, boolToInt(p.IsCherryPick), p.UpdatedAt,
-		); err != nil {
-			return err
-		}
-		if err := syncClosedPRStatusInTx(tx, p.Repo, p.Num, p.State); err != nil {
+		if err := upsertIssuePRLinkMonotonicInTx(tx, issueNum, p, model.LinkSourcePRRef); err != nil {
 			return err
 		}
 	}
@@ -393,12 +543,20 @@ ON CONFLICT(issue_repo, issue_num, pr_repo, pr_num) DO UPDATE SET
 
 // ApplyIssueSync atomically applies an incremental or full SyncPlan without ever clobbering `issues.auto_*`.
 func (s *Store) ApplyIssueSync(plan issuesync.SyncPlan) (model.Dataset, error) {
+	ds, _, err := s.ApplyIssueSyncWithOutcome(plan)
+	return ds, err
+}
+
+// ApplyIssueSyncWithOutcome atomically applies a SyncPlan and returns both the post-sync
+// dataset and the exact in-tx applied structural changes (including concurrent pending
+// closures/graduations and filtered pending upserts).
+func (s *Store) ApplyIssueSyncWithOutcome(plan issuesync.SyncPlan) (model.Dataset, issuesync.SyncAppliedOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	tx, err := s.db.Begin()
 	if err != nil {
-		return model.Dataset{}, err
+		return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -447,10 +605,35 @@ ON CONFLICT(repo, number) DO UPDATE SET
 	for _, cr := range plan.ClosedRemovals {
 		archived, err := archiveAndDelete(cr.Number, cr.Reason)
 		if err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
 		if archived {
 			appliedClosed = append(appliedClosed, cr)
+		}
+	}
+	// If a pending candidate was closed on GitHub while concurrently accepted into `issues`, archive & remove it too.
+	for _, cr := range plan.ClosedPendingRemovals {
+		var effCat, effSev string
+		err := tx.QueryRow(`
+SELECT COALESCE(NULLIF(o.cat, ''), i.auto_cat), COALESCE(NULLIF(o.severity, ''), i.auto_severity)
+FROM issues i
+LEFT JOIN issue_overrides o ON i.repo = o.repo AND i.number = o.number
+WHERE i.repo = ? AND i.number = ?`, DefaultRepo, cr.Number).Scan(&effCat, &effSev)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+		}
+		cr.PrevCat = effCat
+		cr.PrevSeverity = effSev
+		archived, err := archiveAndDelete(cr.Number, cr.Reason)
+		if err != nil {
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+		}
+		if archived {
+			appliedClosed = append(appliedClosed, cr)
+			pruneLocalAcceptedDeltaInTx(tx, cr.Number)
 		}
 	}
 	var appliedGraduated []model.DeltaGraduatedIssue
@@ -468,7 +651,7 @@ WHERE i.repo = ? AND i.number = ?`, DefaultRepo, gr.Number).Scan(&effCat, &effFK
 			continue
 		}
 		if err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
 		// Re-check retention against current in-tx cat/force_keep in case an override arrived during GraphQL fetch
 		if effFK != 0 {
@@ -481,7 +664,7 @@ WHERE i.repo = ? AND i.number = ?`, DefaultRepo, gr.Number).Scan(&effCat, &effFK
 		}
 		archived, err := archiveAndDelete(gr.Number, gr.Reason)
 		if err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
 		if archived {
 			appliedGraduated = append(appliedGraduated, gr)
@@ -491,13 +674,14 @@ WHERE i.repo = ? AND i.number = ?`, DefaultRepo, gr.Number).Scan(&effCat, &effFK
 	evalNumsSet := make(map[int]bool)
 	reconciledIssues := make(map[int]bool)
 	var restoredDelta []model.DeltaAddedIssue
+	var appliedRestoredNums []int
 	maxSyncedIssueUpdated := ""
 
 	// Restore reopened archived issues with their preserved auto_* AND pre-close issue_triage_state baseline
 	for _, upd := range plan.RestoredIssues {
 		var isExcl int
 		if err := tx.QueryRow(`SELECT COUNT(*) FROM excluded_issues WHERE repo = ? AND number = ?`, DefaultRepo, upd.Number).Scan(&isExcl); err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
 		if isExcl > 0 {
 			continue
@@ -537,21 +721,21 @@ ON CONFLICT(repo, number) DO UPDATE SET
 			cat, sev, sub, bdr, fk, nZh, nEn,
 			boolToInt(upd.HasBody),
 		); err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
 		if _, err := tx.Exec(`DELETE FROM archived_issues WHERE repo = ? AND number = ?`, DefaultRepo, upd.Number); err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
 
 		if err := reconcileIssueTimelineLinksInTx(tx, upd.Number, upd.TimelinePRs, upd.TimelineTruncated, plan.StreamBPRRefs[upd.Number], plan.UnlinkedStreamBPRs[upd.Number]); err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
 		reconciledIssues[upd.Number] = true
 		if upd.HasComments {
 			cmtsJSON, _ := json.Marshal(nonNilSlice(upd.RecentComments))
 			if _, err := tx.Exec(`UPDATE issue_triage_state SET recent_comments_json = ? WHERE repo = ? AND number = ?`,
 				string(cmtsJSON), DefaultRepo, upd.Number); err != nil {
-				return model.Dataset{}, err
+				return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 			}
 		}
 		evalNumsSet[upd.Number] = true
@@ -571,6 +755,7 @@ ON CONFLICT(repo, number) DO UPDATE SET
 				effSub = oSub.String
 			}
 		}
+		appliedRestoredNums = append(appliedRestoredNums, upd.Number)
 		restoredDelta = append(restoredDelta, model.DeltaAddedIssue{
 			Number:    upd.Number,
 			Cat:       effCat,
@@ -582,43 +767,50 @@ ON CONFLICT(repo, number) DO UPDATE SET
 
 	// Update live GitHub metadata on tracked issues WITHOUT touching auto_*
 	for _, upd := range plan.UpdatedIssues {
-		asgJSON, _ := json.Marshal(nonNilSlice(upd.Assignees))
-		lbsJSON, _ := json.Marshal(nonNilSlice(upd.Labels))
-		res, err := tx.Exec(`
+		var curIssueUpd string
+		err := tx.QueryRow(`SELECT updated_at FROM issues WHERE repo = ? AND number = ?`, DefaultRepo, upd.Number).Scan(&curIssueUpd)
+		if err == sql.ErrNoRows {
+			// Issue was concurrently excluded or deleted while sync was running; do not recreate PR links.
+			continue
+		}
+		if err != nil {
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+		}
+		if !(upd.UpdatedAt != "" && curIssueUpd != "" && model.CompareRFC3339(upd.UpdatedAt, curIssueUpd) < 0) {
+			asgJSON, _ := json.Marshal(nonNilSlice(upd.Assignees))
+			lbsJSON, _ := json.Marshal(nonNilSlice(upd.Labels))
+			if _, err := tx.Exec(`
 UPDATE issues
 SET
   title = ?,
   body = CASE WHEN ? = 1 THEN ? ELSE body END,
   author = ?,
   assignees_json = ?,
-  updated_at = ?,
+  updated_at = CASE WHEN ? != '' THEN ? ELSE updated_at END,
   labels_json = ?,
   is_canonical = ?,
   is_customer = ?,
   gh_severity = ?
 WHERE repo = ? AND number = ?`,
-			upd.Title, boolToInt(upd.HasBody), upd.Body, upd.Author, string(asgJSON), upd.UpdatedAt, string(lbsJSON),
-			boolToInt(upd.IsCanonical), boolToInt(upd.IsCustomer), upd.GHSeverity,
-			DefaultRepo, upd.Number,
-		)
-		if err != nil {
-			return model.Dataset{}, err
-		}
-		if rowsAff, _ := res.RowsAffected(); rowsAff == 0 {
-			// Issue was concurrently excluded or deleted while sync was running; do not recreate PR links.
-			continue
-		}
-		if err := reconcileIssueTimelineLinksInTx(tx, upd.Number, upd.TimelinePRs, upd.TimelineTruncated, plan.StreamBPRRefs[upd.Number], plan.UnlinkedStreamBPRs[upd.Number]); err != nil {
-			return model.Dataset{}, err
-		}
-		reconciledIssues[upd.Number] = true
-		if upd.HasComments {
-			cmtsJSON, _ := json.Marshal(nonNilSlice(upd.RecentComments))
-			if _, err := tx.Exec(`UPDATE issue_triage_state SET recent_comments_json = ? WHERE repo = ? AND number = ?`,
-				string(cmtsJSON), DefaultRepo, upd.Number); err != nil {
-				return model.Dataset{}, err
+				upd.Title, boolToInt(upd.HasBody), upd.Body, upd.Author, string(asgJSON),
+				upd.UpdatedAt, upd.UpdatedAt, string(lbsJSON),
+				boolToInt(upd.IsCanonical), boolToInt(upd.IsCustomer), upd.GHSeverity,
+				DefaultRepo, upd.Number,
+			); err != nil {
+				return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+			}
+			if upd.HasComments {
+				cmtsJSON, _ := json.Marshal(nonNilSlice(upd.RecentComments))
+				if _, err := tx.Exec(`UPDATE issue_triage_state SET recent_comments_json = ? WHERE repo = ? AND number = ?`,
+					string(cmtsJSON), DefaultRepo, upd.Number); err != nil {
+					return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+				}
 			}
 		}
+		if err := reconcileIssueTimelineLinksInTx(tx, upd.Number, upd.TimelinePRs, upd.TimelineTruncated, plan.StreamBPRRefs[upd.Number], plan.UnlinkedStreamBPRs[upd.Number]); err != nil {
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+		}
+		reconciledIssues[upd.Number] = true
 		evalNumsSet[upd.Number] = true
 		maxSyncedIssueUpdated = model.MaxRFC3339(maxSyncedIssueUpdated, upd.UpdatedAt)
 	}
@@ -642,7 +834,7 @@ DELETE FROM issue_pr_links
 WHERE issue_repo = ? AND issue_num = ? AND pr_repo = ? AND pr_num = ? AND source = 'pr_ref'`,
 				DefaultRepo, issNum, parts[0], prNum)
 			if err != nil {
-				return model.Dataset{}, err
+				return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 			}
 			if n, _ := res.RowsAffected(); n > 0 {
 				evalNumsSet[issNum] = true
@@ -650,61 +842,181 @@ WHERE issue_repo = ? AND issue_num = ? AND pr_repo = ? AND pr_num = ? AND source
 		}
 	}
 
-	// Apply direct Stream B updates to any manual/pr_ref links whose issue wasn't in UpdatedIssues
+	// Apply direct Stream B updates monotonically to any manual/pr_ref links whose issue wasn't in UpdatedIssues
 	for _, ref := range plan.DirectPRUpdates {
-		if _, err := tx.Exec(`
-UPDATE issue_pr_links
-SET state = ?, title = ?, is_cherry_pick = ?, updated_at = CASE WHEN ? != '' THEN ? ELSE updated_at END
-WHERE issue_repo = ? AND pr_repo = ? AND pr_num = ?`,
-			ref.State, ref.Title, boolToInt(ref.IsCherryPick), ref.UpdatedAt, ref.UpdatedAt,
-			DefaultRepo, ref.Repo, ref.Num,
-		); err != nil {
-			return model.Dataset{}, err
+		type existingLink struct {
+			issueNum int
+			state    string
+			updAt    string
 		}
-		if err := syncClosedPRStatusInTx(tx, ref.Repo, ref.Num, ref.State); err != nil {
-			return model.Dataset{}, err
-		}
-		lRows, err := tx.Query(`SELECT issue_num FROM issue_pr_links WHERE issue_repo = ? AND pr_repo = ? AND pr_num = ?`,
+		var links []existingLink
+		lRows, err := tx.Query(`SELECT issue_num, state, updated_at FROM issue_pr_links WHERE issue_repo = ? AND pr_repo = ? AND pr_num = ?`,
 			DefaultRepo, ref.Repo, ref.Num)
-		if err == nil {
-			for lRows.Next() {
-				var issNum int
-				if lRows.Scan(&issNum) == nil {
-					evalNumsSet[issNum] = true
-				}
+		if err != nil {
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+		}
+		for lRows.Next() {
+			var el existingLink
+			if err := lRows.Scan(&el.issueNum, &el.state, &el.updAt); err != nil {
+				_ = lRows.Close()
+				return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 			}
+			links = append(links, el)
+		}
+		if err := lRows.Err(); err != nil {
 			_ = lRows.Close()
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+		}
+		_ = lRows.Close()
+
+		for _, el := range links {
+			evalNumsSet[el.issueNum] = true
+			if isIncomingPRSnapshotStale(el.state, el.updAt, ref.State, ref.UpdatedAt) {
+				continue
+			}
+			if _, err := tx.Exec(`
+UPDATE issue_pr_links
+SET state = ?, title = CASE WHEN ? != '' THEN ? ELSE title END, is_cherry_pick = ?, updated_at = CASE WHEN ? != '' THEN ? ELSE updated_at END
+WHERE issue_repo = ? AND issue_num = ? AND pr_repo = ? AND pr_num = ?`,
+				ref.State, ref.Title, ref.Title, boolToInt(ref.IsCherryPick), ref.UpdatedAt, ref.UpdatedAt,
+				DefaultRepo, el.issueNum, ref.Repo, ref.Num,
+			); err != nil {
+				return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+			}
+		}
+		if err := syncClosedPRStatusInTx(tx, ref.Repo, ref.Num, ref.State, ref.UpdatedAt); err != nil {
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
 	}
 
 	// Upsert / delete pending candidates & clear readmitted exclusions
+	applyConcurrentTrackedUpdate := func(upd issuesync.LiveIssueUpdate) error {
+		var curIssueUpd string
+		err := tx.QueryRow(`SELECT updated_at FROM issues WHERE repo = ? AND number = ?`, DefaultRepo, upd.Number).Scan(&curIssueUpd)
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if upd.UpdatedAt != "" && curIssueUpd != "" && model.CompareRFC3339(upd.UpdatedAt, curIssueUpd) < 0 {
+			return nil
+		}
+		asgJSON, _ := json.Marshal(nonNilSlice(upd.Assignees))
+		lbsJSON, _ := json.Marshal(nonNilSlice(upd.Labels))
+		if _, err := tx.Exec(`
+UPDATE issues
+SET
+  title = ?,
+  body = CASE WHEN ? = 1 THEN ? ELSE body END,
+  author = ?,
+  assignees_json = ?,
+  updated_at = CASE WHEN ? != '' THEN ? ELSE updated_at END,
+  labels_json = ?,
+  is_canonical = ?,
+  is_customer = ?,
+  gh_severity = ?
+WHERE repo = ? AND number = ?`,
+			upd.Title, boolToInt(upd.HasBody), upd.Body, upd.Author, string(asgJSON),
+			upd.UpdatedAt, upd.UpdatedAt, string(lbsJSON),
+			boolToInt(upd.IsCanonical), boolToInt(upd.IsCustomer), upd.GHSeverity,
+			DefaultRepo, upd.Number,
+		); err != nil {
+			return err
+		}
+		if err := reconcileIssueTimelineLinksInTx(tx, upd.Number, upd.TimelinePRs, upd.TimelineTruncated, plan.StreamBPRRefs[upd.Number], plan.UnlinkedStreamBPRs[upd.Number]); err != nil {
+			return err
+		}
+		reconciledIssues[upd.Number] = true
+		if upd.HasComments {
+			cmtsJSON, _ := json.Marshal(nonNilSlice(upd.RecentComments))
+			if _, err := tx.Exec(`UPDATE issue_triage_state SET recent_comments_json = ? WHERE repo = ? AND number = ?`,
+				string(cmtsJSON), DefaultRepo, upd.Number); err != nil {
+				return err
+			}
+		}
+		evalNumsSet[upd.Number] = true
+		maxSyncedIssueUpdated = model.MaxRFC3339(maxSyncedIssueUpdated, upd.UpdatedAt)
+		return nil
+	}
+
+	if len(plan.DeletePendingNums) > 0 {
+		if err := addRemovedPendingNumsInTx(tx, plan.DeletePendingNums...); err != nil {
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+		}
+	}
 	for _, n := range plan.DeletePendingNums {
 		if _, err := tx.Exec(`DELETE FROM pending_candidates WHERE repo = ? AND number = ?`, DefaultRepo, n); err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+		}
+		if upd, ok := plan.PendingLiveUpdates[n]; ok {
+			var effCat string
+			var effFK int
+			if err := tx.QueryRow(`
+SELECT
+  COALESCE(NULLIF(o.cat, ''), i.auto_cat),
+  CASE WHEN COALESCE(o.has_force_keep_override, 0) != 0 THEN COALESCE(o.force_keep, 0) ELSE i.auto_force_keep END
+FROM issues i
+LEFT JOIN issue_overrides o ON i.repo = o.repo AND i.number = o.number
+WHERE i.repo = ? AND i.number = ?`, DefaultRepo, n).Scan(&effCat, &effFK); err == nil {
+				if keep, gradReason := issuesync.ShouldRetainTrackedIssue(upd.Labels, effFK != 0, effCat); !keep {
+					archived, aErr := archiveAndDelete(n, gradReason)
+					if aErr != nil {
+						return model.Dataset{}, issuesync.SyncAppliedOutcome{}, aErr
+					}
+					if archived {
+						appliedGraduated = append(appliedGraduated, model.DeltaGraduatedIssue{
+							Number:        n,
+							PrevCat:       effCat,
+							Reason:        gradReason,
+							CurrentLabels: upd.Labels,
+						})
+						pruneLocalAcceptedDeltaInTx(tx, n)
+					}
+				} else if err := applyConcurrentTrackedUpdate(upd); err != nil {
+					return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+				}
+			}
 		}
 	}
 	readmittedSet := make(map[int]bool, len(plan.ReadmittedNums))
 	for _, n := range plan.ReadmittedNums {
+		if plan.PlanStartedUTC != "" {
+			var liveExAt string
+			if err := tx.QueryRow(`SELECT excluded_at FROM excluded_issues WHERE repo = ? AND number = ?`, DefaultRepo, n).Scan(&liveExAt); err == nil {
+				if liveExAt != "" && model.CompareRFC3339(liveExAt, plan.PlanStartedUTC) > 0 {
+					continue
+				}
+			}
+		}
 		readmittedSet[n] = true
 		if _, err := tx.Exec(`DELETE FROM excluded_issues WHERE repo = ? AND number = ?`, DefaultRepo, n); err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
 	}
+	var appliedPendingNums []int
 	for _, pc := range plan.UpsertPending {
-		maxSyncedIssueUpdated = model.MaxRFC3339(maxSyncedIssueUpdated, pc.UpdatedAt)
 		// Guard against concurrent triage resolution (accept -> issues, or exclude -> excluded_issues)
 		// that happened while PlanSync was running outside the SQLite lock.
 		var inTracked, inExcluded int
 		if err := tx.QueryRow(`SELECT COUNT(*) FROM issues WHERE repo = ? AND number = ?`, DefaultRepo, pc.Number).Scan(&inTracked); err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
 		if inTracked > 0 {
 			_, _ = tx.Exec(`DELETE FROM pending_candidates WHERE repo = ? AND number = ?`, DefaultRepo, pc.Number)
+			upd, hasUpd := plan.PendingLiveUpdates[pc.Number]
+			if !hasUpd {
+				upd = liveUpdateFromPendingCandidate(pc)
+			}
+			if err := applyConcurrentTrackedUpdate(upd); err != nil {
+				return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+			}
 			continue
 		}
+		maxSyncedIssueUpdated = model.MaxRFC3339(maxSyncedIssueUpdated, pc.UpdatedAt)
 		if !readmittedSet[pc.Number] {
 			if err := tx.QueryRow(`SELECT COUNT(*) FROM excluded_issues WHERE repo = ? AND number = ?`, DefaultRepo, pc.Number).Scan(&inExcluded); err != nil {
-				return model.Dataset{}, err
+				return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 			}
 			if inExcluded > 0 {
 				_, _ = tx.Exec(`DELETE FROM pending_candidates WHERE repo = ? AND number = ?`, DefaultRepo, pc.Number)
@@ -713,27 +1025,31 @@ WHERE issue_repo = ? AND pr_repo = ? AND pr_num = ?`,
 		}
 		b, err := json.Marshal(pc)
 		if err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
 		if _, err := tx.Exec(`
-INSERT INTO pending_candidates(repo, number, payload_json, updated_at)
-VALUES (?, ?, ?, ?)
-ON CONFLICT(repo, number) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at`,
+INSERT INTO pending_candidates(repo, number, payload_json, updated_at, revision)
+VALUES (?, ?, ?, ?, 1)
+ON CONFLICT(repo, number) DO UPDATE SET
+  payload_json=excluded.payload_json,
+  updated_at=excluded.updated_at,
+  revision=pending_candidates.revision + 1`,
 			DefaultRepo, pc.Number, string(b), pc.UpdatedAt,
 		); err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
+		appliedPendingNums = append(appliedPendingNums, pc.Number)
 	}
 
 	if len(plan.ClearedRecheckNums) > 0 {
 		if err := removeRecheckNumInTx(tx, plan.ClearedRecheckNums...); err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
 	}
 
 	// Ensure baselines exist and evaluate dynamic re-triage triggers
 	if err := s.backfillTriageBaselines(tx); err != nil {
-		return model.Dataset{}, err
+		return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 	}
 	if len(evalNumsSet) > 0 {
 		evalNums := make([]int, 0, len(evalNumsSet))
@@ -741,15 +1057,41 @@ ON CONFLICT(repo, number) DO UPDATE SET payload_json=excluded.payload_json, upda
 			evalNums = append(evalNums, n)
 		}
 		if err := s.reevaluateIssueRetriageInTx(tx, evalNums); err != nil {
-			return model.Dataset{}, err
+			return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 		}
 	}
+
+	sort.Slice(appliedClosed, func(i, j int) bool { return appliedClosed[i].Number > appliedClosed[j].Number })
+	sort.Slice(appliedGraduated, func(i, j int) bool { return appliedGraduated[i].Number > appliedGraduated[j].Number })
 
 	// Update sync_meta in kv_meta, preserving previous non-empty delta when this sync had 0 structural changes
 	var prevMeta model.SyncMeta
 	var rawMeta string
 	if err := tx.QueryRow(`SELECT val_json FROM kv_meta WHERE key = 'sync_meta'`).Scan(&rawMeta); err == nil {
 		_ = json.Unmarshal([]byte(rawMeta), &prevMeta)
+	}
+	// Preserve any issues accepted concurrently while PlanSync was running (triaged_at >= plan.PlanStartedUTC)
+	if plan.PlanStartedUTC != "" && prevMeta.DeltaSincePrevSnapshot != nil {
+		alreadyAdded := make(map[int]bool, len(restoredDelta))
+		for _, item := range restoredDelta {
+			alreadyAdded[item.Number] = true
+		}
+		for _, prevAdd := range prevMeta.DeltaSincePrevSnapshot.NewOpenCandidatesAdded {
+			if alreadyAdded[prevAdd.Number] {
+				continue
+			}
+			var triagedAt string
+			if err := tx.QueryRow(`
+SELECT ts.triaged_at
+FROM issues i
+JOIN issue_triage_state ts ON i.repo = ts.repo AND i.number = ts.number
+WHERE i.repo = ? AND i.number = ?`, DefaultRepo, prevAdd.Number).Scan(&triagedAt); err == nil {
+				if triagedAt != "" && model.CompareRFC3339(triagedAt, plan.PlanStartedUTC) >= 0 {
+					restoredDelta = append(restoredDelta, prevAdd)
+					alreadyAdded[prevAdd.Number] = true
+				}
+			}
+		}
 	}
 	newDelta := &model.SnapshotDelta{
 		PrevSnapshotDate:          prevMeta.SnapshotUTC,
@@ -774,17 +1116,36 @@ ON CONFLICT(repo, number) DO UPDATE SET payload_json=excluded.payload_json, upda
 
 	metaBytes, err := json.Marshal(prevMeta)
 	if err != nil {
-		return model.Dataset{}, err
+		return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 	}
 	if _, err := tx.Exec(`INSERT INTO kv_meta(key, val_json) VALUES('sync_meta', ?) ON CONFLICT(key) DO UPDATE SET val_json=excluded.val_json`, string(metaBytes)); err != nil {
-		return model.Dataset{}, err
+		return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 	}
 
 	if err := tx.Commit(); err != nil {
-		return model.Dataset{}, err
+		return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
 	}
 
-	return s.buildDatasetLocked(true)
+	ds, err := s.buildDatasetLocked(true)
+	if err != nil {
+		return model.Dataset{}, issuesync.SyncAppliedOutcome{}, err
+	}
+
+	closedNums := make([]int, 0, len(appliedClosed))
+	for _, x := range appliedClosed {
+		closedNums = append(closedNums, x.Number)
+	}
+	gradNums := make([]int, 0, len(appliedGraduated))
+	for _, x := range appliedGraduated {
+		gradNums = append(gradNums, x.Number)
+	}
+	outcome := issuesync.SyncAppliedOutcome{
+		ClosedRemovedNums:    nonNilSlice(closedNums),
+		GraduatedRemovedNums: nonNilSlice(gradNums),
+		RestoredNums:         nonNilSlice(appliedRestoredNums),
+		PendingQueueNums:     nonNilSlice(appliedPendingNums),
+	}
+	return ds, outcome, nil
 }
 
 func (s *Store) reevaluateIssueRetriageInTx(tx *sql.Tx, nums []int) error {
@@ -894,7 +1255,7 @@ func (s *Store) snapshotBaselineInTx(tx *sql.Tx, num int, actor string, nowISO s
 SELECT updated_at, labels_json, gh_severity, is_customer
 FROM issues WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&updatedAt, &labelsJSON, &ghSev, &isCust)
 	if err == sql.ErrNoRows {
-		return fmt.Errorf("issue #%d not found", num)
+		return fmt.Errorf("issue #%d not found: %w", num, ErrIssueNotFound)
 	}
 	if err != nil {
 		return err
@@ -935,6 +1296,8 @@ WHERE issue_repo = ? AND issue_num = ?`, DefaultRepo, num)
 	openKeys, mergedKeys := triage.ExtractMainlinePRKeySets(prs)
 	openJSON, _ := json.Marshal(nonNilSlice(openKeys))
 	mergedJSON, _ := json.Marshal(nonNilSlice(mergedKeys))
+	unverifiedKeys := computeUnverifiedOpenPRKeys(tx, prs, actor == "triage" || actor == "override")
+	unverifiedJSON, _ := json.Marshal(nonNilSlice(unverifiedKeys))
 
 	var hasOvr int
 	_ = tx.QueryRow(`SELECT COUNT(*) FROM issue_overrides WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&hasOvr)
@@ -949,6 +1312,7 @@ WHERE issue_repo = ? AND issue_num = ?`, DefaultRepo, num)
 			BaselineIsCustomer:    isCust,
 			BaselineOpenPRsJSON:   string(openJSON),
 			BaselineMergedPRsJSON: string(mergedJSON),
+			UnverifiedOpenPRsJSON: string(unverifiedJSON),
 			CommentWatermarkUTC:   watermark,
 		}); err == nil {
 			autoBaseToWrite = string(b)
@@ -959,10 +1323,10 @@ WHERE issue_repo = ? AND issue_num = ?`, DefaultRepo, num)
 INSERT INTO issue_triage_state(
   repo, number, triaged_at, triaged_by,
   baseline_labels_json, baseline_gh_severity, baseline_is_customer,
-  baseline_open_prs_json, baseline_merged_prs_json,
+  baseline_open_prs_json, baseline_merged_prs_json, unverified_open_prs_json,
   comment_watermark_utc, recent_comments_json, auto_baseline_json,
   needs_retriage, retriage_reasons_json, retriage_details_json
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', '[]')
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', '[]')
 ON CONFLICT(repo, number) DO UPDATE SET
   triaged_at=excluded.triaged_at,
   triaged_by=excluded.triaged_by,
@@ -971,6 +1335,7 @@ ON CONFLICT(repo, number) DO UPDATE SET
   baseline_is_customer=excluded.baseline_is_customer,
   baseline_open_prs_json=excluded.baseline_open_prs_json,
   baseline_merged_prs_json=excluded.baseline_merged_prs_json,
+  unverified_open_prs_json=excluded.unverified_open_prs_json,
   comment_watermark_utc=excluded.comment_watermark_utc,
   auto_baseline_json=excluded.auto_baseline_json,
   needs_retriage=0,
@@ -978,7 +1343,7 @@ ON CONFLICT(repo, number) DO UPDATE SET
   retriage_details_json='[]'`,
 		DefaultRepo, num, nowISO, actor,
 		labelsJSON, ghSev, isCust,
-		string(openJSON), string(mergedJSON),
+		string(openJSON), string(mergedJSON), string(unverifiedJSON),
 		watermark, cmtsJSON, autoBaseToWrite,
 	)
 	return err
@@ -991,7 +1356,7 @@ func (s *Store) AcknowledgeIssueRetriage(number int, actor string) (model.IssueR
 	if actor == "" {
 		actor = "ack"
 	}
-	nowISO := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	nowISO := model.NowRFC3339Nano()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return model.IssueRecord{}, err
@@ -1023,7 +1388,7 @@ func (s *Store) AcknowledgeBatchRetriage(numbers []int, actor string) ([]int, er
 	if len(numbers) == 0 {
 		return nil, nil
 	}
-	nowISO := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	nowISO := model.NowRFC3339Nano()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -1041,25 +1406,36 @@ func (s *Store) AcknowledgeBatchRetriage(numbers []int, actor string) ([]int, er
 
 func (s *Store) acknowledgeBatchRetriageInTx(tx *sql.Tx, numbers []int, actor string, nowISO string) ([]int, error) {
 	if len(numbers) == 0 {
-		return nil, nil
+		return []int{}, nil
 	}
 	if actor == "" {
 		actor = "ack_batch"
 	}
 	seen := make(map[int]bool, len(numbers))
 	var acked []int
+	var lastSkippedErr error
 	for _, n := range numbers {
 		if n <= 0 || seen[n] {
 			continue
 		}
 		seen[n] = true
 		if err := s.snapshotBaselineInTx(tx, n, actor, nowISO); err != nil {
+			if len(numbers) > 1 && errors.Is(err, ErrIssueNotFound) {
+				_, inEx, inArch := isIssueKnownNonPending(tx, n)
+				if inEx || inArch {
+					lastSkippedErr = err
+					continue
+				}
+			}
 			return nil, err
 		}
 		acked = append(acked, n)
 	}
+	if len(acked) == 0 && lastSkippedErr != nil {
+		return nil, lastSkippedErr
+	}
 	sort.Slice(acked, func(i, j int) bool { return acked[i] > acked[j] })
-	return acked, nil
+	return nonNilSlice(acked), nil
 }
 
 func (s *Store) ExcludeExistingIssue(number int, reason string, allowCanonical bool) error {
@@ -1070,7 +1446,7 @@ func (s *Store) ExcludeExistingIssue(number int, reason string, allowCanonical b
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	nowISO := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	nowISO := model.NowRFC3339Nano()
 	if err := s.excludeExistingIssueInTx(tx, number, reason, allowCanonical, nowISO); err != nil {
 		return err
 	}
@@ -1078,6 +1454,11 @@ func (s *Store) ExcludeExistingIssue(number int, reason string, allowCanonical b
 }
 
 func (s *Store) excludeExistingIssueInTx(tx *sql.Tx, number int, reason string, allowCanonical bool, nowISO string) error {
+	if norm, ok := model.NormalizeRFC3339NanoFixed(nowISO); ok {
+		nowISO = norm
+	} else if strings.TrimSpace(nowISO) == "" {
+		nowISO = model.NowRFC3339Nano()
+	}
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "Excluded non-optimizer issue"
@@ -1111,9 +1492,13 @@ func (s *Store) excludeExistingIssueInTx(tx *sql.Tx, number int, reason string, 
 				source = "pending_triage"
 			}
 		} else {
-			_ = tx.QueryRow(`SELECT title FROM archived_issues WHERE repo = ? AND number = ?`, DefaultRepo, number).Scan(&title)
-			lbsJSON = "[]"
-			source = "manual_untracked"
+			if exErr := tx.QueryRow(`SELECT title, excluded_labels_json, source FROM excluded_issues WHERE repo = ? AND number = ?`,
+				DefaultRepo, number).Scan(&title, &lbsJSON, &source); exErr != nil {
+				if exErr == sql.ErrNoRows {
+					return fmt.Errorf("issue #%d not found in active or pending issues: %w", number, ErrIssueNotFound)
+				}
+				return exErr
+			}
 		}
 	}
 	if lbsJSON == "" {
@@ -1235,7 +1620,7 @@ func (s *Store) RestoreExcludedIssue(number int) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("excluded issue #%d not found", number)
+		return fmt.Errorf("excluded issue #%d not found: %w", number, ErrIssueNotFound)
 	}
 	if err := addRecheckNumInTx(tx, number); err != nil {
 		return err
@@ -1260,11 +1645,20 @@ func (s *Store) UpdatePendingCandidates(candidates []model.PendingCandidate) err
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`
-UPDATE pending_candidates SET payload_json = ?, updated_at = ?
-WHERE repo = ? AND number = ?`,
-			string(b), pc.UpdatedAt, DefaultRepo, pc.Number); err != nil {
-			return err
+		if pc.Revision > 0 {
+			if _, err := tx.Exec(`
+UPDATE pending_candidates SET payload_json = ?, revision = revision + 1
+WHERE repo = ? AND number = ? AND revision = ?`,
+				string(b), DefaultRepo, pc.Number, pc.Revision); err != nil {
+				return err
+			}
+		} else {
+			if _, err := tx.Exec(`
+UPDATE pending_candidates SET payload_json = ?, revision = revision + 1
+WHERE repo = ? AND number = ? AND updated_at = ?`,
+				string(b), DefaultRepo, pc.Number, pc.UpdatedAt); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
@@ -1302,30 +1696,64 @@ func (s *Store) ListRetriageCandidates(onlyFlagged bool, specificNums []int) ([]
 	}
 
 	cmtsByNum := make(map[int][]model.PendingComment, len(matched))
-	rows, err := s.db.Query(`SELECT number, recent_comments_json FROM issue_triage_state WHERE repo = ?`, DefaultRepo)
-	if err == nil {
+	bodyByNum := make(map[int]string, len(matched))
+	for start := 0; start < len(matched); start += sqlInChunkSize {
+		end := start + sqlInChunkSize
+		if end > len(matched) {
+			end = len(matched)
+		}
+		chunk := matched[start:end]
+		placeholders := make([]string, len(chunk))
+		queryArgs := make([]any, 0, len(chunk)+1)
+		queryArgs = append(queryArgs, DefaultRepo)
+		for i, r := range chunk {
+			placeholders[i] = "?"
+			queryArgs = append(queryArgs, r.Number)
+		}
+		inClause := strings.Join(placeholders, ",")
+
+		rows, err := s.db.Query(`SELECT number, recent_comments_json FROM issue_triage_state WHERE repo = ? AND number IN (`+inClause+`)`, queryArgs...)
+		if err != nil {
+			return nil, err
+		}
 		for rows.Next() {
 			var n int
 			var raw string
-			if rows.Scan(&n, &raw) == nil && matchedSet[n] {
+			if err := rows.Scan(&n, &raw); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if matchedSet[n] {
 				var cmts []model.PendingComment
 				if json.Unmarshal([]byte(raw), &cmts) == nil {
 					cmtsByNum[n] = cmts
 				}
 			}
 		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
 		_ = rows.Close()
-	}
 
-	bodyByNum := make(map[int]string, len(matched))
-	bRows, err := s.db.Query(`SELECT number, body FROM issues WHERE repo = ?`, DefaultRepo)
-	if err == nil {
+		bRows, err := s.db.Query(`SELECT number, body FROM issues WHERE repo = ? AND number IN (`+inClause+`)`, queryArgs...)
+		if err != nil {
+			return nil, err
+		}
 		for bRows.Next() {
 			var n int
 			var body string
-			if bRows.Scan(&n, &body) == nil && matchedSet[n] && body != "" {
+			if err := bRows.Scan(&n, &body); err != nil {
+				_ = bRows.Close()
+				return nil, err
+			}
+			if matchedSet[n] && body != "" {
 				bodyByNum[n] = body
 			}
+		}
+		if err := bRows.Err(); err != nil {
+			_ = bRows.Close()
+			return nil, err
 		}
 		_ = bRows.Close()
 	}
@@ -1449,30 +1877,34 @@ func (s *Store) addManualPRLinksInTx(tx *sql.Tx, manualLinks map[string][]string
 						title = st.Title
 					}
 				}
-				if _, err := tx.Exec(`
-INSERT INTO issue_pr_links(issue_repo, issue_num, pr_repo, pr_num, label, url, state, title, is_cherry_pick, updated_at, source)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual')
-ON CONFLICT(issue_repo, issue_num, pr_repo, pr_num) DO UPDATE SET
-  state=CASE WHEN excluded.updated_at != '' THEN excluded.state ELSE issue_pr_links.state END,
-  title=CASE WHEN excluded.title != '' AND excluded.title != excluded.label THEN excluded.title ELSE issue_pr_links.title END,
-  is_cherry_pick=CASE WHEN excluded.updated_at != '' THEN excluded.is_cherry_pick ELSE issue_pr_links.is_cherry_pick END,
-  updated_at=CASE WHEN excluded.updated_at != '' THEN excluded.updated_at ELSE issue_pr_links.updated_at END,
-  source='manual'`,
-					DefaultRepo, issNum, t.Repo, t.Number, label, url, state, title, isCP, updAt,
-				); err != nil {
-					return 0, err
-				}
-				linkedRefs = append(linkedRefs, model.LinkedPRRef{
+				ref := model.LinkedPRRef{
 					Repo:         t.Repo,
 					Num:          t.Number,
+					Label:        label,
+					URL:          url,
 					State:        state,
+					Title:        title,
 					IsCherryPick: isCP != 0,
-				})
+					UpdatedAt:    updAt,
+					Source:       model.LinkSourceManual,
+				}
+				if err := upsertIssuePRLinkMonotonicInTx(tx, issNum, ref, model.LinkSourceManual); err != nil {
+					return 0, err
+				}
+				var effState, effUpdAt string
+				var effIsCP int
+				if tx.QueryRow(`SELECT state, is_cherry_pick, updated_at FROM issue_pr_links WHERE issue_repo = ? AND issue_num = ? AND pr_repo = ? AND pr_num = ?`,
+					DefaultRepo, issNum, t.Repo, t.Number).Scan(&effState, &effIsCP, &effUpdAt) == nil {
+					ref.State = effState
+					ref.IsCherryPick = effIsCP != 0
+					ref.UpdatedAt = effUpdAt
+				}
+				linkedRefs = append(linkedRefs, ref)
 				added++
 			}
 		}
 		if newlyAccepted[issNum] {
-			nowISO := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+			nowISO := model.NowRFC3339Nano()
 			if err := s.snapshotBaselineInTx(tx, issNum, "triage", nowISO); err != nil {
 				return 0, err
 			}
@@ -1496,14 +1928,15 @@ ON CONFLICT(issue_repo, issue_num, pr_repo, pr_num) DO UPDATE SET
 // so linking a PR via manual_pr_links does not immediately self-flag new_fix_pr / fix_pr_merged_still_open.
 func mergeManualPRsIntoBaselineInTx(tx *sql.Tx, num int, linked []model.LinkedPRRef) error {
 	addOpen, addMerged := triage.ExtractMainlinePRKeySets(linked)
-	if len(addOpen) == 0 && len(addMerged) == 0 {
+	addUnverified := computeUnverifiedOpenPRKeys(tx, linked, false)
+	if len(addOpen) == 0 && len(addMerged) == 0 && len(addUnverified) == 0 {
 		return nil
 	}
-	var openJSON, mergedJSON, autoBase string
+	var openJSON, mergedJSON, unverifiedJSON, autoBase string
 	err := tx.QueryRow(`
-SELECT baseline_open_prs_json, baseline_merged_prs_json, auto_baseline_json
+SELECT baseline_open_prs_json, baseline_merged_prs_json, unverified_open_prs_json, auto_baseline_json
 FROM issue_triage_state
-WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&openJSON, &mergedJSON, &autoBase)
+WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&openJSON, &mergedJSON, &unverifiedJSON, &autoBase)
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -1536,14 +1969,14 @@ WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&openJSON, &mergedJSON, &
 
 	newOpenJSON := mergeKeys(openJSON, addOpen)
 	newMergedJSON := mergeKeys(mergedJSON, addMerged)
+	newUnverifiedJSON := mergeKeys(unverifiedJSON, addUnverified)
 
-	var hasOvr int
-	_ = tx.QueryRow(`SELECT COUNT(*) FROM issue_overrides WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&hasOvr)
-	if hasOvr == 0 && autoBase != "" {
+	if autoBase != "" {
 		var saved savedTriageBaseline
 		if json.Unmarshal([]byte(autoBase), &saved) == nil {
 			saved.BaselineOpenPRsJSON = mergeKeys(saved.BaselineOpenPRsJSON, addOpen)
 			saved.BaselineMergedPRsJSON = mergeKeys(saved.BaselineMergedPRsJSON, addMerged)
+			saved.UnverifiedOpenPRsJSON = mergeKeys(saved.UnverifiedOpenPRsJSON, addUnverified)
 			if b, err := json.Marshal(saved); err == nil {
 				autoBase = string(b)
 			}
@@ -1552,8 +1985,8 @@ WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&openJSON, &mergedJSON, &
 
 	_, err = tx.Exec(`
 UPDATE issue_triage_state
-SET baseline_open_prs_json = ?, baseline_merged_prs_json = ?, auto_baseline_json = ?
+SET baseline_open_prs_json = ?, baseline_merged_prs_json = ?, unverified_open_prs_json = ?, auto_baseline_json = ?
 WHERE repo = ? AND number = ?`,
-		newOpenJSON, newMergedJSON, autoBase, DefaultRepo, num)
+		newOpenJSON, newMergedJSON, newUnverifiedJSON, autoBase, DefaultRepo, num)
 	return err
 }

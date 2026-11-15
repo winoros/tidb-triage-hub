@@ -2,9 +2,12 @@ package syncer
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/winoros/tidb-triage-hub/internal/ghgql"
@@ -15,13 +18,19 @@ import (
 	"github.com/winoros/tidb-triage-hub/internal/triage"
 )
 
+var (
+	ErrInvalidSyncInput = errors.New("invalid sync input")
+	ErrMissingGitHubPR  = errors.New("manual_pr_links PR not found on GitHub")
+)
+
 type Syncer struct {
-	mu     sync.Mutex
-	store  *store.Store
-	runner ghgql.Runner
+	mu                 sync.Mutex
+	store              *store.Store
+	runner             ghgql.Runner
+	lastFullPRSyncUnix atomic.Int64
 }
 
-// New creates a pure-Go Syncer using the default gh GraphQL CLI runner.
+// New creates a pure-Go Syncer using the default GitHub GraphQL runner.
 func New(st *store.Store) *Syncer {
 	return &Syncer{
 		store:  st,
@@ -50,6 +59,9 @@ func (sy *Syncer) SyncPRStatuses(ctx context.Context) (prstatus.FetchStats, erro
 func (sy *Syncer) SyncPRStatusesWithQuota(ctx context.Context, minQuota int) (prstatus.FetchStats, error) {
 	sy.mu.Lock()
 	defer sy.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return prstatus.FetchStats{}, err
+	}
 	if minQuota > 0 {
 		if _, err := ghgql.CheckQuota(ctx, sy.runner, minQuota); err != nil {
 			return prstatus.FetchStats{}, err
@@ -58,10 +70,57 @@ func (sy *Syncer) SyncPRStatusesWithQuota(ctx context.Context, minQuota int) (pr
 	return sy.syncPRStatusesLocked(ctx)
 }
 
+// SyncPRStatusesIfStale runs a full open-PR refresh only if at least minAge has elapsed
+// since the last completed full PR status refresh (including one run inside SyncIssuesWithOptions).
+func (sy *Syncer) SyncPRStatusesIfStale(ctx context.Context, minAge time.Duration) (prstatus.FetchStats, bool, error) {
+	sy.mu.Lock()
+	defer sy.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return prstatus.FetchStats{}, false, err
+	}
+	if minAge > 0 {
+		if last := sy.lastFullPRSyncUnix.Load(); last > 0 && time.Since(time.Unix(0, last)) < minAge {
+			return prstatus.FetchStats{}, false, nil
+		}
+	}
+	if _, err := ghgql.CheckQuota(ctx, sy.runner, 100); err != nil {
+		return prstatus.FetchStats{}, false, err
+	}
+	stats, err := sy.syncPRStatusesLocked(ctx)
+	if err != nil {
+		return prstatus.FetchStats{}, false, err
+	}
+	return stats, true, nil
+}
+
+// ExecuteSyncPRs runs either a targeted PR refresh (when prSpec is non-empty) or a full open-PR refresh,
+// applying standard default quota thresholds when minQuota < 0.
+func (sy *Syncer) ExecuteSyncPRs(ctx context.Context, prSpec string, minQuota int) (prstatus.FetchStats, error) {
+	if strings.TrimSpace(prSpec) != "" {
+		targets, err := prstatus.ParsePRSpecs(prSpec, store.DefaultRepo)
+		if err != nil {
+			return prstatus.FetchStats{}, fmt.Errorf("%w: invalid pr spec: %v", ErrInvalidSyncInput, err)
+		}
+		mq := minQuota
+		if mq < 0 {
+			mq = 20
+		}
+		return sy.SyncSpecificPRs(ctx, targets, mq)
+	}
+	mq := minQuota
+	if mq < 0 {
+		mq = 100
+	}
+	return sy.SyncPRStatusesWithQuota(ctx, mq)
+}
+
 func (sy *Syncer) SyncSpecificPRs(ctx context.Context, targets []prstatus.PRTarget, minQuota int) (prstatus.FetchStats, error) {
 	// Intentionally do not acquire sy.mu here: targeted PR syncs are fast (single-batch GraphQL)
 	// and Store.mu serializes SQLite writes safely, so Web UI triage actions don't block for minutes
 	// behind a background SyncIssuesWithOptions run.
+	if err := ctx.Err(); err != nil {
+		return prstatus.FetchStats{}, err
+	}
 	if minQuota > 0 {
 		if _, err := ghgql.CheckQuota(ctx, sy.runner, minQuota); err != nil {
 			return prstatus.FetchStats{}, err
@@ -102,19 +161,20 @@ func (sy *Syncer) syncPRStatusesLocked(ctx context.Context) (prstatus.FetchStats
 	if err := sy.store.UpsertPRStatuses(statuses, finished); err != nil {
 		return prstatus.FetchStats{}, err
 	}
+	sy.lastFullPRSyncUnix.Store(finished.UnixNano())
 	sy.store.RecordSyncRun("pr_status", started, finished, stats)
 	return stats, nil
 }
 
 type IssueSyncOptions struct {
-	Full                  bool
-	SkipPRs               bool
-	DryRun                bool
-	Since                 string
-	OverlapMinutes        int
-	MaxIncrementalDays    int
-	UntriagedLookbackDays int
-	MinQuota              int
+	Full                  bool   `json:"full"`
+	SkipPRs               bool   `json:"skip_prs"`
+	DryRun                bool   `json:"dry_run"`
+	Since                 string `json:"since,omitempty"`
+	OverlapMinutes        int    `json:"overlap_minutes"`
+	MaxIncrementalDays    int    `json:"max_incremental_days"`
+	UntriagedLookbackDays int    `json:"untriaged_lookback_days"`
+	MinQuota              int    `json:"min_quota"`
 }
 
 type IssueSyncResult struct {
@@ -138,15 +198,40 @@ func (sy *Syncer) SyncIssuesDualStream(ctx context.Context, full bool) (IssueSyn
 	})
 }
 
+func buildPrevSummaryDataset(syncState issuesync.SyncState, retriageNums []int) model.Dataset {
+	meta := syncState.PrevMeta
+	canCnt := 0
+	realBugs := 0
+	for _, tr := range syncState.TrackedIssues {
+		if tr.IsCanonical {
+			canCnt++
+		}
+		if model.IsRealBugCategory(tr.Cat) {
+			realBugs++
+		}
+	}
+	meta.TotalCandidates = len(syncState.TrackedIssues)
+	meta.CanonicalCandidates = canCnt
+	meta.RealBugs = realBugs
+	meta.RetriageIssueNums = retriageNums
+	return model.Dataset{SyncMeta: meta}
+}
+
 func (sy *Syncer) SyncIssuesWithOptions(ctx context.Context, opts IssueSyncOptions) (IssueSyncResult, error) {
+	if s := strings.TrimSpace(opts.Since); s != "" {
+		if _, ok := model.NormalizeRFC3339NanoFixed(s); !ok {
+			return IssueSyncResult{}, fmt.Errorf("%w: invalid since timestamp %q (expected RFC3339)", ErrInvalidSyncInput, s)
+		}
+	}
+
 	sy.mu.Lock()
 	defer sy.mu.Unlock()
-
-	started := time.Now()
-	prevDS, err := sy.store.BuildDataset(true)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return IssueSyncResult{}, err
 	}
+
+	started := time.Now()
+	planStartedUTC := model.NowRFC3339Nano()
 	syncState, err := sy.store.LoadSyncState()
 	if err != nil {
 		return IssueSyncResult{}, err
@@ -183,6 +268,7 @@ func (sy *Syncer) SyncIssuesWithOptions(ctx context.Context, opts IssueSyncOptio
 	if err != nil {
 		return IssueSyncResult{}, err
 	}
+	plan.PlanStartedUTC = planStartedUTC
 
 	var enrichWarn string
 	if len(plan.UpsertPending) > 0 {
@@ -199,7 +285,9 @@ func (sy *Syncer) SyncIssuesWithOptions(ctx context.Context, opts IssueSyncOptio
 		for _, pc := range plan.UpsertPending {
 			pendNums = append(pendNums, pc.Number)
 		}
-		summary := issuesync.FormatSyncSummary(plan, prevDS, prevDS)
+		curRetriage, _ := sy.store.ListRetriageNumbers()
+		prevSummaryDS := buildPrevSummaryDataset(syncState, curRetriage)
+		summary := issuesync.FormatSyncSummary(plan, prevSummaryDS, prevSummaryDS)
 		return IssueSyncResult{
 			ModeUsed:       plan.ModeUsed,
 			DryRun:         true,
@@ -211,12 +299,16 @@ func (sy *Syncer) SyncIssuesWithOptions(ctx context.Context, opts IssueSyncOptio
 		}, nil
 	}
 
-	nextDS, err := sy.store.ApplyIssueSync(plan)
+	prevSummaryDS := buildPrevSummaryDataset(syncState, nil)
+	nextDS, applied, err := sy.store.ApplyIssueSyncWithOutcome(plan)
 	if err != nil {
 		return IssueSyncResult{}, err
 	}
+	plan.Applied = &applied
 
-	summary := issuesync.FormatSyncSummary(plan, prevDS, nextDS)
+	summary := issuesync.FormatSyncSummary(plan, prevSummaryDS, nextDS)
+	pendNums := nextDS.SyncMeta.PendingCandidateNums
+	retriageNums := nextDS.SyncMeta.RetriageIssueNums
 
 	var prStats prstatus.FetchStats
 	if !opts.SkipPRs {
@@ -228,13 +320,12 @@ func (sy *Syncer) SyncIssuesWithOptions(ctx context.Context, opts IssueSyncOptio
 				IssueStats:   plan.Stats,
 			}, err
 		}
-		nextDS, _ = sy.store.BuildDataset(true)
-	}
-
-	pending, _ := sy.store.ListPendingCandidates()
-	pendNums := make([]int, 0, len(pending))
-	for _, pc := range pending {
-		pendNums = append(pendNums, pc.Number)
+		if pNums, pErr := sy.store.ListPendingCandidateNumbers(); pErr == nil {
+			pendNums = pNums
+		}
+		if nums, rErr := sy.store.ListRetriageNumbers(); rErr == nil {
+			retriageNums = nums
+		}
 	}
 
 	res := IssueSyncResult{
@@ -244,8 +335,8 @@ func (sy *Syncer) SyncIssuesWithOptions(ctx context.Context, opts IssueSyncOptio
 		PRStats:         prStats,
 		PendingCount:    len(pendNums),
 		PendingNumbers:  pendNums,
-		RetriageCount:   len(nextDS.SyncMeta.RetriageIssueNums),
-		RetriageNumbers: nextDS.SyncMeta.RetriageIssueNums,
+		RetriageCount:   len(retriageNums),
+		RetriageNumbers: retriageNums,
 		EnrichWarning:   enrichWarn,
 	}
 	sy.store.RecordSyncRun("issues_dual_stream", started, time.Now(), res)
@@ -254,8 +345,10 @@ func (sy *Syncer) SyncIssuesWithOptions(ctx context.Context, opts IssueSyncOptio
 
 type TriageApplyResult struct {
 	store.BatchTriageResult
-	SyncedNewPRs int                  `json:"synced_new_prs"`
-	PRStats      *prstatus.FetchStats `json:"pr_stats,omitempty"`
+	SyncedNewPRs       int                        `json:"synced_new_prs"`
+	PRStats            *prstatus.FetchStats       `json:"pr_stats,omitempty"`
+	PRSyncWarning      string                     `json:"pr_sync_warning,omitempty"`
+	ValidationWarnings []triage.ValidationWarning `json:"validation_warnings,omitempty"`
 }
 
 func collectManualLinkTargets(manualLinks map[string][]string) []prstatus.PRTarget {
@@ -283,22 +376,63 @@ func collectManualLinkTargets(manualLinks map[string][]string) []prstatus.PRTarg
 	return out
 }
 
+func mergePRFetchStats(dst *prstatus.FetchStats, src prstatus.FetchStats) {
+	dst.GraphQLCalls += src.GraphQLCalls
+	dst.GraphQLCost += src.GraphQLCost
+	dst.TotalFetched += src.TotalFetched
+	dst.OpenCount += src.OpenCount
+	dst.ClosedCount += src.ClosedCount
+	dst.DurationMs += src.DurationMs
+	if src.RateLimitLimit > 0 {
+		dst.RateLimitLimit = src.RateLimitLimit
+		dst.RateLimitRemaining = src.RateLimitRemaining
+		dst.RateLimitResetUTC8 = src.RateLimitResetUTC8
+	}
+}
+
+func collectDecisionIssueNums[V any](m map[string]V) []int {
+	if len(m) == 0 {
+		return nil
+	}
+	var nums []int
+	seen := make(map[int]bool, len(m))
+	for k := range m {
+		s := strings.TrimPrefix(strings.TrimSpace(k), "#")
+		if n, err := strconv.Atoi(s); err == nil && n > 0 && !seen[n] {
+			seen[n] = true
+			nums = append(nums, n)
+		}
+	}
+	return nums
+}
+
 func (sy *Syncer) ApplyTriageDecisions(ctx context.Context, dec model.BatchTriageDecisions, syncNewPRs bool, minQuota int) (TriageApplyResult, error) {
-	sy.mu.Lock()
-	defer sy.mu.Unlock()
+	return sy.ApplyTriageDecisionsWithOptions(ctx, dec, store.BatchApplyOptions{SkipConflicts: false}, syncNewPRs, minQuota)
+}
+
+func (sy *Syncer) ApplyTriageDecisionsWithOptions(ctx context.Context, dec model.BatchTriageDecisions, applyOpts store.BatchApplyOptions, syncNewPRs bool, minQuota int) (TriageApplyResult, error) {
+	// Intentionally do not acquire sy.mu here: Store.mu serializes SQLite batch writes safely in <5ms,
+	// and ApplyIssueSync re-reads live tables inside its write transaction, so batch triage calls
+	// (including remote Machine B `triage`) never stall behind multi-minute background syncs.
+	if err := ctx.Err(); err != nil {
+		return TriageApplyResult{}, err
+	}
 
 	started := time.Now()
 	var combinedStats prstatus.FetchStats
 	hasStats := false
 	quotaChecked := false
+	prSyncWarn := ""
 
-	// Pre-fetch manual PR specs BEFORE applying decisions so real state/title/is_cherry_pick
-	// are available during baseline snapshotting & retriage evaluation (including FILTER_NON_OPT_OR_FIXED).
-	if syncNewPRs && len(dec.ManualPRLinks) > 0 {
-		if err := sy.store.ValidateBatchDecisionsReadOnly(dec); err != nil {
+	// Pre-fetch uncached PRs BEFORE mutating SQLite so baseline snapshotting sees true GitHub PR states
+	// immediately on the first transaction, avoiding any post-commit transient window.
+	if syncNewPRs && (len(dec.ManualPRLinks) > 0 || len(dec.NewIssues) > 0 || len(dec.Overrides) > 0) {
+		planned, _, err := sy.store.PlanBatchDecisionsWithOptions(dec, applyOpts)
+		if err != nil {
 			return TriageApplyResult{}, err
 		}
-		manualTargets := collectManualLinkTargets(dec.ManualPRLinks)
+		syncedKeys := make(map[string]bool)
+		manualTargets := collectManualLinkTargets(planned.ManualPRLinks)
 		if len(manualTargets) > 0 {
 			if minQuota > 0 {
 				if _, err := ghgql.CheckQuota(ctx, sy.runner, minQuota); err != nil {
@@ -315,46 +449,81 @@ func (sy *Syncer) ApplyTriageDecisions(ctx context.Context, dec model.BatchTriag
 				return TriageApplyResult{}, err
 			}
 			if len(missingPRs) > 0 {
-				return TriageApplyResult{}, fmt.Errorf("manual_pr_links PR not found on GitHub: %s", strings.Join(missingPRs, ", "))
+				return TriageApplyResult{}, fmt.Errorf("%w: %s", ErrMissingGitHubPR, strings.Join(missingPRs, ", "))
 			}
-			combinedStats = stats
+			for _, t := range manualTargets {
+				syncedKeys[model.PRKey(t.Repo, t.Number)] = true
+			}
+			mergePRFetchStats(&combinedStats, stats)
 			hasStats = true
+		}
+
+		var preTargets []prstatus.PRTarget
+		addPreTargets := func(list []prstatus.PRTarget) {
+			for _, t := range list {
+				k := model.PRKey(t.Repo, t.Number)
+				if !syncedKeys[k] {
+					syncedKeys[k] = true
+					preTargets = append(preTargets, t)
+				}
+			}
+		}
+		if newNums := collectDecisionIssueNums(planned.NewIssues); len(newNums) > 0 {
+			if list, err := sy.store.ListPendingMissingPRTargets(newNums...); err == nil {
+				addPreTargets(list)
+			}
+		}
+		if ovrNums := collectDecisionIssueNums(planned.Overrides); len(ovrNums) > 0 {
+			if list, err := sy.store.ListIssueMissingPRTargets(ovrNums...); err == nil {
+				addPreTargets(list)
+			}
+		}
+		if len(preTargets) > 0 {
+			if minQuota > 0 && !quotaChecked {
+				if _, qErr := ghgql.CheckQuota(ctx, sy.runner, minQuota); qErr != nil {
+					prSyncWarn = fmt.Sprintf("triage decisions saved, but pre-flight quota check for %d newly linked PR(s) failed: %v", len(preTargets), qErr)
+				} else {
+					quotaChecked = true
+				}
+			}
+			if prSyncWarn == "" {
+				stats, sErr := sy.syncSpecificPRs(ctx, preTargets)
+				if sErr != nil {
+					prSyncWarn = fmt.Sprintf("triage decisions saved, but syncing %d newly linked PR(s) failed: %v", len(preTargets), sErr)
+				} else {
+					mergePRFetchStats(&combinedStats, stats)
+					hasStats = true
+				}
+			}
 		}
 	}
 
-	bRes, err := sy.store.ApplyBatchTriageDecisions(dec)
+	bRes, err := sy.store.ApplyBatchTriageDecisionsWithOptions(dec, applyOpts)
 	if err != nil {
 		return TriageApplyResult{}, err
 	}
-	out := TriageApplyResult{BatchTriageResult: bRes}
-	if syncNewPRs && len(bRes.MissingPRTargets) > 0 {
+	out := TriageApplyResult{
+		BatchTriageResult: bRes,
+		PRSyncWarning:     prSyncWarn,
+	}
+	if syncNewPRs && out.PRSyncWarning == "" && len(bRes.MissingPRTargets) > 0 {
 		if minQuota > 0 && !quotaChecked {
-			if _, err := ghgql.CheckQuota(ctx, sy.runner, minQuota); err != nil {
-				return out, fmt.Errorf("triage decisions saved, but pre-flight quota check for %d newly linked PR(s) failed: %w", len(bRes.MissingPRTargets), err)
+			if _, qErr := ghgql.CheckQuota(ctx, sy.runner, minQuota); qErr != nil {
+				out.PRSyncWarning = fmt.Sprintf("triage decisions saved, but pre-flight quota check for %d newly linked PR(s) failed: %v", len(bRes.MissingPRTargets), qErr)
 			}
 		}
-		stats, err := sy.syncSpecificPRs(ctx, bRes.MissingPRTargets)
-		if err != nil {
-			return out, fmt.Errorf("triage decisions saved, but syncing %d newly linked PR(s) failed: %w", len(bRes.MissingPRTargets), err)
-		}
-		if len(bRes.AcceptedIssues) > 0 {
-			_ = sy.store.RefreshAcceptedIssueBaselines(bRes.AcceptedIssues)
-			if cnt, cntErr := sy.store.CountRetriageNeeded(); cntErr == nil {
-				out.RemainingRetriage = cnt
+		if out.PRSyncWarning == "" {
+			stats, sErr := sy.syncSpecificPRs(ctx, bRes.MissingPRTargets)
+			if sErr != nil {
+				out.PRSyncWarning = fmt.Sprintf("triage decisions saved, but syncing %d newly linked PR(s) failed: %v", len(bRes.MissingPRTargets), sErr)
+			} else {
+				if cnt, cntErr := sy.store.CountRetriageNeeded(); cntErr == nil {
+					out.RemainingRetriage = cnt
+				}
+				mergePRFetchStats(&combinedStats, stats)
+				hasStats = true
 			}
 		}
-		combinedStats.GraphQLCalls += stats.GraphQLCalls
-		combinedStats.GraphQLCost += stats.GraphQLCost
-		combinedStats.TotalFetched += stats.TotalFetched
-		combinedStats.OpenCount += stats.OpenCount
-		combinedStats.ClosedCount += stats.ClosedCount
-		combinedStats.DurationMs += stats.DurationMs
-		if stats.RateLimitLimit > 0 {
-			combinedStats.RateLimitLimit = stats.RateLimitLimit
-			combinedStats.RateLimitRemaining = stats.RateLimitRemaining
-			combinedStats.RateLimitResetUTC8 = stats.RateLimitResetUTC8
-		}
-		hasStats = true
 	}
 	if hasStats {
 		out.SyncedNewPRs = combinedStats.TotalFetched

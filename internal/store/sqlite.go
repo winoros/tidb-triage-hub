@@ -1,10 +1,12 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,7 +25,12 @@ import (
 
 const DefaultRepo = "pingcap/tidb"
 
-var ErrCanonicalCannotExclude = errors.New("canonical sig/planner + type/bug issue cannot be excluded")
+var (
+	ErrCanonicalCannotExclude = errors.New("canonical sig/planner + type/bug issue cannot be excluded")
+	ErrIssueNotFound          = errors.New("issue not found")
+	ErrOverrideConflict       = errors.New("issue triage state was modified concurrently")
+	ErrBatchConflict          = errors.New("batch triage conflict")
+)
 
 type sqlExecQuerier interface {
 	Exec(query string, args ...any) (sql.Result, error)
@@ -32,30 +39,180 @@ type sqlExecQuerier interface {
 }
 
 type Store struct {
-	mu sync.Mutex
-	db *sql.DB
+	mu       sync.Mutex
+	backupMu sync.Mutex
+	db       *sql.DB
+	dbPath   string
+}
+
+func sqliteFileURI(absPath string, rawQuery string) string {
+	slashPath := filepath.ToSlash(absPath)
+	omitHost := strings.HasPrefix(slashPath, "/")
+	if !omitHost {
+		slashPath = "/" + slashPath
+	}
+	u := url.URL{
+		Scheme:   "file",
+		OmitHost: omitHost,
+		Path:     slashPath,
+		RawQuery: rawQuery,
+	}
+	return u.String()
+}
+
+func resolveMainDBFilePath(db *sql.DB) string {
+	rows, err := db.Query(`PRAGMA database_list`)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var seq int
+		var name, file string
+		if err := rows.Scan(&seq, &name, &file); err == nil && name == "main" {
+			file = strings.TrimSpace(file)
+			if file == "" {
+				return ""
+			}
+			if abs, aErr := filepath.Abs(file); aErr == nil {
+				return abs
+			}
+			return file
+		}
+	}
+	return ""
 }
 
 func Open(dbPath string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
-		return nil, err
+	trimmed := strings.TrimSpace(dbPath)
+	if trimmed == "" {
+		return nil, fmt.Errorf("sqlite database path is empty")
 	}
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(15000)&_pragma=journal_mode(WAL)", dbPath)
+	var (
+		absPath string
+		dsn     string
+	)
+	switch {
+	case trimmed == ":memory:":
+		dsn = "file::memory:?_pragma=busy_timeout(15000)"
+	case strings.HasPrefix(trimmed, "file:"):
+		dsn = trimmed
+		if u, uErr := url.Parse(trimmed); uErr == nil {
+			modeMem := strings.EqualFold(u.Query().Get("mode"), "memory") || strings.HasPrefix(trimmed, "file::memory:")
+			if !modeMem && u.Path != "" && u.Path != ":memory:" {
+				if p, aErr := filepath.Abs(filepath.FromSlash(u.Path)); aErr == nil {
+					absPath = p
+					_ = os.MkdirAll(filepath.Dir(absPath), 0o755)
+				}
+			}
+		}
+	default:
+		p, err := filepath.Abs(trimmed)
+		if err != nil {
+			return nil, err
+		}
+		absPath = p
+		if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+			return nil, err
+		}
+		dsn = sqliteFileURI(absPath, "_pragma=busy_timeout(15000)&_pragma=journal_mode(WAL)")
+	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, dbPath: absPath}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+	if mainFile := resolveMainDBFilePath(db); mainFile != "" {
+		s.dbPath = mainFile
+	} else {
+		s.dbPath = ""
+	}
 	return s, nil
+}
+
+func (s *Store) DBPath() string {
+	return s.dbPath
 }
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// BackupTo creates an online, self-contained SQLite snapshot at destPath using VACUUM INTO.
+func (s *Store) BackupTo(destPath string) error {
+	return s.BackupToContext(context.Background(), destPath)
+}
+
+// BackupToContext creates an online, self-contained SQLite snapshot at destPath using VACUUM INTO,
+// honoring ctx cancellation and preventing live-DB self-overwrite or fixed-.tmp races.
+func (s *Store) BackupToContext(ctx context.Context, destPath string) error {
+	destPath = strings.TrimSpace(destPath)
+	if destPath == "" {
+		return fmt.Errorf("backup destination path is empty")
+	}
+	absDest, err := filepath.Abs(destPath)
+	if err != nil {
+		return err
+	}
+	if s.dbPath != "" {
+		if filepath.Clean(absDest) == filepath.Clean(s.dbPath) {
+			return fmt.Errorf("backup destination %s cannot be the active SQLite database", absDest)
+		}
+		if srcInfo, err1 := os.Stat(s.dbPath); err1 == nil {
+			if dstInfo, err2 := os.Stat(absDest); err2 == nil && os.SameFile(srcInfo, dstInfo) {
+				return fmt.Errorf("backup destination %s refers to the active SQLite database", absDest)
+			}
+		}
+	}
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+
+	if err := os.MkdirAll(filepath.Dir(absDest), 0o755); err != nil {
+		return err
+	}
+	tmpFile, err := os.CreateTemp(filepath.Dir(absDest), ".triage-backup-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	_ = tmpFile.Close()
+	_ = os.Remove(tmpPath)
+
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	escaped := strings.ReplaceAll(tmpPath, "'", "''")
+	var vacErr error
+	if s.dbPath != "" {
+		vacDB, openErr := sql.Open("sqlite", sqliteFileURI(s.dbPath, "_pragma=busy_timeout(15000)&_pragma=journal_mode(WAL)"))
+		if openErr != nil {
+			return openErr
+		}
+		vacDB.SetMaxOpenConns(1)
+		_, vacErr = vacDB.ExecContext(ctx, fmt.Sprintf("VACUUM INTO '%s'", escaped))
+		_ = vacDB.Close()
+	} else {
+		s.mu.Lock()
+		_, vacErr = s.db.ExecContext(ctx, fmt.Sprintf("VACUUM INTO '%s'", escaped))
+		s.mu.Unlock()
+	}
+	if vacErr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("sqlite vacuum into %s: %w", absDest, vacErr)
+	}
+	_ = os.Chmod(tmpPath, 0o600)
+	if err := os.Rename(tmpPath, absDest); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	_ = os.Remove(absDest + "-wal")
+	_ = os.Remove(absDest + "-shm")
+	return nil
 }
 
 func ensureColumn(db *sql.DB, table, col, colDef string) error {
@@ -172,6 +329,7 @@ CREATE TABLE IF NOT EXISTS pending_candidates (
   number INTEGER NOT NULL,
   payload_json TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (repo, number)
 );
 
@@ -212,6 +370,7 @@ CREATE TABLE IF NOT EXISTS issue_triage_state (
   baseline_is_customer INTEGER NOT NULL DEFAULT 0,
   baseline_open_prs_json TEXT NOT NULL DEFAULT '[]',
   baseline_merged_prs_json TEXT NOT NULL DEFAULT '[]',
+  unverified_open_prs_json TEXT NOT NULL DEFAULT '[]',
   comment_watermark_utc TEXT NOT NULL DEFAULT '',
   recent_comments_json TEXT NOT NULL DEFAULT '[]',
   auto_baseline_json TEXT NOT NULL DEFAULT '',
@@ -252,7 +411,9 @@ CREATE TABLE IF NOT EXISTS sync_runs (
 		{"issues", "auto_force_keep", "INTEGER NOT NULL DEFAULT 0"},
 		{"issue_overrides", "has_force_keep_override", "INTEGER NOT NULL DEFAULT 0"},
 		{"issue_pr_links", "source", "TEXT NOT NULL DEFAULT 'timeline'"},
+		{"pending_candidates", "revision", "INTEGER NOT NULL DEFAULT 1"},
 		{"issue_triage_state", "auto_baseline_json", "TEXT NOT NULL DEFAULT ''"},
+		{"issue_triage_state", "unverified_open_prs_json", "TEXT NOT NULL DEFAULT '[]'"},
 		{"excluded_issues", "title", "TEXT NOT NULL DEFAULT ''"},
 		{"excluded_issues", "excluded_labels_json", "TEXT NOT NULL DEFAULT '[]'"},
 		{"excluded_issues", "source", "TEXT NOT NULL DEFAULT 'triage'"},
@@ -319,6 +480,16 @@ WHERE source != 'manual'
 		return err
 	}
 
+	// Normalize any legacy second-precision excluded_at timestamps (YYYY-MM-DDTHH:MM:SSZ)
+	// to fixed 9-digit nanosecond UTC so SQLite lexicographical ORDER BY matches chronological order.
+	if _, err := s.db.Exec(`
+UPDATE excluded_issues
+SET excluded_at = substr(excluded_at, 1, 19) || '.000000000Z'
+WHERE length(excluded_at) = 20 AND substr(excluded_at, 20, 1) = 'Z'
+`); err != nil {
+		return err
+	}
+
 	return s.backfillTriageBaselines(s.db)
 }
 
@@ -330,7 +501,56 @@ type savedTriageBaseline struct {
 	BaselineIsCustomer    int    `json:"baseline_is_customer"`
 	BaselineOpenPRsJSON   string `json:"baseline_open_prs_json"`
 	BaselineMergedPRsJSON string `json:"baseline_merged_prs_json"`
+	UnverifiedOpenPRsJSON string `json:"unverified_open_prs_json,omitempty"`
 	CommentWatermarkUTC   string `json:"comment_watermark_utc"`
+}
+
+func computeUnverifiedOpenPRKeys(q sqlExecQuerier, prs []model.LinkedPRRef, markAllUncached bool) []string {
+	if len(prs) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, p := range prs {
+		if p.Repo == "" || p.Num <= 0 || p.IsCherryPick {
+			continue
+		}
+		if p.State != "OPEN" && p.State != "DRAFT" {
+			continue
+		}
+		if !markAllUncached && strings.TrimSpace(p.UpdatedAt) != "" {
+			continue
+		}
+		key := model.PRKey(p.Repo, p.Num)
+		if seen[key] {
+			continue
+		}
+		var cnt int
+		if err := q.QueryRow(`SELECT COUNT(*) FROM pull_requests WHERE repo = ? AND number = ?`, p.Repo, p.Num).Scan(&cnt); err == nil && cnt > 0 {
+			continue
+		}
+		seen[key] = true
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return nonNilSlice(out)
+}
+
+func isIncomingPRSnapshotStale(curState, curUpdAt, nextState, nextUpdAt string) bool {
+	curUpdAt = strings.TrimSpace(curUpdAt)
+	nextUpdAt = strings.TrimSpace(nextUpdAt)
+	if curUpdAt == "" || nextUpdAt == "" {
+		return false
+	}
+	cmp := model.CompareRFC3339(nextUpdAt, curUpdAt)
+	if cmp < 0 {
+		return true
+	}
+	// GitHub PR updatedAt has 1-second resolution; MERGED is terminal on GitHub and cannot regress.
+	if cmp == 0 && curState == "MERGED" && nextState != "MERGED" {
+		return true
+	}
+	return false
 }
 
 func (s *Store) backfillTriageBaselines(q sqlExecQuerier) error {
@@ -407,8 +627,10 @@ WHERE issue_repo = ?`, DefaultRepo)
 
 	for _, m := range missing {
 		openKeys, mergedKeys := triage.ExtractMainlinePRKeySets(linksByIssue[m.number])
+		unverifiedKeys := computeUnverifiedOpenPRKeys(q, linksByIssue[m.number], false)
 		openJSON, _ := json.Marshal(nonNilSlice(openKeys))
 		mergedJSON, _ := json.Marshal(nonNilSlice(mergedKeys))
+		unverifiedJSON, _ := json.Marshal(unverifiedKeys)
 		triagedAt := m.triagedAt
 		if triagedAt == "" {
 			triagedAt = snapUTC
@@ -425,20 +647,21 @@ WHERE issue_repo = ?`, DefaultRepo)
 			BaselineIsCustomer:    m.isCustomer,
 			BaselineOpenPRsJSON:   string(openJSON),
 			BaselineMergedPRsJSON: string(mergedJSON),
+			UnverifiedOpenPRsJSON: string(unverifiedJSON),
 			CommentWatermarkUTC:   watermark,
 		})
 		if _, err := q.Exec(`
 INSERT INTO issue_triage_state(
   repo, number, triaged_at, triaged_by,
   baseline_labels_json, baseline_gh_severity, baseline_is_customer,
-  baseline_open_prs_json, baseline_merged_prs_json,
+  baseline_open_prs_json, baseline_merged_prs_json, unverified_open_prs_json,
   comment_watermark_utc, recent_comments_json, auto_baseline_json,
   needs_retriage, retriage_reasons_json, retriage_details_json
-) VALUES (?, ?, ?, 'seed', ?, ?, ?, ?, ?, ?, '[]', ?, 0, '[]', '[]')
+) VALUES (?, ?, ?, 'seed', ?, ?, ?, ?, ?, ?, ?, '[]', ?, 0, '[]', '[]')
 ON CONFLICT(repo, number) DO NOTHING`,
 			DefaultRepo, m.number, triagedAt,
 			m.labelsJSON, m.ghSeverity, m.isCustomer,
-			string(openJSON), string(mergedJSON), watermark, string(baseSnap),
+			string(openJSON), string(mergedJSON), string(unverifiedJSON), watermark, string(baseSnap),
 		); err != nil {
 			return err
 		}
@@ -460,17 +683,42 @@ func (s *Store) IssueCount() (int, error) {
 }
 
 func (s *Store) BootstrapIfEmpty(dataJSONPath string) (bool, error) {
+	return s.BootstrapIfEmptyWithFallback(dataJSONPath, nil)
+}
+
+func (s *Store) BootstrapIfEmptyWithFallback(dataJSONPath string, fallbackJSON []byte) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	var cnt int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM issues`).Scan(&cnt); err != nil {
+	if err := s.db.QueryRow(`
+SELECT
+  (SELECT COUNT(*) FROM issues) +
+  (SELECT COUNT(*) FROM pending_candidates) +
+  (SELECT COUNT(*) FROM excluded_issues) +
+  (SELECT COUNT(*) FROM archived_issues) +
+  (SELECT COUNT(*) FROM pull_requests) +
+  (SELECT COUNT(*) FROM pr_annotations) +
+  (SELECT COUNT(*) FROM sync_runs) +
+  (SELECT COUNT(*) FROM kv_meta)`).Scan(&cnt); err != nil {
 		return false, err
 	}
 	if cnt > 0 {
 		return false, nil
 	}
-	raw, err := os.ReadFile(dataJSONPath)
+	var raw []byte
+	var err error
+	if strings.TrimSpace(dataJSONPath) != "" {
+		raw, err = os.ReadFile(dataJSONPath)
+		if err != nil && os.IsNotExist(err) && len(fallbackJSON) > 0 {
+			raw = fallbackJSON
+			err = nil
+		}
+	} else if len(fallbackJSON) > 0 {
+		raw = fallbackJSON
+	} else {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
@@ -633,11 +881,12 @@ ON CONFLICT(issue_repo, issue_num, pr_repo, pr_num) DO UPDATE SET
 		}
 	}
 
+	nowNanoISO := model.NowRFC3339Nano()
 	for _, exNum := range ds.SyncMeta.ExcludedIssueNums {
 		if _, err := tx.Exec(`
 INSERT INTO excluded_issues(repo, number, reason, source, excluded_at)
 VALUES (?, ?, 'Excluded from optimizer candidate scope', 'seed_removed', ?)
-ON CONFLICT(repo, number) DO NOTHING`, DefaultRepo, exNum, nowISO); err != nil {
+ON CONFLICT(repo, number) DO NOTHING`, DefaultRepo, exNum, nowNanoISO); err != nil {
 			return err
 		}
 	}
@@ -645,6 +894,23 @@ ON CONFLICT(repo, number) DO NOTHING`, DefaultRepo, exNum, nowISO); err != nil {
 		_, _ = tx.Exec(`DELETE FROM excluded_issues WHERE repo = ? AND number = ?`, DefaultRepo, r.Number)
 	}
 
+	nextPendSet := make(map[int]bool, len(pending))
+	for _, pc := range pending {
+		nextPendSet[pc.Number] = true
+	}
+	var removedFromPend []int
+	if oldPRows, qErr := tx.Query(`SELECT number FROM pending_candidates WHERE repo = ?`, DefaultRepo); qErr == nil {
+		for oldPRows.Next() {
+			var n int
+			if oldPRows.Scan(&n) == nil && !nextPendSet[n] {
+				removedFromPend = append(removedFromPend, n)
+			}
+		}
+		_ = oldPRows.Close()
+	}
+	if len(removedFromPend) > 0 {
+		_ = addRemovedPendingNumsInTx(tx, removedFromPend...)
+	}
 	if _, err := tx.Exec(`DELETE FROM pending_candidates WHERE repo = ?`, DefaultRepo); err != nil {
 		return err
 	}
@@ -808,6 +1074,149 @@ WHERE state IN ('OPEN', 'DRAFT')`)
 	return out, nil
 }
 
+type verifiedPRStateLite struct {
+	state string
+	isCP  bool
+}
+
+func reconcileUnverifiedPRsInTx(tx *sql.Tx, issueNums []int, verified map[string]verifiedPRStateLite) error {
+	if len(issueNums) == 0 || len(verified) == 0 {
+		return nil
+	}
+	reconcileSet := func(openJSON, mergedJSON, unverifiedJSON string) (string, string, string, bool) {
+		var unverified []string
+		_ = json.Unmarshal([]byte(unverifiedJSON), &unverified)
+		if len(unverified) == 0 {
+			return openJSON, mergedJSON, unverifiedJSON, false
+		}
+		var openList, mergedList []string
+		_ = json.Unmarshal([]byte(openJSON), &openList)
+		_ = json.Unmarshal([]byte(mergedJSON), &mergedList)
+		openSet := make(map[string]bool, len(openList))
+		for _, k := range openList {
+			if k != "" {
+				openSet[k] = true
+			}
+		}
+		mergedSet := make(map[string]bool, len(mergedList))
+		for _, k := range mergedList {
+			if k != "" {
+				mergedSet[k] = true
+			}
+		}
+
+		var remUnverified []string
+		changed := false
+		for _, k := range unverified {
+			if k == "" {
+				continue
+			}
+			vp, ok := verified[k]
+			if !ok {
+				remUnverified = append(remUnverified, k)
+				continue
+			}
+			changed = true
+			if openSet[k] {
+				switch {
+				case vp.isCP:
+					delete(openSet, k)
+				case vp.state == "MERGED":
+					delete(openSet, k)
+					mergedSet[k] = true
+				case vp.state == "CLOSED":
+					delete(openSet, k)
+				}
+			}
+		}
+		if !changed {
+			return openJSON, mergedJSON, unverifiedJSON, false
+		}
+		nextOpen := make([]string, 0, len(openSet))
+		for k := range openSet {
+			nextOpen = append(nextOpen, k)
+		}
+		sort.Strings(nextOpen)
+		nextMerged := make([]string, 0, len(mergedSet))
+		for k := range mergedSet {
+			nextMerged = append(nextMerged, k)
+		}
+		sort.Strings(nextMerged)
+		sort.Strings(remUnverified)
+		ob, _ := json.Marshal(nonNilSlice(nextOpen))
+		mb, _ := json.Marshal(nonNilSlice(nextMerged))
+		ub, _ := json.Marshal(nonNilSlice(remUnverified))
+		return string(ob), string(mb), string(ub), true
+	}
+
+	for _, num := range issueNums {
+		var openJSON, mergedJSON, unverifiedJSON, autoBase string
+		err := tx.QueryRow(`
+SELECT baseline_open_prs_json, baseline_merged_prs_json, unverified_open_prs_json, auto_baseline_json
+FROM issue_triage_state
+WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&openJSON, &mergedJSON, &unverifiedJSON, &autoBase)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		nextOpen, nextMerged, nextUnverified, mainChanged := reconcileSet(openJSON, mergedJSON, unverifiedJSON)
+		autoChanged := false
+		if autoBase != "" {
+			var saved savedTriageBaseline
+			if json.Unmarshal([]byte(autoBase), &saved) == nil {
+				ao, am, au, ac := reconcileSet(saved.BaselineOpenPRsJSON, saved.BaselineMergedPRsJSON, saved.UnverifiedOpenPRsJSON)
+				if ac {
+					saved.BaselineOpenPRsJSON = ao
+					saved.BaselineMergedPRsJSON = am
+					saved.UnverifiedOpenPRsJSON = au
+					if b, mErr := json.Marshal(saved); mErr == nil {
+						autoBase = string(b)
+						autoChanged = true
+					}
+				}
+			}
+		}
+		if !mainChanged && !autoChanged {
+			continue
+		}
+		if _, err := tx.Exec(`
+UPDATE issue_triage_state
+SET baseline_open_prs_json = ?, baseline_merged_prs_json = ?, unverified_open_prs_json = ?, auto_baseline_json = ?
+WHERE repo = ? AND number = ?`,
+			nextOpen, nextMerged, nextUnverified, autoBase, DefaultRepo, num); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func mergeTrackSources(existing, incoming []string) ([]string, bool) {
+	seen := make(map[string]bool, len(existing)+len(incoming))
+	for _, s := range existing {
+		if s != "" {
+			seen[s] = true
+		}
+	}
+	added := false
+	for _, s := range incoming {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			added = true
+		}
+	}
+	if !added {
+		return existing, false
+	}
+	out := make([]string, 0, len(seen))
+	for s := range seen {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out, true
+}
+
 func (s *Store) UpsertPRStatuses(statuses []model.PRStatus, syncTime time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -829,36 +1238,97 @@ ON CONFLICT(repo, number) DO UPDATE SET
 	}
 	defer stmtPR.Close()
 
-	stmtLink, err := tx.Prepare(`
+	stmtLinkOne, err := tx.Prepare(`
 UPDATE issue_pr_links
-SET state = ?, title = ?, is_cherry_pick = ?, updated_at = ?
-WHERE pr_repo = ? AND pr_num = ?`)
+SET state = ?, title = ?, is_cherry_pick = ?, updated_at = CASE WHEN ? != '' THEN ? ELSE updated_at END
+WHERE issue_repo = ? AND issue_num = ? AND pr_repo = ? AND pr_num = ?`)
 	if err != nil {
 		return err
 	}
-	defer stmtLink.Close()
+	defer stmtLinkOne.Close()
 
 	affectedIssues := make(map[int]bool)
+	verifiedMap := make(map[string]verifiedPRStateLite, len(statuses))
+
 	for _, st := range statuses {
-		b, err := json.Marshal(st)
+		effSt := st
+		var curState, curUpdAt, curRaw string
+		var curIsCP int
+		rowErr := tx.QueryRow(`SELECT state, is_cherry_pick, updated_at, status_json FROM pull_requests WHERE repo = ? AND number = ?`,
+			st.Repo, st.Num).Scan(&curState, &curIsCP, &curUpdAt, &curRaw)
+		if rowErr != nil && rowErr != sql.ErrNoRows {
+			return rowErr
+		}
+		if rowErr == nil {
+			var curObj model.PRStatus
+			_ = json.Unmarshal([]byte(curRaw), &curObj)
+			if isIncomingPRSnapshotStale(curState, curUpdAt, st.State, st.UpdatedAt) {
+				// Incoming snapshot is older than the already-committed row: preserve fresher state,
+				// only merging any newly discovered TrackSources if present.
+				if mergedSrcs, changed := mergeTrackSources(curObj.TrackSources, st.TrackSources); changed {
+					curObj.TrackSources = mergedSrcs
+					if mb, mErr := json.Marshal(curObj); mErr == nil {
+						if _, uErr := tx.Exec(`UPDATE pull_requests SET status_json = ? WHERE repo = ? AND number = ?`,
+							string(mb), st.Repo, st.Num); uErr != nil {
+							return uErr
+						}
+					}
+				}
+				verifiedMap[model.PRKey(st.Repo, st.Num)] = verifiedPRStateLite{state: curState, isCP: curIsCP != 0}
+				continue
+			}
+			if mergedSrcs, changed := mergeTrackSources(curObj.TrackSources, st.TrackSources); changed {
+				effSt.TrackSources = mergedSrcs
+			} else if len(effSt.TrackSources) == 0 && len(curObj.TrackSources) > 0 {
+				effSt.TrackSources = curObj.TrackSources
+			}
+		}
+
+		b, err := json.Marshal(effSt)
 		if err != nil {
 			return err
 		}
-		if _, err := stmtPR.Exec(st.Repo, st.Num, st.State, boolToInt(st.IsCherryPick), st.UpdatedAt, string(b)); err != nil {
+		if _, err := stmtPR.Exec(effSt.Repo, effSt.Num, effSt.State, boolToInt(effSt.IsCherryPick), effSt.UpdatedAt, string(b)); err != nil {
 			return err
 		}
-		if _, err := stmtLink.Exec(st.State, st.Title, boolToInt(st.IsCherryPick), st.UpdatedAt, st.Repo, st.Num); err != nil {
+		verifiedMap[model.PRKey(effSt.Repo, effSt.Num)] = verifiedPRStateLite{state: effSt.State, isCP: effSt.IsCherryPick}
+
+		type linkRow struct {
+			issueNum int
+			state    string
+			updAt    string
+		}
+		var links []linkRow
+		lRows, err := tx.Query(`SELECT issue_num, state, updated_at FROM issue_pr_links WHERE issue_repo = ? AND pr_repo = ? AND pr_num = ?`,
+			DefaultRepo, effSt.Repo, effSt.Num)
+		if err != nil {
 			return err
 		}
-		lRows, err := tx.Query(`SELECT issue_num FROM issue_pr_links WHERE issue_repo = ? AND pr_repo = ? AND pr_num = ?`, DefaultRepo, st.Repo, st.Num)
-		if err == nil {
-			for lRows.Next() {
-				var issNum int
-				if lRows.Scan(&issNum) == nil {
-					affectedIssues[issNum] = true
-				}
+		for lRows.Next() {
+			var lr linkRow
+			if sErr := lRows.Scan(&lr.issueNum, &lr.state, &lr.updAt); sErr != nil {
+				_ = lRows.Close()
+				return sErr
 			}
+			links = append(links, lr)
+		}
+		if rErr := lRows.Err(); rErr != nil {
 			_ = lRows.Close()
+			return rErr
+		}
+		_ = lRows.Close()
+
+		for _, lr := range links {
+			affectedIssues[lr.issueNum] = true
+			if isIncomingPRSnapshotStale(lr.state, lr.updAt, effSt.State, effSt.UpdatedAt) {
+				continue
+			}
+			if _, err := stmtLinkOne.Exec(
+				effSt.State, effSt.Title, boolToInt(effSt.IsCherryPick), effSt.UpdatedAt, effSt.UpdatedAt,
+				DefaultRepo, lr.issueNum, effSt.Repo, effSt.Num,
+			); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -866,6 +1336,10 @@ WHERE pr_repo = ? AND pr_num = ?`)
 		nums := make([]int, 0, len(affectedIssues))
 		for n := range affectedIssues {
 			nums = append(nums, n)
+		}
+		sort.Ints(nums)
+		if err := reconcileUnverifiedPRsInTx(tx, nums, verifiedMap); err != nil {
+			return err
 		}
 		if err := s.reevaluateIssueRetriageInTx(tx, nums); err != nil {
 			return err
@@ -894,14 +1368,14 @@ SELECT
   auto_baseline_json,
   triaged_at, triaged_by,
   baseline_labels_json, baseline_gh_severity, baseline_is_customer,
-  baseline_open_prs_json, baseline_merged_prs_json,
+  baseline_open_prs_json, baseline_merged_prs_json, unverified_open_prs_json,
   comment_watermark_utc
 FROM issue_triage_state
 WHERE repo = ? AND number = ?`, DefaultRepo, number).Scan(
 		&autoBase,
 		&cur.TriagedAt, &cur.TriagedBy,
 		&cur.BaselineLabelsJSON, &cur.BaselineGHSeverity, &cur.BaselineIsCustomer,
-		&cur.BaselineOpenPRsJSON, &cur.BaselineMergedPRsJSON,
+		&cur.BaselineOpenPRsJSON, &cur.BaselineMergedPRsJSON, &cur.UnverifiedOpenPRsJSON,
 		&cur.CommentWatermarkUTC,
 	)
 	if err == sql.ErrNoRows {
@@ -923,6 +1397,13 @@ WHERE repo = ? AND number = ?`, DefaultRepo, number).Scan(
 }
 
 func (s *Store) applyIssueOverrideInTx(tx *sql.Tx, number int, req model.TriagePatchRequest, nowISO string) error {
+	if rawIf := strings.TrimSpace(req.IfUnmodifiedSince); rawIf != "" {
+		norm, ok := model.NormalizeRFC3339NanoFixed(rawIf)
+		if !ok {
+			return fmt.Errorf("invalid `if_unmodified_since` timestamp %q (expected RFC3339 UTC)", req.IfUnmodifiedSince)
+		}
+		req.IfUnmodifiedSince = norm
+	}
 	req.Severity = model.NormalizeSeverityForCategory(req.Cat, req.Severity, "MODERATE")
 	if err := model.ValidateTriageFields(req.Cat, req.Severity, req.Subsystem); err != nil {
 		return err
@@ -939,7 +1420,12 @@ func (s *Store) applyIssueOverrideInTx(tx *sql.Tx, number int, req model.TriageP
 		return err
 	}
 	if exists == 0 {
-		return fmt.Errorf("issue #%d not found", number)
+		return fmt.Errorf("issue #%d not found: %w", number, ErrIssueNotFound)
+	}
+	if req.IfUnmodifiedSince != "" {
+		if conflict, msg := checkOverrideConflict(tx, number, req, ""); conflict {
+			return fmt.Errorf("%w: %s", ErrOverrideConflict, msg)
+		}
 	}
 
 	if err := s.preserveAutoBaselineBeforeOverrideInTx(tx, number); err != nil {
@@ -996,21 +1482,34 @@ ON CONFLICT(repo, number) DO UPDATE SET
 	return s.snapshotBaselineInTx(tx, number, "override", nowISO)
 }
 
+func (s *Store) ApplyIssueOverride(number int, req model.TriagePatchRequest) ([]prstatus.PRTarget, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.applyIssueOverrideLocked(number, req)
+}
+
+func (s *Store) applyIssueOverrideLocked(number int, req model.TriagePatchRequest) ([]prstatus.PRTarget, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	nowISO := model.NowRFC3339Nano()
+	if err := s.applyIssueOverrideInTx(tx, number, req, nowISO); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.listMissingOpenPRTargetsLocked()
+}
+
 func (s *Store) SaveIssueOverride(number int, req model.TriagePatchRequest) (model.IssueRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		return model.IssueRecord{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	nowISO := time.Now().UTC().Format("2006-01-02T15:04:05Z")
-	if err := s.applyIssueOverrideInTx(tx, number, req, nowISO); err != nil {
-		return model.IssueRecord{}, err
-	}
-	if err := tx.Commit(); err != nil {
+	if _, err := s.applyIssueOverrideLocked(number, req); err != nil {
 		return model.IssueRecord{}, err
 	}
 
@@ -1023,36 +1522,45 @@ func (s *Store) SaveIssueOverride(number int, req model.TriagePatchRequest) (mod
 			return r, nil
 		}
 	}
-	return model.IssueRecord{}, fmt.Errorf("issue #%d missing after update", number)
+	return model.IssueRecord{}, fmt.Errorf("issue #%d missing after update: %w", number, ErrIssueNotFound)
 }
 
-func (s *Store) DeleteIssueOverride(number int) (model.IssueRecord, error) {
+func (s *Store) ResetIssueOverride(number int) ([]prstatus.PRTarget, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.resetIssueOverrideLocked(number)
+}
 
+func (s *Store) resetIssueOverrideLocked(number int) ([]prstatus.PRTarget, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return model.IssueRecord{}, err
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	var exists int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM issues WHERE repo = ? AND number = ?`, DefaultRepo, number).Scan(&exists); err != nil {
-		return model.IssueRecord{}, err
+		return nil, err
 	}
 	if exists == 0 {
-		return model.IssueRecord{}, fmt.Errorf("issue #%d not found", number)
+		return nil, fmt.Errorf("issue #%d not found: %w", number, ErrIssueNotFound)
 	}
 
 	if _, err := tx.Exec(`DELETE FROM issue_overrides WHERE repo = ? AND number = ?`, DefaultRepo, number); err != nil {
-		return model.IssueRecord{}, err
+		return nil, err
 	}
 
+	nowISO := model.NowRFC3339Nano()
+	restoredBaseline := false
 	var autoBase string
 	if err := tx.QueryRow(`SELECT auto_baseline_json FROM issue_triage_state WHERE repo = ? AND number = ?`,
 		DefaultRepo, number).Scan(&autoBase); err == nil && autoBase != "" {
 		var saved savedTriageBaseline
 		if json.Unmarshal([]byte(autoBase), &saved) == nil && saved.BaselineLabelsJSON != "" {
+			unver := saved.UnverifiedOpenPRsJSON
+			if strings.TrimSpace(unver) == "" {
+				unver = "[]"
+			}
 			if _, err := tx.Exec(`
 UPDATE issue_triage_state
 SET
@@ -1063,23 +1571,38 @@ SET
   baseline_is_customer = ?,
   baseline_open_prs_json = ?,
   baseline_merged_prs_json = ?,
+  unverified_open_prs_json = ?,
   comment_watermark_utc = ?
 WHERE repo = ? AND number = ?`,
-				saved.TriagedAt, saved.TriagedBy,
+				nowISO, saved.TriagedBy,
 				saved.BaselineLabelsJSON, saved.BaselineGHSeverity, saved.BaselineIsCustomer,
-				saved.BaselineOpenPRsJSON, saved.BaselineMergedPRsJSON,
+				saved.BaselineOpenPRsJSON, saved.BaselineMergedPRsJSON, unver,
 				saved.CommentWatermarkUTC,
 				DefaultRepo, number,
 			); err != nil {
-				return model.IssueRecord{}, err
+				return nil, err
 			}
+			restoredBaseline = true
 		}
+	}
+	if !restoredBaseline {
+		_, _ = tx.Exec(`UPDATE issue_triage_state SET triaged_at = ? WHERE repo = ? AND number = ?`, nowISO, DefaultRepo, number)
 	}
 
 	if err := s.reevaluateIssueRetriageInTx(tx, []int{number}); err != nil {
-		return model.IssueRecord{}, err
+		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.listMissingOpenPRTargetsLocked()
+}
+
+func (s *Store) DeleteIssueOverride(number int) (model.IssueRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, err := s.resetIssueOverrideLocked(number); err != nil {
 		return model.IssueRecord{}, err
 	}
 
@@ -1092,14 +1615,61 @@ WHERE repo = ? AND number = ?`,
 			return r, nil
 		}
 	}
-	return model.IssueRecord{}, fmt.Errorf("issue #%d not found", number)
+	return model.IssueRecord{}, fmt.Errorf("issue #%d not found: %w", number, ErrIssueNotFound)
+}
+
+func (s *Store) ListPendingCandidateNumbers() ([]int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query(`SELECT number FROM pending_candidates WHERE repo = ? ORDER BY number DESC`, DefaultRepo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]int, 0)
+	for rows.Next() {
+		var n int
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListRetriageNumbers() ([]int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query(`
+SELECT i.number
+FROM issues i
+JOIN issue_triage_state ts ON i.repo = ts.repo AND i.number = ts.number
+WHERE i.repo = ? AND ts.needs_retriage = 1
+ORDER BY i.number DESC`, DefaultRepo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]int, 0)
+	for rows.Next() {
+		var n int
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) ListPendingCandidates() ([]model.PendingCandidate, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rows, err := s.db.Query(`SELECT payload_json FROM pending_candidates WHERE repo = ? ORDER BY number DESC`, DefaultRepo)
+	rows, err := s.db.Query(`SELECT payload_json, revision FROM pending_candidates WHERE repo = ? ORDER BY number DESC`, DefaultRepo)
 	if err != nil {
 		return nil, err
 	}
@@ -1108,13 +1678,15 @@ func (s *Store) ListPendingCandidates() ([]model.PendingCandidate, error) {
 	out := make([]model.PendingCandidate, 0)
 	for rows.Next() {
 		var raw string
-		if err := rows.Scan(&raw); err != nil {
+		var rev int
+		if err := rows.Scan(&raw, &rev); err != nil {
 			return nil, err
 		}
 		var pc model.PendingCandidate
 		if err := json.Unmarshal([]byte(raw), &pc); err != nil {
 			return nil, err
 		}
+		pc.Revision = rev
 		out = append(out, pc)
 	}
 	return out, rows.Err()
@@ -1157,7 +1729,7 @@ func (s *Store) resolvePendingCandidateLocked(number int, req model.PendingResol
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	nowISO := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	nowISO := model.NowRFC3339Nano()
 	if err := s.resolvePendingCandidateInTx(tx, number, req, nowISO); err != nil {
 		return err
 	}
@@ -1165,10 +1737,15 @@ func (s *Store) resolvePendingCandidateLocked(number int, req model.PendingResol
 }
 
 func (s *Store) resolvePendingCandidateInTx(tx *sql.Tx, number int, req model.PendingResolveRequest, nowISO string) error {
+	if norm, ok := model.NormalizeRFC3339NanoFixed(nowISO); ok {
+		nowISO = norm
+	} else if strings.TrimSpace(nowISO) == "" {
+		nowISO = model.NowRFC3339Nano()
+	}
 	var raw string
 	err := tx.QueryRow(`SELECT payload_json FROM pending_candidates WHERE repo = ? AND number = ?`, DefaultRepo, number).Scan(&raw)
 	if err == sql.ErrNoRows {
-		return fmt.Errorf("pending candidate #%d not found", number)
+		return fmt.Errorf("pending candidate #%d not found: %w", number, ErrIssueNotFound)
 	}
 	if err != nil {
 		return err
@@ -1277,9 +1854,29 @@ ON CONFLICT(repo, number) DO UPDATE SET
 		return err
 	}
 
+	hydratedPRs := make([]model.LinkedPRRef, 0, len(pc.PRs))
 	for _, p := range pc.PRs {
+		hp := p
+		var cachedState, cachedUpdAt, cachedRaw string
+		var cachedIsCP int
+		if tx.QueryRow(`SELECT state, is_cherry_pick, updated_at, status_json FROM pull_requests WHERE repo = ? AND number = ?`,
+			p.Repo, p.Num).Scan(&cachedState, &cachedIsCP, &cachedUpdAt, &cachedRaw) == nil {
+			if !isIncomingPRSnapshotStale(hp.State, hp.UpdatedAt, cachedState, cachedUpdAt) {
+				hp.State = cachedState
+				hp.IsCherryPick = cachedIsCP != 0
+				if cachedUpdAt != "" {
+					hp.UpdatedAt = cachedUpdAt
+				}
+				var stObj model.PRStatus
+				if json.Unmarshal([]byte(cachedRaw), &stObj) == nil && stObj.Title != "" {
+					hp.Title = stObj.Title
+				}
+			}
+		}
+		hydratedPRs = append(hydratedPRs, hp)
+
 		src := model.LinkSourceTimeline
-		switch p.Source {
+		switch hp.Source {
 		case model.LinkSourceManual:
 			src = model.LinkSourceManual
 		case model.LinkSourcePRRef:
@@ -1298,7 +1895,7 @@ ON CONFLICT(issue_repo, issue_num, pr_repo, pr_num) DO UPDATE SET
     WHEN issue_pr_links.source = 'timeline' OR excluded.source = 'timeline' THEN 'timeline'
     ELSE excluded.source
   END`,
-			DefaultRepo, pc.Number, p.Repo, p.Num, p.Label, p.URL, p.State, p.Title, boolToInt(p.IsCherryPick), p.UpdatedAt, src,
+			DefaultRepo, pc.Number, hp.Repo, hp.Num, hp.Label, hp.URL, hp.State, hp.Title, boolToInt(hp.IsCherryPick), hp.UpdatedAt, src,
 		); err != nil {
 			return err
 		}
@@ -1314,9 +1911,11 @@ ON CONFLICT(issue_repo, issue_num, pr_repo, pr_num) DO UPDATE SET
 	_ = removeRecheckNumInTx(tx, pc.Number)
 
 	// Initialize baseline in issue_triage_state using GitHub timestamps (never wall-clock nowISO)
-	openKeys, mergedKeys := triage.ExtractMainlinePRKeySets(pc.PRs)
+	openKeys, mergedKeys := triage.ExtractMainlinePRKeySets(hydratedPRs)
+	unverifiedKeys := computeUnverifiedOpenPRKeys(tx, hydratedPRs, true)
 	openJSON, _ := json.Marshal(nonNilSlice(openKeys))
 	mergedJSON, _ := json.Marshal(nonNilSlice(mergedKeys))
+	unverifiedJSON, _ := json.Marshal(unverifiedKeys)
 	watermark := model.NormalizeRFC3339UTC(pc.UpdatedAt)
 	for _, c := range pc.RecentComments {
 		watermark = model.MaxRFC3339(watermark, c.CreatedAt)
@@ -1329,16 +1928,17 @@ ON CONFLICT(issue_repo, issue_num, pr_repo, pr_num) DO UPDATE SET
 		BaselineIsCustomer:    boolToInt(isCust),
 		BaselineOpenPRsJSON:   string(openJSON),
 		BaselineMergedPRsJSON: string(mergedJSON),
+		UnverifiedOpenPRsJSON: string(unverifiedJSON),
 		CommentWatermarkUTC:   watermark,
 	})
 	if _, err := tx.Exec(`
 INSERT INTO issue_triage_state(
   repo, number, triaged_at, triaged_by,
   baseline_labels_json, baseline_gh_severity, baseline_is_customer,
-  baseline_open_prs_json, baseline_merged_prs_json,
+  baseline_open_prs_json, baseline_merged_prs_json, unverified_open_prs_json,
   comment_watermark_utc, recent_comments_json, auto_baseline_json,
   needs_retriage, retriage_reasons_json, retriage_details_json
-) VALUES (?, ?, ?, 'triage', ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', '[]')
+) VALUES (?, ?, ?, 'triage', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', '[]')
 ON CONFLICT(repo, number) DO UPDATE SET
   triaged_at=excluded.triaged_at,
   triaged_by=excluded.triaged_by,
@@ -1347,6 +1947,7 @@ ON CONFLICT(repo, number) DO UPDATE SET
   baseline_is_customer=excluded.baseline_is_customer,
   baseline_open_prs_json=excluded.baseline_open_prs_json,
   baseline_merged_prs_json=excluded.baseline_merged_prs_json,
+  unverified_open_prs_json=excluded.unverified_open_prs_json,
   comment_watermark_utc=excluded.comment_watermark_utc,
   recent_comments_json=excluded.recent_comments_json,
   auto_baseline_json=excluded.auto_baseline_json,
@@ -1355,7 +1956,7 @@ ON CONFLICT(repo, number) DO UPDATE SET
   retriage_details_json='[]'`,
 		DefaultRepo, pc.Number, nowISO,
 		string(lbsJSON), ghSev, boolToInt(isCust),
-		string(openJSON), string(mergedJSON),
+		string(openJSON), string(mergedJSON), string(unverifiedJSON),
 		watermark, string(cmtsJSON), string(baseSnap),
 	); err != nil {
 		return err
@@ -1428,6 +2029,7 @@ func (s *Store) RecordSyncRun(kind string, started, finished time.Time, summary 
 	defer s.mu.Unlock()
 	_, _ = s.db.Exec(`INSERT INTO sync_runs(kind, started_at, finished_at, summary_json) VALUES (?, ?, ?, ?)`,
 		kind, started.UTC().Format(time.RFC3339), finished.UTC().Format(time.RFC3339), string(b))
+	_, _ = s.db.Exec(`DELETE FROM sync_runs WHERE id NOT IN (SELECT id FROM sync_runs ORDER BY id DESC LIMIT 200)`)
 }
 
 func (s *Store) RecentSyncRuns(limit int) ([]SyncRunRecord, error) {
@@ -1462,14 +2064,20 @@ func (s *Store) RecentSyncRuns(limit int) ([]SyncRunRecord, error) {
 }
 
 type BatchTriageResult struct {
-	AcceptedIssues     []int               `json:"accepted_issues"`
-	ExcludedIssues     []int               `json:"excluded_issues"`
-	OverriddenIssues   []int               `json:"overridden_issues"`
-	AcknowledgedIssues []int               `json:"acknowledged_issues,omitempty"`
-	ManualPRsLinked    int                 `json:"manual_prs_linked,omitempty"`
-	RemainingPending   int                 `json:"remaining_pending"`
-	RemainingRetriage  int                 `json:"remaining_retriage"`
-	MissingPRTargets   []prstatus.PRTarget `json:"-"`
+	AcceptedIssues     []int                  `json:"accepted_issues"`
+	ExcludedIssues     []int                  `json:"excluded_issues"`
+	OverriddenIssues   []int                  `json:"overridden_issues"`
+	AcknowledgedIssues []int                  `json:"acknowledged_issues,omitempty"`
+	ManualPRsLinked    int                    `json:"manual_prs_linked,omitempty"`
+	SkippedConflicts   []model.TriageConflict `json:"skipped_conflicts,omitempty"`
+	RemainingPending   int                    `json:"remaining_pending"`
+	RemainingRetriage  int                    `json:"remaining_retriage"`
+	MissingPRTargets   []prstatus.PRTarget    `json:"-"`
+	ManualLinkedIssues []int                  `json:"-"`
+}
+
+type BatchApplyOptions struct {
+	SkipConflicts bool
 }
 
 func sortedNumericKeys[V any](m map[string]V) ([]int, error) {
@@ -1490,113 +2098,353 @@ func sortedNumericKeys[V any](m map[string]V) ([]int, error) {
 	return nums, nil
 }
 
+func isIssueKnownNonPending(q sqlExecQuerier, num int) (inIssues, inExcluded, inArchived bool) {
+	var c int
+	if q.QueryRow(`SELECT COUNT(*) FROM issues WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&c) == nil && c > 0 {
+		inIssues = true
+	}
+	c = 0
+	if q.QueryRow(`SELECT COUNT(*) FROM excluded_issues WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&c) == nil && c > 0 {
+		inExcluded = true
+	}
+	c = 0
+	if q.QueryRow(`SELECT COUNT(*) FROM archived_issues WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&c) == nil && c > 0 {
+		inArchived = true
+	}
+	return
+}
+
+func queryIssueLastTriageMod(q sqlExecQuerier, num int) string {
+	var ovrUpdated, triagedAt string
+	_ = q.QueryRow(`SELECT COALESCE((SELECT updated_at FROM issue_overrides WHERE repo = ? AND number = ?), '')`, DefaultRepo, num).Scan(&ovrUpdated)
+	_ = q.QueryRow(`SELECT COALESCE((SELECT triaged_at FROM issue_triage_state WHERE repo = ? AND number = ?), '')`, DefaultRepo, num).Scan(&triagedAt)
+	return model.MaxRFC3339(ovrUpdated, triagedAt)
+}
+
+func checkOverrideConflict(q sqlExecQuerier, num int, patch model.TriagePatchRequest, baseExportedAt string) (bool, string) {
+	curMod := queryIssueLastTriageMod(q, num)
+	if patch.IfUnmodifiedSince != "" && curMod != "" && model.CompareRFC3339(curMod, patch.IfUnmodifiedSince) > 0 {
+		return true, fmt.Sprintf("issue #%d was modified at %s (expected unmodified since %s)", num, curMod, patch.IfUnmodifiedSince)
+	}
+	if patch.IfUnmodifiedSince == "" && baseExportedAt != "" && curMod != "" && model.CompareRFC3339(curMod, baseExportedAt) > 0 {
+		return true, fmt.Sprintf("issue #%d triage state was updated at %s after export %s", num, curMod, baseExportedAt)
+	}
+	return false, ""
+}
+
+func lookupByIssueNum[V any](m map[string]V, n int) (V, bool) {
+	for _, k := range []string{strconv.Itoa(n), "#" + strconv.Itoa(n)} {
+		if v, ok := m[k]; ok {
+			return v, true
+		}
+	}
+	var zero V
+	return zero, false
+}
+
+func planBatchDecisions(q sqlExecQuerier, dec model.BatchTriageDecisions, opts BatchApplyOptions) (model.BatchTriageDecisions, []model.TriageConflict, error) {
+	newNums, err := sortedNumericKeys(dec.NewIssues)
+	if err != nil {
+		return model.BatchTriageDecisions{}, nil, err
+	}
+	exNums, err := sortedNumericKeys(dec.ExcludeIssues)
+	if err != nil {
+		return model.BatchTriageDecisions{}, nil, err
+	}
+	ovrNums, err := sortedNumericKeys(dec.Overrides)
+	if err != nil {
+		return model.BatchTriageDecisions{}, nil, err
+	}
+	manNums, err := sortedNumericKeys(dec.ManualPRLinks)
+	if err != nil {
+		return model.BatchTriageDecisions{}, nil, err
+	}
+
+	planned := model.BatchTriageDecisions{
+		BaseExportedAt: dec.BaseExportedAt,
+		NewIssues:      make(map[string]model.TriagePatchRequest),
+		ExcludeIssues:  make(map[string]string),
+		Overrides:      make(map[string]model.TriagePatchRequest),
+		ManualPRLinks:  make(map[string][]string),
+	}
+
+	var conflicts []model.TriageConflict
+	declaredNewSet := make(map[int]bool, len(newNums))
+	acceptedSet := make(map[int]bool, len(newNums))
+	skippedIssueSet := make(map[int]bool)
+	removedPendingSet, _ := loadRemovedPendingNums(q)
+	conflictErr := func(msg string) error {
+		return fmt.Errorf("%w: %s", ErrBatchConflict, msg)
+	}
+
+	// 1. Plan new_issues
+	for _, num := range newNums {
+		declaredNewSet[num] = true
+		var cnt int
+		if err := q.QueryRow(`SELECT COUNT(*) FROM pending_candidates WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&cnt); err != nil {
+			return model.BatchTriageDecisions{}, nil, err
+		}
+		if cnt == 0 {
+			inIss, inEx, inArch := isIssueKnownNonPending(q, num)
+			wasRemoved := removedPendingSet[num]
+			if inIss || inEx || inArch || wasRemoved {
+				if opts.SkipConflicts {
+					skippedIssueSet[num] = true
+					conflicts = append(conflicts, model.TriageConflict{
+						Issue:   num,
+						Action:  "new_issues",
+						Kind:    "already_resolved",
+						Message: fmt.Sprintf("pending candidate #%d was already resolved or removed concurrently; skipped", num),
+					})
+					continue
+				}
+				return model.BatchTriageDecisions{}, nil, conflictErr(fmt.Sprintf("accept new issue #%d: pending candidate #%d was already resolved or removed concurrently", num, num))
+			}
+			return model.BatchTriageDecisions{}, nil, fmt.Errorf("accept new issue #%d: pending candidate #%d not found: %w", num, num, ErrIssueNotFound)
+		}
+		patch, _ := lookupByIssueNum(dec.NewIssues, num)
+		planned.NewIssues[strconv.Itoa(num)] = patch
+		acceptedSet[num] = true
+	}
+
+	// 2. Plan exclude_issues
+	for _, num := range exNums {
+		if declaredNewSet[num] {
+			return model.BatchTriageDecisions{}, nil, fmt.Errorf("issue #%d cannot appear in both new_issues and exclude_issues", num)
+		}
+		reason, _ := lookupByIssueNum(dec.ExcludeIssues, num)
+		var raw string
+		if err := q.QueryRow(`SELECT payload_json FROM pending_candidates WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&raw); err == nil {
+			var pc model.PendingCandidate
+			if json.Unmarshal([]byte(raw), &pc) == nil && isCanonicalLabelList(pc.Labels) {
+				return model.BatchTriageDecisions{}, nil, fmt.Errorf("%w: #%d must be accepted with a FILTER_* category", ErrCanonicalCannotExclude, num)
+			}
+			planned.ExcludeIssues[strconv.Itoa(num)] = reason
+			continue
+		}
+
+		inIss, inEx, inArch := isIssueKnownNonPending(q, num)
+		wasRemoved := removedPendingSet[num]
+		if !inIss {
+			if inEx {
+				if opts.SkipConflicts {
+					skippedIssueSet[num] = true
+					conflicts = append(conflicts, model.TriageConflict{
+						Issue:   num,
+						Action:  "exclude_issues",
+						Kind:    "already_resolved",
+						Message: fmt.Sprintf("issue #%d is already excluded; skipped", num),
+					})
+					continue
+				}
+				if dec.BaseExportedAt != "" {
+					var liveExAt string
+					_ = q.QueryRow(`SELECT excluded_at FROM excluded_issues WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&liveExAt)
+					if liveExAt != "" && model.CompareRFC3339(liveExAt, dec.BaseExportedAt) > 0 {
+						return model.BatchTriageDecisions{}, nil, conflictErr(fmt.Sprintf("exclude issue #%d: issue was already excluded at %s after export %s", num, liveExAt, dec.BaseExportedAt))
+					}
+				}
+				planned.ExcludeIssues[strconv.Itoa(num)] = reason
+				continue
+			}
+			if inArch || wasRemoved {
+				if opts.SkipConflicts {
+					skippedIssueSet[num] = true
+					conflicts = append(conflicts, model.TriageConflict{
+						Issue:   num,
+						Action:  "exclude_issues",
+						Kind:    "issue_not_active",
+						Message: fmt.Sprintf("issue #%d is no longer active (closed or removed from pending); skipped exclude", num),
+					})
+					continue
+				}
+				return model.BatchTriageDecisions{}, nil, conflictErr(fmt.Sprintf("exclude issue #%d: issue is already closed or removed", num))
+			}
+			return model.BatchTriageDecisions{}, nil, fmt.Errorf("exclude issue #%d: issue not found in database: %w", num, ErrIssueNotFound)
+		}
+
+		var isCan int
+		if err := q.QueryRow(`SELECT is_canonical FROM issues WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&isCan); err == nil && isCan != 0 {
+			return model.BatchTriageDecisions{}, nil, fmt.Errorf("%w: #%d (classify as FILTER_* instead)", ErrCanonicalCannotExclude, num)
+		}
+		if dec.BaseExportedAt != "" {
+			curMod := queryIssueLastTriageMod(q, num)
+			if curMod != "" && model.CompareRFC3339(curMod, dec.BaseExportedAt) > 0 {
+				msg := fmt.Sprintf("issue #%d was modified at %s after export %s", num, curMod, dec.BaseExportedAt)
+				if opts.SkipConflicts {
+					skippedIssueSet[num] = true
+					conflicts = append(conflicts, model.TriageConflict{
+						Issue:   num,
+						Action:  "exclude_issues",
+						Kind:    "concurrent_override",
+						Message: msg + "; skipped exclude",
+					})
+					continue
+				}
+				return model.BatchTriageDecisions{}, nil, conflictErr(fmt.Sprintf("exclude issue #%d: %s", num, msg))
+			}
+		}
+		planned.ExcludeIssues[strconv.Itoa(num)] = reason
+	}
+
+	// 3. Plan overrides (evaluated BEFORE manual_pr_links so conflict-skipped overrides also skip companion manual_pr_links)
+	plannedOverridesSet := make(map[int]bool, len(ovrNums))
+	for _, num := range ovrNums {
+		if declaredNewSet[num] {
+			return model.BatchTriageDecisions{}, nil, fmt.Errorf("issue #%d cannot appear in both new_issues and overrides", num)
+		}
+		inIss, inEx, inArch := isIssueKnownNonPending(q, num)
+		if !inIss {
+			if inEx || inArch {
+				if opts.SkipConflicts {
+					skippedIssueSet[num] = true
+					conflicts = append(conflicts, model.TriageConflict{
+						Issue:   num,
+						Action:  "overrides",
+						Kind:    "issue_not_active",
+						Message: fmt.Sprintf("issue #%d is no longer active (excluded or closed); skipped override", num),
+					})
+					continue
+				}
+				return model.BatchTriageDecisions{}, nil, conflictErr(fmt.Sprintf("override issue #%d: issue is no longer active (excluded or closed)", num))
+			}
+			return model.BatchTriageDecisions{}, nil, fmt.Errorf("override issue #%d: issue not found in database: %w", num, ErrIssueNotFound)
+		}
+		patch, _ := lookupByIssueNum(dec.Overrides, num)
+		if conflict, msg := checkOverrideConflict(q, num, patch, dec.BaseExportedAt); conflict {
+			if opts.SkipConflicts {
+				skippedIssueSet[num] = true
+				conflicts = append(conflicts, model.TriageConflict{
+					Issue:   num,
+					Action:  "overrides",
+					Kind:    "concurrent_override",
+					Message: msg + "; skipped override",
+				})
+				continue
+			}
+			return model.BatchTriageDecisions{}, nil, conflictErr(fmt.Sprintf("override issue #%d: %s", num, msg))
+		}
+		planned.Overrides[strconv.Itoa(num)] = patch
+		plannedOverridesSet[num] = true
+	}
+
+	// 4. Plan manual_pr_links
+	for _, num := range manNums {
+		if skippedIssueSet[num] {
+			conflicts = append(conflicts, model.TriageConflict{
+				Issue:   num,
+				Action:  "manual_pr_links",
+				Kind:    "companion_skipped",
+				Message: fmt.Sprintf("issue #%d primary triage action was skipped due to conflict; skipped manual_pr_links", num),
+			})
+			continue
+		}
+		if !acceptedSet[num] {
+			inIss, inEx, inArch := isIssueKnownNonPending(q, num)
+			if !inIss {
+				if inEx || inArch {
+					if opts.SkipConflicts {
+						conflicts = append(conflicts, model.TriageConflict{
+							Issue:   num,
+							Action:  "manual_pr_links",
+							Kind:    "issue_not_active",
+							Message: fmt.Sprintf("issue #%d is no longer active (excluded or closed); skipped manual_pr_links", num),
+						})
+						continue
+					}
+					return model.BatchTriageDecisions{}, nil, conflictErr(fmt.Sprintf("manual_pr_links issue #%d: issue is no longer active", num))
+				}
+				return model.BatchTriageDecisions{}, nil, fmt.Errorf("manual_pr_links issue #%d not found: %w", num, ErrIssueNotFound)
+			}
+		}
+		if specs, ok := lookupByIssueNum(dec.ManualPRLinks, num); ok && len(specs) > 0 {
+			planned.ManualPRLinks[strconv.Itoa(num)] = specs
+		}
+	}
+
+	// 5. Plan ack_retriage
+	seenAck := make(map[int]bool, len(dec.AckRetriage))
+	for _, num := range dec.AckRetriage {
+		if num <= 0 || seenAck[num] {
+			continue
+		}
+		seenAck[num] = true
+		if skippedIssueSet[num] {
+			conflicts = append(conflicts, model.TriageConflict{
+				Issue:   num,
+				Action:  "ack_retriage",
+				Kind:    "companion_skipped",
+				Message: fmt.Sprintf("issue #%d primary triage action was skipped due to conflict; skipped ack_retriage", num),
+			})
+			continue
+		}
+		if !acceptedSet[num] {
+			inIss, inEx, inArch := isIssueKnownNonPending(q, num)
+			if !inIss {
+				if inEx || inArch {
+					if opts.SkipConflicts {
+						conflicts = append(conflicts, model.TriageConflict{
+							Issue:   num,
+							Action:  "ack_retriage",
+							Kind:    "issue_not_active",
+							Message: fmt.Sprintf("issue #%d is no longer active (excluded or closed); skipped ack_retriage", num),
+						})
+						continue
+					}
+					return model.BatchTriageDecisions{}, nil, conflictErr(fmt.Sprintf("ack_retriage issue #%d: issue is no longer active", num))
+				}
+				return model.BatchTriageDecisions{}, nil, fmt.Errorf("ack_retriage issue #%d not found: %w", num, ErrIssueNotFound)
+			}
+			if !plannedOverridesSet[num] && dec.BaseExportedAt != "" {
+				curMod := queryIssueLastTriageMod(q, num)
+				if curMod != "" && model.CompareRFC3339(curMod, dec.BaseExportedAt) > 0 {
+					msg := fmt.Sprintf("issue #%d triage state was updated at %s after export %s", num, curMod, dec.BaseExportedAt)
+					if opts.SkipConflicts {
+						conflicts = append(conflicts, model.TriageConflict{
+							Issue:   num,
+							Action:  "ack_retriage",
+							Kind:    "concurrent_override",
+							Message: msg + "; skipped ack_retriage",
+						})
+						continue
+					}
+					return model.BatchTriageDecisions{}, nil, conflictErr(fmt.Sprintf("ack_retriage issue #%d: %s", num, msg))
+				}
+			}
+		}
+		planned.AckRetriage = append(planned.AckRetriage, num)
+	}
+
+	return planned, conflicts, nil
+}
+
+// PlanBatchDecisionsWithOptions validates database invariants and filters out conflict-skipped
+// items (when opts.SkipConflicts is true) without mutating SQLite.
+func (s *Store) PlanBatchDecisionsWithOptions(dec model.BatchTriageDecisions, opts BatchApplyOptions) (model.BatchTriageDecisions, []model.TriageConflict, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return planBatchDecisions(s.db, dec, opts)
+}
+
 // ValidateBatchDecisionsReadOnly validates database-state invariants (pending existence,
 // canonical exclusion prohibition, target issue existence) without mutating the database.
 func (s *Store) ValidateBatchDecisionsReadOnly(dec model.BatchTriageDecisions) error {
-	newNums, err := sortedNumericKeys(dec.NewIssues)
-	if err != nil {
-		return err
-	}
-	exNums, err := sortedNumericKeys(dec.ExcludeIssues)
-	if err != nil {
-		return err
-	}
-	ovrNums, err := sortedNumericKeys(dec.Overrides)
-	if err != nil {
-		return err
-	}
-	manNums, err := sortedNumericKeys(dec.ManualPRLinks)
-	if err != nil {
-		return err
-	}
+	_, err := s.ValidateBatchDecisionsWithOptions(dec, BatchApplyOptions{SkipConflicts: false})
+	return err
+}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	newSet := make(map[int]bool, len(newNums))
-	for _, num := range newNums {
-		var cnt int
-		if err := s.db.QueryRow(`SELECT COUNT(*) FROM pending_candidates WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&cnt); err != nil {
-			return err
-		}
-		if cnt == 0 {
-			return fmt.Errorf("accept new issue #%d: pending candidate #%d not found", num, num)
-		}
-		newSet[num] = true
-	}
-
-	for _, num := range exNums {
-		if newSet[num] {
-			return fmt.Errorf("issue #%d cannot appear in both new_issues and exclude_issues", num)
-		}
-		var raw string
-		if err := s.db.QueryRow(`SELECT payload_json FROM pending_candidates WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&raw); err == nil {
-			var pc model.PendingCandidate
-			if json.Unmarshal([]byte(raw), &pc) == nil && isCanonicalLabelList(pc.Labels) {
-				return fmt.Errorf("%w: #%d must be accepted with a FILTER_* category", ErrCanonicalCannotExclude, num)
-			}
-			continue
-		}
-		var isCan int
-		if err := s.db.QueryRow(`SELECT is_canonical FROM issues WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&isCan); err == nil && isCan != 0 {
-			return fmt.Errorf("%w: #%d (classify as FILTER_* instead)", ErrCanonicalCannotExclude, num)
-		}
-	}
-
-	issueExists := func(num int) bool {
-		if newSet[num] {
-			return true
-		}
-		var cnt int
-		_ = s.db.QueryRow(`SELECT COUNT(*) FROM issues WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&cnt)
-		return cnt > 0
-	}
-
-	for _, num := range ovrNums {
-		if newSet[num] {
-			return fmt.Errorf("issue #%d cannot appear in both new_issues and overrides", num)
-		}
-		if !issueExists(num) {
-			return fmt.Errorf("override issue #%d: issue not found in database", num)
-		}
-	}
-	for _, num := range manNums {
-		if !issueExists(num) {
-			return fmt.Errorf("manual_pr_links issue #%d not found", num)
-		}
-	}
-	for _, num := range dec.AckRetriage {
-		if num > 0 && !issueExists(num) {
-			return fmt.Errorf("ack_retriage issue #%d not found", num)
-		}
-	}
-	return nil
+func (s *Store) ValidateBatchDecisionsWithOptions(dec model.BatchTriageDecisions, opts BatchApplyOptions) ([]model.TriageConflict, error) {
+	_, conflicts, err := s.PlanBatchDecisionsWithOptions(dec, opts)
+	return conflicts, err
 }
 
 func (s *Store) ApplyBatchTriageDecisions(dec model.BatchTriageDecisions) (BatchTriageResult, error) {
-	newNums, err := sortedNumericKeys(dec.NewIssues)
-	if err != nil {
-		return BatchTriageResult{}, err
-	}
-	exNums, err := sortedNumericKeys(dec.ExcludeIssues)
-	if err != nil {
-		return BatchTriageResult{}, err
-	}
-	ovrNums, err := sortedNumericKeys(dec.Overrides)
-	if err != nil {
-		return BatchTriageResult{}, err
-	}
-	manNums, err := sortedNumericKeys(dec.ManualPRLinks)
-	if err != nil {
-		return BatchTriageResult{}, err
-	}
+	return s.ApplyBatchTriageDecisionsWithOptions(dec, BatchApplyOptions{SkipConflicts: false})
+}
 
+func (s *Store) ApplyBatchTriageDecisionsWithOptions(dec model.BatchTriageDecisions, opts BatchApplyOptions) (BatchTriageResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	lookupVal := func(n int) []string {
-		return []string{strconv.Itoa(n), "#" + strconv.Itoa(n)}
-	}
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1604,19 +2452,26 @@ func (s *Store) ApplyBatchTriageDecisions(dec model.BatchTriageDecisions) (Batch
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	nowISO := time.Now().UTC().Format("2006-01-02T15:04:05Z")
-	var res BatchTriageResult
+	planned, conflicts, err := planBatchDecisions(tx, dec, opts)
+	if err != nil {
+		return BatchTriageResult{}, err
+	}
+
+	newNums, _ := sortedNumericKeys(planned.NewIssues)
+	exNums, _ := sortedNumericKeys(planned.ExcludeIssues)
+	ovrNums, _ := sortedNumericKeys(planned.Overrides)
+	manNums, _ := sortedNumericKeys(planned.ManualPRLinks)
+
+	nowISO := model.NowRFC3339Nano()
+	res := BatchTriageResult{
+		SkippedConflicts:   conflicts,
+		ManualLinkedIssues: manNums,
+	}
 	acceptedSet := make(map[int]bool, len(newNums))
 
 	// 1. Accept new issues
 	for _, num := range newNums {
-		var patch model.TriagePatchRequest
-		for _, k := range lookupVal(num) {
-			if v, ok := dec.NewIssues[k]; ok {
-				patch = v
-				break
-			}
-		}
+		patch := planned.NewIssues[strconv.Itoa(num)]
 		req := model.PendingResolveRequest{
 			Action:           "accept",
 			Cat:              patch.Cat,
@@ -1635,13 +2490,7 @@ func (s *Store) ApplyBatchTriageDecisions(dec model.BatchTriageDecisions) (Batch
 
 	// 2. Exclude issues
 	for _, num := range exNums {
-		var reason string
-		for _, k := range lookupVal(num) {
-			if v, ok := dec.ExcludeIssues[k]; ok {
-				reason = strings.TrimSpace(v)
-				break
-			}
-		}
+		reason := strings.TrimSpace(planned.ExcludeIssues[strconv.Itoa(num)])
 		if reason == "" {
 			reason = "Excluded non-optimizer issue via CLI triage"
 		}
@@ -1663,8 +2512,8 @@ func (s *Store) ApplyBatchTriageDecisions(dec model.BatchTriageDecisions) (Batch
 	}
 
 	// 3. Link manual PRs BEFORE overrides/ack so newly linked PRs are snapshotted into baselines
-	if len(manNums) > 0 {
-		cnt, err := s.addManualPRLinksInTx(tx, dec.ManualPRLinks, acceptedSet)
+	if len(planned.ManualPRLinks) > 0 {
+		cnt, err := s.addManualPRLinksInTx(tx, planned.ManualPRLinks, acceptedSet)
 		if err != nil {
 			return BatchTriageResult{}, err
 		}
@@ -1673,13 +2522,7 @@ func (s *Store) ApplyBatchTriageDecisions(dec model.BatchTriageDecisions) (Batch
 
 	// 4. Apply overrides
 	for _, num := range ovrNums {
-		var patch model.TriagePatchRequest
-		for _, k := range lookupVal(num) {
-			if v, ok := dec.Overrides[k]; ok {
-				patch = v
-				break
-			}
-		}
+		patch := planned.Overrides[strconv.Itoa(num)]
 		if err := s.applyIssueOverrideInTx(tx, num, patch, nowISO); err != nil {
 			return BatchTriageResult{}, fmt.Errorf("override issue #%d: %w", num, err)
 		}
@@ -1687,8 +2530,8 @@ func (s *Store) ApplyBatchTriageDecisions(dec model.BatchTriageDecisions) (Batch
 	}
 
 	// 5. Acknowledge retriage
-	if len(dec.AckRetriage) > 0 {
-		acked, err := s.acknowledgeBatchRetriageInTx(tx, []int(dec.AckRetriage), "cli", nowISO)
+	if len(planned.AckRetriage) > 0 {
+		acked, err := s.acknowledgeBatchRetriageInTx(tx, planned.AckRetriage, "cli", nowISO)
 		if err != nil {
 			return BatchTriageResult{}, err
 		}
@@ -1732,37 +2575,136 @@ func (s *Store) HasPRStatuses(targets []prstatus.PRTarget) ([]string, error) {
 	return missing, nil
 }
 
-// RefreshAcceptedIssueBaselines refreshes baseline PR sets for newly accepted issues after
-// post-accept PR status sync updates cached PR states (e.g. OPEN -> MERGED) so newly accepted
-// issues are not immediately self-flagged for retriage.
-func (s *Store) RefreshAcceptedIssueBaselines(numbers []int) error {
-	if len(numbers) == 0 {
-		return nil
+const sqlInChunkSize = 400
+
+// ListIssueMissingPRTargets returns open/draft PRs linked to the given tracked issue numbers
+// that are not yet present in `pull_requests` (so callers can pre-fetch them before snapshotting baselines).
+func (s *Store) ListIssueMissingPRTargets(issueNums ...int) ([]prstatus.PRTarget, error) {
+	if len(issueNums) == 0 {
+		return nil, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
+	seen := make(map[string]bool)
+	var out []prstatus.PRTarget
+	for start := 0; start < len(issueNums); start += sqlInChunkSize {
+		end := start + sqlInChunkSize
+		if end > len(issueNums) {
+			end = len(issueNums)
+		}
+		chunk := issueNums[start:end]
+		ph := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, DefaultRepo)
+		for i, n := range chunk {
+			ph[i] = "?"
+			args = append(args, n)
+		}
+		rows, err := s.db.Query(`
+SELECT DISTINCT l.pr_repo, l.pr_num
+FROM issue_pr_links l
+LEFT JOIN pull_requests p ON l.pr_repo = p.repo AND l.pr_num = p.number
+WHERE l.issue_repo = ? AND l.issue_num IN (`+strings.Join(ph, ",")+`)
+  AND l.state IN ('OPEN', 'DRAFT')
+  AND p.number IS NULL
+ORDER BY l.pr_repo ASC, l.pr_num DESC`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var repo string
+			var num int
+			if err := rows.Scan(&repo, &num); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			k := model.PRKey(repo, num)
+			if !seen[k] {
+				seen[k] = true
+				out = append(out, prstatus.PRTarget{
+					Repo:         repo,
+					Number:       num,
+					TrackSources: []string{"issue_linked"},
+				})
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		_ = rows.Close()
 	}
-	defer func() { _ = tx.Rollback() }()
+	return out, nil
+}
 
-	nowISO := time.Now().UTC().Format("2006-01-02T15:04:05Z")
-	for _, num := range numbers {
-		if num <= 0 {
-			continue
+// ListPendingMissingPRTargets returns open/draft PRs referenced on the given pending candidate numbers
+// that are not yet present in `pull_requests`.
+func (s *Store) ListPendingMissingPRTargets(issueNums ...int) ([]prstatus.PRTarget, error) {
+	if len(issueNums) == 0 {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	seen := make(map[string]bool)
+	var out []prstatus.PRTarget
+	for start := 0; start < len(issueNums); start += sqlInChunkSize {
+		end := start + sqlInChunkSize
+		if end > len(issueNums) {
+			end = len(issueNums)
 		}
-		var hasOvr int
-		_ = tx.QueryRow(`SELECT COUNT(*) FROM issue_overrides WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&hasOvr)
-		if hasOvr != 0 {
-			continue
+		chunk := issueNums[start:end]
+		ph := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, DefaultRepo)
+		for i, n := range chunk {
+			ph[i] = "?"
+			args = append(args, n)
 		}
-		if err := s.snapshotBaselineInTx(tx, num, "triage", nowISO); err != nil {
-			return err
+		rows, err := s.db.Query(`SELECT payload_json FROM pending_candidates WHERE repo = ? AND number IN (`+strings.Join(ph, ",")+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		var refs []model.LinkedPRRef
+		for rows.Next() {
+			var raw string
+			if err := rows.Scan(&raw); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			var pc model.PendingCandidate
+			if json.Unmarshal([]byte(raw), &pc) == nil {
+				refs = append(refs, pc.PRs...)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		_ = rows.Close()
+
+		for _, r := range refs {
+			if r.Repo == "" || r.Num <= 0 || r.IsCherryPick || (r.State != "OPEN" && r.State != "DRAFT") {
+				continue
+			}
+			k := model.PRKey(r.Repo, r.Num)
+			if seen[k] {
+				continue
+			}
+			var cnt int
+			if err := s.db.QueryRow(`SELECT COUNT(*) FROM pull_requests WHERE repo = ? AND number = ?`, r.Repo, r.Num).Scan(&cnt); err == nil && cnt > 0 {
+				continue
+			}
+			seen[k] = true
+			out = append(out, prstatus.PRTarget{
+				Repo:         r.Repo,
+				Number:       r.Num,
+				TrackSources: []string{"issue_linked"},
+			})
 		}
 	}
-	return tx.Commit()
+	return out, nil
 }
 
 func (s *Store) CountRetriageNeeded() (int, error) {
@@ -1927,6 +2869,7 @@ SELECT
   o.cat, o.severity, o.subsystem, o.is_borderline_kept, COALESCE(o.force_keep, 0), COALESCE(o.has_force_keep_override, 0),
   o.note_zh, o.note_en, COALESCE(o.has_note_override, 0),
   CASE WHEN o.number IS NOT NULL THEN 1 ELSE 0 END,
+  COALESCE(o.updated_at, ''),
   COALESCE(ts.triaged_at, ''), COALESCE(ts.needs_retriage, 0),
   COALESCE(ts.retriage_reasons_json, '[]'), COALESCE(ts.retriage_details_json, '[]')
 FROM issues i
@@ -1948,20 +2891,20 @@ ORDER BY i.number DESC`, DefaultRepo)
 
 	for rows.Next() {
 		var (
-			r                       model.IssueRecord
-			asgJSON, lbsJSON        string
-			isCan, isCust           int
-			autoCat, autoSev        string
-			autoSub                 string
-			autoBdr, autoFK         int
-			autoNZh, autoNEn        string
-			oCat, oSev, oSub        sql.NullString
-			oBdr                    sql.NullInt64
-			oForceKeep, oHasFK      int
-			oNZh, oNEn              sql.NullString
-			oHasNote, hasOvr        int
-			triagedAt               string
-			needsRetriage           int
+			r                        model.IssueRecord
+			asgJSON, lbsJSON         string
+			isCan, isCust            int
+			autoCat, autoSev         string
+			autoSub                  string
+			autoBdr, autoFK          int
+			autoNZh, autoNEn         string
+			oCat, oSev, oSub         sql.NullString
+			oBdr                     sql.NullInt64
+			oForceKeep, oHasFK       int
+			oNZh, oNEn               sql.NullString
+			oHasNote, hasOvr         int
+			ovrUpdatedAt, triagedAt  string
+			needsRetriage            int
 			reasonsJSON, detailsJSON string
 		)
 		if err := rows.Scan(
@@ -1970,7 +2913,7 @@ ORDER BY i.number DESC`, DefaultRepo)
 			&autoCat, &autoSev, &autoSub, &autoBdr, &autoFK, &autoNZh, &autoNEn,
 			&oCat, &oSev, &oSub, &oBdr, &oForceKeep, &oHasFK,
 			&oNZh, &oNEn, &oHasNote, &hasOvr,
-			&triagedAt, &needsRetriage, &reasonsJSON, &detailsJSON,
+			&ovrUpdatedAt, &triagedAt, &needsRetriage, &reasonsJSON, &detailsJSON,
 		); err != nil {
 			return model.Dataset{}, err
 		}
@@ -2052,7 +2995,7 @@ ORDER BY i.number DESC`, DefaultRepo)
 				effForceKeep = oForceKeep != 0
 			}
 			r.ForceKeep = effForceKeep
-			r.TriagedAt = triagedAt
+			r.TriagedAt = model.MaxRFC3339(ovrUpdatedAt, triagedAt)
 			if needsRetriage != 0 {
 				r.NeedsRetriage = true
 				_ = json.Unmarshal([]byte(reasonsJSON), &r.RetriageReasons)
@@ -2109,28 +3052,31 @@ ORDER BY i.number DESC`, DefaultRepo)
 		}
 	}
 
-	var exNums []int
-	exRows, err := s.db.Query(`SELECT number FROM excluded_issues WHERE repo = ? ORDER BY number DESC`, DefaultRepo)
-	if err == nil {
-		defer exRows.Close()
-		for exRows.Next() {
-			var n int
-			if exRows.Scan(&n) == nil {
-				exNums = append(exNums, n)
+	var exNums, pendNums []int
+	if includeWorkbenchFlags {
+		exRows, err := s.db.Query(`SELECT number FROM excluded_issues WHERE repo = ? ORDER BY number DESC`, DefaultRepo)
+		if err == nil {
+			defer exRows.Close()
+			for exRows.Next() {
+				var n int
+				if exRows.Scan(&n) == nil {
+					exNums = append(exNums, n)
+				}
 			}
 		}
-	}
 
-	var pendNums []int
-	pendRows, err := s.db.Query(`SELECT number FROM pending_candidates WHERE repo = ? ORDER BY number DESC`, DefaultRepo)
-	if err == nil {
-		defer pendRows.Close()
-		for pendRows.Next() {
-			var n int
-			if pendRows.Scan(&n) == nil {
-				pendNums = append(pendNums, n)
+		pendRows, err := s.db.Query(`SELECT number FROM pending_candidates WHERE repo = ? ORDER BY number DESC`, DefaultRepo)
+		if err == nil {
+			defer pendRows.Close()
+			for pendRows.Next() {
+				var n int
+				if pendRows.Scan(&n) == nil {
+					pendNums = append(pendNums, n)
+				}
 			}
 		}
+	} else {
+		retriageNums = nil
 	}
 
 	syncMeta.SchemaVersion = model.SchemaVersion
