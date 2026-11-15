@@ -195,11 +195,17 @@ func FetchPendingPRDetails(
 					return out, fmt.Errorf("graphql PR enrich error (%s): %s", ge.Type, ge.Message)
 				}
 			}
-			if resp.Data == nil || resp.Data.Repository == nil {
+			if resp.Data == nil {
 				if len(resp.Errors) > 0 {
 					return out, fmt.Errorf("graphql PR enrich error: %s", resp.Errors[0].Message)
 				}
-				continue
+				return out, fmt.Errorf("graphql PR enrich returned empty data payload")
+			}
+			if resp.Data.Repository == nil {
+				if len(resp.Errors) > 0 {
+					continue
+				}
+				return out, fmt.Errorf("graphql PR enrich returned null repository without NOT_FOUND error")
 			}
 
 			for _, n := range chunk {

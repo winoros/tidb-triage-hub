@@ -387,6 +387,46 @@ func AnalyzeCandidate(pc *model.PendingCandidate) {
 	pc.SuggestedTriage = SuggestTriage(pc.Title, pc.Labels, pc.PRs, pc.PRDetails, pc.Clues)
 }
 
+// FilterRelevantKernelPRs returns non-cherry-pick kernel PRs, omitting CLOSED PRs when
+// at least one non-CLOSED (OPEN/DRAFT/MERGED) kernel mainline PR exists on the same issue.
+func FilterRelevantKernelPRs(prs []model.LinkedPRRef) []model.LinkedPRRef {
+	hasActiveOrMerged := false
+	for _, pr := range prs {
+		if !pr.IsCherryPick && pr.State != "CLOSED" && issuesync.IsKernelRepo(pr.Repo) {
+			hasActiveOrMerged = true
+			break
+		}
+	}
+	var out []model.LinkedPRRef
+	for _, pr := range prs {
+		if pr.IsCherryPick || !issuesync.IsKernelRepo(pr.Repo) {
+			continue
+		}
+		if hasActiveOrMerged && pr.State == "CLOSED" {
+			continue
+		}
+		out = append(out, pr)
+	}
+	return out
+}
+
+func isCachedPRDetailFresh(prev model.PendingPRDetail, pr model.LinkedPRRef) bool {
+	if pr.UpdatedAt == "" {
+		return prev.State == pr.State
+	}
+	if prev.UpdatedAt == "" {
+		return false
+	}
+	cmp := model.CompareRFC3339(prev.UpdatedAt, pr.UpdatedAt)
+	if cmp < 0 {
+		return false
+	}
+	if cmp > 0 {
+		return true
+	}
+	return prev.State == pr.State
+}
+
 // CandidateNeedsPREnrichment reports whether any active/merged kernel mainline PR on `c`
 // lacks cached PRDetails or has changed state/updatedAt since it was last enriched.
 func CandidateNeedsPREnrichment(c model.PendingCandidate) bool {
@@ -394,22 +434,9 @@ func CandidateNeedsPREnrichment(c model.PendingCandidate) bool {
 	for _, d := range c.PRDetails {
 		detailMap[model.PRKey(d.Repo, d.Num)] = d
 	}
-	hasActiveOrMerged := false
-	for _, pr := range c.PRs {
-		if !pr.IsCherryPick && pr.State != "CLOSED" && issuesync.IsKernelRepo(pr.Repo) {
-			hasActiveOrMerged = true
-			break
-		}
-	}
-	for _, pr := range c.PRs {
-		if pr.IsCherryPick || !issuesync.IsKernelRepo(pr.Repo) {
-			continue
-		}
-		if hasActiveOrMerged && pr.State == "CLOSED" {
-			continue
-		}
+	for _, pr := range FilterRelevantKernelPRs(c.PRs) {
 		prev, ok := detailMap[model.PRKey(pr.Repo, pr.Num)]
-		if !ok || prev.State != pr.State || (pr.UpdatedAt != "" && prev.UpdatedAt != pr.UpdatedAt) {
+		if !ok || !isCachedPRDetailFresh(prev, pr) {
 			return true
 		}
 	}
@@ -432,29 +459,17 @@ func EnrichAndAnalyzePending(
 	detailMap := make(map[string]model.PendingPRDetail)
 	for _, c := range candidates {
 		for _, d := range c.PRDetails {
-			detailMap[model.PRKey(d.Repo, d.Num)] = d
+			k := model.PRKey(d.Repo, d.Num)
+			if prev, exists := detailMap[k]; !exists || model.CompareRFC3339(d.UpdatedAt, prev.UpdatedAt) >= 0 {
+				detailMap[k] = d
+			}
 		}
 	}
 	if fetchPRFiles {
 		var missingPRs []model.LinkedPRRef
 		for _, c := range candidates {
-			hasActiveOrMerged := false
-			for _, pr := range c.PRs {
-				if !pr.IsCherryPick && pr.State != "CLOSED" && issuesync.IsKernelRepo(pr.Repo) {
-					hasActiveOrMerged = true
-					break
-				}
-			}
-			for _, pr := range c.PRs {
-				if pr.IsCherryPick || !issuesync.IsKernelRepo(pr.Repo) {
-					continue
-				}
-				if hasActiveOrMerged && pr.State == "CLOSED" {
-					continue
-				}
-				if prev, ok := detailMap[model.PRKey(pr.Repo, pr.Num)]; ok &&
-					prev.State == pr.State &&
-					(pr.UpdatedAt == "" || prev.UpdatedAt == pr.UpdatedAt) {
+			for _, pr := range FilterRelevantKernelPRs(c.PRs) {
+				if prev, ok := detailMap[model.PRKey(pr.Repo, pr.Num)]; ok && isCachedPRDetailFresh(prev, pr) {
 					continue
 				}
 				missingPRs = append(missingPRs, pr)
@@ -473,18 +488,29 @@ func EnrichAndAnalyzePending(
 	for i := range candidates {
 		pc := candidates[i]
 		if len(detailMap) > 0 {
-			hasActiveOrMerged := false
-			for _, pr := range pc.PRs {
-				if !pr.IsCherryPick && pr.State != "CLOSED" && issuesync.IsKernelRepo(pr.Repo) {
-					hasActiveOrMerged = true
-					break
+			if len(pc.PRs) > 0 {
+				syncedPRs := make([]model.LinkedPRRef, len(pc.PRs))
+				copy(syncedPRs, pc.PRs)
+				for j := range syncedPRs {
+					if d, ok := detailMap[model.PRKey(syncedPRs[j].Repo, syncedPRs[j].Num)]; ok {
+						if d.UpdatedAt == "" || syncedPRs[j].UpdatedAt == "" || model.CompareRFC3339(d.UpdatedAt, syncedPRs[j].UpdatedAt) >= 0 {
+							if d.State != "" {
+								syncedPRs[j].State = d.State
+							}
+							if d.UpdatedAt != "" {
+								syncedPRs[j].UpdatedAt = d.UpdatedAt
+							}
+							if d.Title != "" {
+								syncedPRs[j].Title = d.Title
+							}
+							syncedPRs[j].IsCherryPick = d.IsCherryPick
+						}
+					}
 				}
+				pc.PRs = syncedPRs
 			}
 			var dets []model.PendingPRDetail
-			for _, pr := range pc.PRs {
-				if hasActiveOrMerged && pr.State == "CLOSED" {
-					continue
-				}
+			for _, pr := range FilterRelevantKernelPRs(pc.PRs) {
 				if d, ok := detailMap[model.PRKey(pr.Repo, pr.Num)]; ok {
 					dets = append(dets, d)
 				}

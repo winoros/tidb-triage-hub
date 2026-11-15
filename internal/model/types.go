@@ -188,8 +188,10 @@ type Permissions struct {
 }
 
 type SessionInfo struct {
-	Viewer      Viewer      `json:"viewer"`
-	Permissions Permissions `json:"permissions"`
+	Viewer        Viewer      `json:"viewer"`
+	Permissions   Permissions `json:"permissions"`
+	AuthRequired  bool        `json:"auth_required,omitempty"`
+	Authenticated bool        `json:"authenticated,omitempty"`
 }
 
 type FailedCheck struct {
@@ -360,6 +362,7 @@ type SuggestedTriage struct {
 }
 
 type PendingCandidate struct {
+	Revision        int               `json:"-"`
 	Number          int               `json:"number"`
 	URL             string            `json:"url"`
 	Title           string            `json:"title"`
@@ -446,21 +449,30 @@ func (f *FlexIntList) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type TriageConflict struct {
+	Issue   int    `json:"issue"`
+	Action  string `json:"action"`
+	Kind    string `json:"kind"`
+	Message string `json:"message"`
+}
+
 type BatchTriageDecisions struct {
-	NewIssues     map[string]TriagePatchRequest `json:"new_issues,omitempty"`
-	ExcludeIssues map[string]string             `json:"exclude_issues,omitempty"`
-	Overrides     map[string]TriagePatchRequest `json:"overrides,omitempty"`
-	AckRetriage   FlexIntList                   `json:"ack_retriage,omitempty"`
-	ManualPRLinks map[string][]string           `json:"manual_pr_links,omitempty"`
+	BaseExportedAt string                        `json:"base_exported_at,omitempty"`
+	NewIssues      map[string]TriagePatchRequest `json:"new_issues,omitempty"`
+	ExcludeIssues  map[string]string             `json:"exclude_issues,omitempty"`
+	Overrides      map[string]TriagePatchRequest `json:"overrides,omitempty"`
+	AckRetriage    FlexIntList                   `json:"ack_retriage,omitempty"`
+	ManualPRLinks  map[string][]string           `json:"manual_pr_links,omitempty"`
 }
 
 type TriagePatchRequest struct {
-	Cat              string         `json:"cat"`
-	Severity         string         `json:"severity"`
-	Subsystem        string         `json:"subsystem"`
-	IsBorderlineKept bool           `json:"is_borderline_kept"`
-	ForceKeep        bool           `json:"force_keep"`
-	Note             *LocalizedNote `json:"note"`
+	Cat               string         `json:"cat"`
+	Severity          string         `json:"severity"`
+	Subsystem         string         `json:"subsystem"`
+	IsBorderlineKept  bool           `json:"is_borderline_kept"`
+	ForceKeep         bool           `json:"force_keep"`
+	Note              *LocalizedNote `json:"note"`
+	IfUnmodifiedSince string         `json:"if_unmodified_since,omitempty"`
 
 	unmarshaled       bool `json:"-"`
 	hasBorderlineKept bool `json:"-"`
@@ -468,21 +480,32 @@ type TriagePatchRequest struct {
 }
 
 func (r *TriagePatchRequest) UnmarshalJSON(data []byte) error {
-	type alias TriagePatchRequest
-	var aux alias
+	var aux struct {
+		Cat               string         `json:"cat"`
+		Severity          string         `json:"severity"`
+		Subsystem         string         `json:"subsystem"`
+		IsBorderlineKept  *bool          `json:"is_borderline_kept"`
+		ForceKeep         *bool          `json:"force_keep"`
+		Note              *LocalizedNote `json:"note"`
+		IfUnmodifiedSince string         `json:"if_unmodified_since"`
+	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
+	*r = TriagePatchRequest{
+		Cat:               aux.Cat,
+		Severity:          aux.Severity,
+		Subsystem:         aux.Subsystem,
+		Note:              aux.Note,
+		IfUnmodifiedSince: aux.IfUnmodifiedSince,
+		unmarshaled:       true,
 	}
-	*r = TriagePatchRequest(aux)
-	r.unmarshaled = true
-	if raw, ok := fields["is_borderline_kept"]; ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+	if aux.IsBorderlineKept != nil {
+		r.IsBorderlineKept = *aux.IsBorderlineKept
 		r.hasBorderlineKept = true
 	}
-	if raw, ok := fields["force_keep"]; ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+	if aux.ForceKeep != nil {
+		r.ForceKeep = *aux.ForceKeep
 		r.hasForceKeep = true
 	}
 	return nil
@@ -504,19 +527,21 @@ func (r TriagePatchRequest) MarshalJSON() ([]byte, error) {
 		fkPtr = &v
 	}
 	return json.Marshal(struct {
-		Cat              string         `json:"cat"`
-		Severity         string         `json:"severity"`
-		Subsystem        string         `json:"subsystem"`
-		IsBorderlineKept *bool          `json:"is_borderline_kept,omitempty"`
-		ForceKeep        *bool          `json:"force_keep,omitempty"`
-		Note             *LocalizedNote `json:"note"`
+		Cat               string         `json:"cat"`
+		Severity          string         `json:"severity"`
+		Subsystem         string         `json:"subsystem"`
+		IsBorderlineKept  *bool          `json:"is_borderline_kept,omitempty"`
+		ForceKeep         *bool          `json:"force_keep,omitempty"`
+		Note              *LocalizedNote `json:"note"`
+		IfUnmodifiedSince string         `json:"if_unmodified_since,omitempty"`
 	}{
-		Cat:              r.Cat,
-		Severity:         r.Severity,
-		Subsystem:        r.Subsystem,
-		IsBorderlineKept: bdrPtr,
-		ForceKeep:        fkPtr,
-		Note:             r.Note,
+		Cat:               r.Cat,
+		Severity:          r.Severity,
+		Subsystem:         r.Subsystem,
+		IsBorderlineKept:  bdrPtr,
+		ForceKeep:         fkPtr,
+		Note:              r.Note,
+		IfUnmodifiedSince: r.IfUnmodifiedSince,
 	})
 }
 
@@ -531,6 +556,29 @@ func (r TriagePatchRequest) HasForceKeepField() bool {
 	return !r.unmarshaled || r.hasForceKeep
 }
 
+// NewTemplateOverridePatch constructs a template TriagePatchRequest whose JSON serialization
+// omits `is_borderline_kept` and `force_keep` unless explicitly added by the user, preventing
+// note-backfill or re-triage templates from unintentionally pinning manual boolean overrides.
+func NewTemplateOverridePatch(cat, severity, subsystem, ifUnmodifiedSince string, note *LocalizedNote) TriagePatchRequest {
+	return TriagePatchRequest{
+		Cat:               cat,
+		Severity:          severity,
+		Subsystem:         subsystem,
+		Note:              note,
+		IfUnmodifiedSince: ifUnmodifiedSince,
+		unmarshaled:       true,
+	}
+}
+
+// RFC3339NanoFixed formats UTC timestamps with fixed 9-digit nanoseconds so both Go
+// chronological comparison and SQLite lexicographic `ORDER BY` remain strictly monotonic.
+const RFC3339NanoFixed = "2006-01-02T15:04:05.000000000Z"
+
+// NowRFC3339Nano returns the current UTC time formatted with fixed-width nanosecond precision.
+func NowRFC3339Nano() string {
+	return time.Now().UTC().Format(RFC3339NanoFixed)
+}
+
 func parseFlexibleRFC3339(ts string) (time.Time, bool) {
 	s := strings.TrimSpace(ts)
 	if s == "" {
@@ -543,6 +591,52 @@ func parseFlexibleRFC3339(ts string) (time.Time, bool) {
 		return t.UTC(), true
 	}
 	return time.Time{}, false
+}
+
+// NormalizeRFC3339NanoFixed validates an RFC3339/RFC3339Nano timestamp and normalizes it to UTC RFC3339NanoFixed.
+func NormalizeRFC3339NanoFixed(ts string) (string, bool) {
+	t, ok := parseFlexibleRFC3339(ts)
+	if !ok {
+		return "", false
+	}
+	return t.Format(RFC3339NanoFixed), true
+}
+
+// ParseBoolDefault parses common boolean query/env literals ("1","true","yes" / "0","false","no").
+func ParseBoolDefault(raw string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes":
+		return true
+	case "0", "false", "no":
+		return false
+	default:
+		return def
+	}
+}
+
+// ParseIssueNumCSV parses a comma-separated list of positive issue numbers (with optional '#' prefixes) and deduplicates them.
+func ParseIssueNumCSV(raw string) ([]int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var out []int
+	seen := make(map[int]bool)
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimPrefix(strings.TrimSpace(part), "#")
+		if part == "" {
+			continue
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("invalid issue number %q", part)
+		}
+		if !seen[n] {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	return out, nil
 }
 
 // CompareRFC3339 compares two ISO8601/RFC3339 timestamps chronologically (handling subseconds and offsets).

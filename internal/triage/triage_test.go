@@ -519,4 +519,143 @@ func TestRound2PatchMarshalRoundTripAndCluesClosedPRFilter(t *testing.T) {
 	if smallCboSug.Cat == "EASY" || smallCboSug.Confidence != "low" {
 		t.Fatalf("expected small CBO diff not to auto-grade EASY, got %+v", smallCboSug)
 	}
+
+	// Case-insensitive boolean keys set presence flags in single-pass UnmarshalJSON
+	var ciPatch model.TriagePatchRequest
+	if err := ciPatch.UnmarshalJSON([]byte(`{"cat":"EASY","severity":"MINOR","subsystem":"statistics","Is_Borderline_Kept":true,"Force_Keep":false}`)); err != nil {
+		t.Fatalf("case-insensitive UnmarshalJSON failed: %v", err)
+	}
+	if !ciPatch.HasBorderlineField() || !ciPatch.IsBorderlineKept || !ciPatch.HasForceKeepField() || ciPatch.ForceKeep {
+		t.Fatalf("expected case-insensitive boolean presence tracking, got %+v (hasBdr=%v hasFK=%v)", ciPatch, ciPatch.HasBorderlineField(), ciPatch.HasForceKeepField())
+	}
+
+	// Invalid base_exported_at or if_unmodified_since is rejected fast; valid RFC3339 is normalized
+	if _, _, err := ValidateAndPrepareDecisions(model.BatchTriageDecisions{
+		BaseExportedAt: "TODO",
+		AckRetriage:    model.FlexIntList{73001},
+	}, ValidateOptions{}); err == nil || !strings.Contains(err.Error(), "base_exported_at") {
+		t.Fatalf("expected invalid base_exported_at error, got %v", err)
+	}
+	if _, _, err := ValidateAndPrepareDecisions(model.BatchTriageDecisions{
+		Overrides: map[string]model.TriagePatchRequest{
+			"73001": {
+				Cat:               "EASY",
+				Severity:          "MINOR",
+				Subsystem:         "statistics",
+				IfUnmodifiedSince: "not-a-time",
+				Note:              &model.LocalizedNote{ZhCN: "测试备注内容足够长用于校验", En: "Test note long enough for validation"},
+			},
+		},
+	}, ValidateOptions{}); err == nil || !strings.Contains(err.Error(), "if_unmodified_since") {
+		t.Fatalf("expected invalid if_unmodified_since error, got %v", err)
+	}
+	normDec, _, err := ValidateAndPrepareDecisions(model.BatchTriageDecisions{
+		BaseExportedAt: "2026-11-12T18:00:00+08:00",
+		AckRetriage:    model.FlexIntList{73001},
+	}, ValidateOptions{})
+	if err != nil || normDec.BaseExportedAt != "2026-11-12T10:00:00.000000000Z" {
+		t.Fatalf("expected normalized UTC nano BaseExportedAt, got %q err=%v", normDec.BaseExportedAt, err)
+	}
+}
+
+func TestFetchPendingPRDetailsNullDataCacheFreshnessAndSkipTodoCompanions(t *testing.T) {
+	// 1. FetchPendingPRDetails rejects {"data":null} and {"data":{"repository":null}} instead of silently skipping
+	refs := []model.LinkedPRRef{{Repo: "pingcap/tidb", Num: 74901, State: "OPEN"}}
+	if _, err := FetchPendingPRDetails(context.Background(), staticRunner{payload: `{"data":null}`}, nil, refs); err == nil {
+		t.Fatal("expected FetchPendingPRDetails to fail on {\"data\":null}")
+	}
+	if _, err := FetchPendingPRDetails(context.Background(), staticRunner{payload: `{"data":{"repository":null}}`}, nil, refs); err == nil {
+		t.Fatal("expected FetchPendingPRDetails to fail on null repository without NOT_FOUND errors")
+	}
+
+	// 2. Cached PRDetail with UpdatedAt >= PRs.UpdatedAt is treated as fresh AND syncs PRs state before ExtractClues
+	cand := model.PendingCandidate{
+		Number: 74002,
+		Title:  "wrong result in join reorder",
+		Labels: []string{"sig/planner", "type/bug"},
+		PRs: []model.LinkedPRRef{
+			{Repo: "pingcap/tidb", Num: 74910, State: "OPEN", UpdatedAt: "2026-11-12T08:00:00Z"},
+			{Repo: "pingcap/tidb", Num: 74911, State: "OPEN", UpdatedAt: "2026-11-12T09:00:00Z"},
+		},
+		PRDetails: []model.PendingPRDetail{
+			{
+				Repo:             "pingcap/tidb",
+				Num:              74910,
+				State:            "CLOSED",
+				UpdatedAt:        "2026-11-12T10:00:00Z", // fresher than PRs[0].UpdatedAt!
+				NonTestFileCount: 1,
+				NonTestFiles:     []string{"pkg/statistics/handle/bootstrap.go"},
+			},
+			{
+				Repo:             "pingcap/tidb",
+				Num:              74911,
+				State:            "OPEN",
+				UpdatedAt:        "2026-11-12T09:00:00Z",
+				NonTestFileCount: 1,
+				NonTestAdditions: 25,
+				NonTestFiles:     []string{"pkg/planner/core/rule_join_reorder.go"},
+			},
+		},
+	}
+	if CandidateNeedsPREnrichment(cand) {
+		t.Fatal("expected CandidateNeedsPREnrichment=false when cached PRDetails are at least as fresh as PRs")
+	}
+	enriched, err := EnrichAndAnalyzePending(context.Background(), staticRunner{payload: `{"data":null}`}, nil, []model.PendingCandidate{cand}, true)
+	if err != nil {
+		t.Fatalf("expected EnrichAndAnalyzePending not to call GraphQL when cache is fresh, got %v", err)
+	}
+	if enriched[0].PRs[0].State != "CLOSED" {
+		t.Fatalf("expected EnrichAndAnalyzePending to sync PRs[0].State=CLOSED from fresher PRDetails, got %s", enriched[0].PRs[0].State)
+	}
+	if enriched[0].SuggestedTriage == nil || enriched[0].SuggestedTriage.Subsystem != "cbo_cost_join_reorder" {
+		t.Fatalf("expected SuggestedTriage subsystem=cbo_cost_join_reorder (ignoring closed statistics PR), got %+v", enriched[0].SuggestedTriage)
+	}
+
+	// 3. SkipTodo skips companion manual_pr_links and ack_retriage for skipped TODO issues
+	todoDec := model.BatchTriageDecisions{
+		NewIssues: map[string]model.TriagePatchRequest{
+			"74100": {
+				Cat:       "MEDIUM",
+				Severity:  "MAJOR",
+				Subsystem: "statistics",
+				Note:      &model.LocalizedNote{ZhCN: "TODO: 待补充中文根因", En: "TODO: fill root cause"},
+			},
+			"74101": {
+				Cat:       "EASY",
+				Severity:  "MINOR",
+				Subsystem: "statistics",
+				Note:      &model.LocalizedNote{ZhCN: "统计信息直方图边界缺少空值判断导致估算偏差", En: "Missing null check in histogram boundary causes misestimation"},
+			},
+		},
+		Overrides: map[string]model.TriagePatchRequest{
+			"74200": {
+				Cat:       "HARD",
+				Severity:  "CRITICAL",
+				Subsystem: "logical_rewrite",
+				Note:      &model.LocalizedNote{ZhCN: "TODO: 待确认重分拣结论", En: "TODO: verify retriage"},
+			},
+		},
+		ManualPRLinks: map[string][]string{
+			"74100": {"75001"},
+			"74101": {"75002"},
+			"74200": {"75003"},
+		},
+		AckRetriage: model.FlexIntList{74200, 74300},
+	}
+	cleaned, _, err := ValidateAndPrepareDecisions(todoDec, ValidateOptions{SkipTodo: true})
+	if err != nil {
+		t.Fatalf("ValidateAndPrepareDecisions(SkipTodo=true) failed: %v", err)
+	}
+	if _, has74100 := cleaned.ManualPRLinks["74100"]; has74100 {
+		t.Fatalf("expected companion manual_pr_links for skipped TODO new_issue #74100 to be omitted, got %+v", cleaned.ManualPRLinks)
+	}
+	if _, has74200 := cleaned.ManualPRLinks["74200"]; has74200 {
+		t.Fatalf("expected companion manual_pr_links for skipped TODO override #74200 to be omitted, got %+v", cleaned.ManualPRLinks)
+	}
+	if len(cleaned.ManualPRLinks["74101"]) != 1 || cleaned.ManualPRLinks["74101"][0] != "75002" {
+		t.Fatalf("expected manual_pr_links for active #74101 preserved, got %+v", cleaned.ManualPRLinks)
+	}
+	if len(cleaned.AckRetriage) != 1 || cleaned.AckRetriage[0] != 74300 {
+		t.Fatalf("expected companion ack_retriage for skipped TODO #74200 to be omitted while keeping #74300, got %v", cleaned.AckRetriage)
+	}
 }

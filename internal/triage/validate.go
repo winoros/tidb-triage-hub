@@ -89,6 +89,13 @@ func ValidateAndPrepareDecisions(
 		Overrides:     make(map[string]model.TriagePatchRequest),
 		ManualPRLinks: make(map[string][]string),
 	}
+	if rawBase := strings.TrimSpace(dec.BaseExportedAt); rawBase != "" {
+		norm, ok := model.NormalizeRFC3339NanoFixed(rawBase)
+		if !ok {
+			return out, nil, fmt.Errorf("invalid `base_exported_at` timestamp %q (expected RFC3339 UTC)", dec.BaseExportedAt)
+		}
+		out.BaseExportedAt = norm
+	}
 
 	excludedByNum := make(map[int]string)
 	for k, reason := range dec.ExcludeIssues {
@@ -164,6 +171,7 @@ func ValidateAndPrepareDecisions(
 	}
 
 	seenNew := make(map[int]string)
+	skippedTodoNums := make(map[int]bool)
 	for k, patch := range dec.NewIssues {
 		num, err := normalizeIssueKey(k)
 		if err != nil {
@@ -182,11 +190,19 @@ func ValidateAndPrepareDecisions(
 		}
 		if isTodoNote(patch.Note) {
 			if opts.SkipTodo {
+				skippedTodoNums[num] = true
 				continue
 			}
 			return out, nil, fmt.Errorf("issue #%d: `note` still contains `TODO:` placeholder (complete the note or pass --skip-todo)", num)
 		}
 
+		if rawIf := strings.TrimSpace(patch.IfUnmodifiedSince); rawIf != "" {
+			norm, ok := model.NormalizeRFC3339NanoFixed(rawIf)
+			if !ok {
+				return out, nil, fmt.Errorf("issue #%d: invalid `if_unmodified_since` timestamp %q (expected RFC3339 UTC)", num, patch.IfUnmodifiedSince)
+			}
+			patch.IfUnmodifiedSince = norm
+		}
 		patch.Severity = model.NormalizeSeverityForCategory(patch.Cat, patch.Severity, "MAJOR")
 		if err := model.ValidateTriageFields(patch.Cat, patch.Severity, patch.Subsystem); err != nil {
 			return out, nil, fmt.Errorf("issue #%d: %w", num, err)
@@ -218,12 +234,20 @@ func ValidateAndPrepareDecisions(
 		}
 		if isTodoNote(patch.Note) {
 			if opts.SkipTodo {
+				skippedTodoNums[num] = true
 				continue
 			}
 			return out, nil, fmt.Errorf("issue #%d: `note` still contains `TODO:` placeholder (complete the note or pass --skip-todo)", num)
 		}
 		if _, inNew := out.NewIssues[strconv.Itoa(num)]; inNew {
 			return out, nil, fmt.Errorf("issue #%d appears in both `new_issues` and `overrides`; keep only one", num)
+		}
+		if rawIf := strings.TrimSpace(patch.IfUnmodifiedSince); rawIf != "" {
+			norm, ok := model.NormalizeRFC3339NanoFixed(rawIf)
+			if !ok {
+				return out, nil, fmt.Errorf("override #%d: invalid `if_unmodified_since` timestamp %q (expected RFC3339 UTC)", num, patch.IfUnmodifiedSince)
+			}
+			patch.IfUnmodifiedSince = norm
 		}
 		patch.Severity = model.NormalizeSeverityForCategory(patch.Cat, patch.Severity, "MODERATE")
 		if err := model.ValidateTriageFields(patch.Cat, patch.Severity, patch.Subsystem); err != nil {
@@ -264,6 +288,13 @@ func ValidateAndPrepareDecisions(
 			cleaned = append(cleaned, s)
 		}
 		if len(cleaned) > 0 {
+			if skippedTodoNums[num] {
+				if _, activeNew := out.NewIssues[strconv.Itoa(num)]; !activeNew {
+					if _, activeOvr := out.Overrides[strconv.Itoa(num)]; !activeOvr {
+						continue
+					}
+				}
+			}
 			out.ManualPRLinks[strconv.Itoa(num)] = cleaned
 		}
 	}
@@ -277,6 +308,13 @@ func ValidateAndPrepareDecisions(
 			return out, nil, fmt.Errorf("issue #%d appears in both `ack_retriage` and `exclude_issues`", num)
 		}
 		seenAck[num] = true
+		if skippedTodoNums[num] {
+			if _, activeNew := out.NewIssues[strconv.Itoa(num)]; !activeNew {
+				if _, activeOvr := out.Overrides[strconv.Itoa(num)]; !activeOvr {
+					continue
+				}
+			}
+		}
 		out.AckRetriage = append(out.AckRetriage, num)
 	}
 
