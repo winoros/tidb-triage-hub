@@ -328,24 +328,47 @@ func TestRemoteClientURLCanonicalizationBackupMagicAndPostCommitWarn(t *testing.
 	err := executePending([]string{"-h"}, &dummy, &dummy)
 	mustRun(err)
 
-	// 2. newRemoteClient canonicalizes schemes, strips query/fragment, and uses HTTPS for public hosts
-	pubRC, err := newRemoteClient(remoteConfig{BaseURL: "hub.example.com/?view=prs#inbox"}, 10*time.Second)
+	// 2. newRemoteClient requires explicit http:// or https:// scheme, strips query/fragment,
+	//    and refuses plain http:// + token on non-loopback hosts unless AllowInsecureHTTP is true.
+	if _, err := newRemoteClient(remoteConfig{BaseURL: "hub.example.com/?view=prs#inbox"}, 10*time.Second); err == nil {
+		t.Fatalf("expected scheme-less remote URL to be rejected")
+	}
+	if _, err := newRemoteClient(remoteConfig{BaseURL: "127.0.0.1:8787/#prs"}, 10*time.Second); err == nil {
+		t.Fatalf("expected scheme-less loopback URL to be rejected")
+	}
+	if _, err := newRemoteClient(remoteConfig{BaseURL: "http://10.0.0.5:8787", Token: "secret-tok"}, 10*time.Second); err == nil || !strings.Contains(err.Error(), "allow-insecure-http") {
+		t.Fatalf("expected plain http:// + token on non-loopback host to be rejected, got %v", err)
+	}
+	allowInsecRC, err := newRemoteClient(remoteConfig{BaseURL: "http://10.0.0.5:8787", Token: "secret-tok", AllowInsecureHTTP: true}, 10*time.Second)
+	if err != nil || allowInsecRC.baseURL != "http://10.0.0.5:8787" {
+		t.Fatalf("expected AllowInsecureHTTP=true to allow http://10.0.0.5:8787, got baseURL=%q err=%v", allowInsecRC.baseURL, err)
+	}
+	pubRC, err := newRemoteClient(remoteConfig{BaseURL: "https://hub.example.com/?view=prs#inbox"}, 10*time.Second)
 	if err != nil || pubRC.baseURL != "https://hub.example.com" {
 		t.Fatalf("expected https://hub.example.com, got baseURL=%q err=%v", pubRC.baseURL, err)
 	}
-	locRC, err := newRemoteClient(remoteConfig{BaseURL: "127.0.0.1:8787/#prs"}, 10*time.Second)
+	locRC, err := newRemoteClient(remoteConfig{BaseURL: "http://127.0.0.1:8787/#prs", Token: "loopback-ok"}, 10*time.Second)
 	if err != nil || locRC.baseURL != "http://127.0.0.1:8787" {
-		t.Fatalf("expected http://127.0.0.1:8787, got baseURL=%q err=%v", locRC.baseURL, err)
+		t.Fatalf("expected http://127.0.0.1:8787 with token allowed on loopback, got baseURL=%q err=%v", locRC.baseURL, err)
 	}
 	upperRC, err := newRemoteClient(remoteConfig{BaseURL: "HTTPS://hub.example.com/subpath/"}, 10*time.Second)
 	if err != nil || upperRC.baseURL != "https://hub.example.com/subpath" {
 		t.Fatalf("expected https://hub.example.com/subpath, got baseURL=%q err=%v", upperRC.baseURL, err)
 	}
 
-	// 3. downloadBackup rejects HTTP 200 non-SQLite HTML responses without clobbering existing backup
+	// 3. downloadBackup rejects HTTP 200 non-SQLite HTML responses immediately after 16-byte header check
+	//    without clobbering existing backup or streaming full body to disk, AND refuses overwriting active DB.
 	htmlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(strings.Repeat("<html><body>SSO Login Page</body></html>\n", 10)))
+		flusher, _ := w.(http.Flusher)
+		for i := 0; i < 64; i++ {
+			if _, wErr := w.Write([]byte(strings.Repeat("<html><body>SSO Login Page</body></html>\n", 256))); wErr != nil {
+				break
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
 	}))
 	defer htmlSrv.Close()
 
@@ -359,12 +382,18 @@ func TestRemoteClientURLCanonicalizationBackupMagicAndPostCommitWarn(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rcHTML.downloadBackup(context.Background(), existingBak); err == nil || !strings.Contains(err.Error(), "not a valid SQLite") {
+	if _, err := rcHTML.downloadBackup(context.Background(), existingBak, ""); err == nil || !strings.Contains(err.Error(), "not a valid SQLite") {
 		t.Fatalf("expected SQLite magic header error, got %v", err)
 	}
 	gotExisting, _ := os.ReadFile(existingBak)
 	if !bytes.Equal(gotExisting, sentinel) {
 		t.Fatalf("expected existing backup file untouched on invalid download")
+	}
+	if _, err := rcHTML.downloadBackup(context.Background(), existingBak, existingBak); err == nil || !strings.Contains(err.Error(), "refusing to overwrite local SQLite") {
+		t.Fatalf("expected active DB overwrite guard error, got %v", err)
+	}
+	if _, err := rcHTML.downloadBackup(context.Background(), existingBak+"-wal", existingBak); err == nil || !strings.Contains(err.Error(), "refusing to overwrite local SQLite") {
+		t.Fatalf("expected active DB WAL overwrite guard error, got %v", err)
 	}
 
 	// 4. Post-commit PR sync outage returns 200 OK with pr_sync_warning AND still downloads auto-backup!
@@ -524,7 +553,7 @@ func TestRound2CLISubcommandGuardWarningsAndShortTimeoutBackup(t *testing.T) {
 
 func TestConvergenceURLForceQueryTimeoutGraceAndNegativeFlags(t *testing.T) {
 	// 1. Bare trailing '?' (ForceQuery) is stripped cleanly from BaseURL & joined endpoints
-	for _, rawURL := range []string{"https://hub.example.com?", "hub.example.com/?", "https://hub.example.com/subpath/?"} {
+	for _, rawURL := range []string{"https://hub.example.com?", "https://hub.example.com/?", "https://hub.example.com/subpath/?"} {
 		rc, err := newRemoteClient(remoteConfig{BaseURL: rawURL}, 10*time.Second)
 		if err != nil {
 			t.Fatalf("newRemoteClient(%q) unexpected error: %v", rawURL, err)
@@ -588,5 +617,151 @@ func TestConvergenceURLForceQueryTimeoutGraceAndNegativeFlags(t *testing.T) {
 	}
 	if gotBackupTimeoutHdr != "600000" {
 		t.Fatalf("expected X-Triage-Timeout-Ms=600000 for --timeout 10m, got %q", gotBackupTimeoutHdr)
+	}
+}
+
+func TestLocalDryRunWithoutDBAndBackfillNotesIntentPreservesRetriage(t *testing.T) {
+	tmp := t.TempDir()
+
+	// 1. Local triage --dry-run with missing --db does NOT seed embedded initial_dataset.json
+	missingDB := filepath.Join(tmp, "nonexistent.db")
+	t.Setenv("TRIAGE_HUB_URL", "")
+	t.Setenv("TRIAGE_HUB_TOKEN", "")
+	t.Setenv("TRIAGE_HUB_DB", missingDB)
+
+	dryDecBytes, _ := json.Marshal(model.BatchTriageDecisions{
+		Overrides: map[string]model.TriagePatchRequest{
+			"999999": {
+				Cat:       "HARD",
+				Severity:  "MAJOR",
+				Subsystem: "logical_rewrite",
+				Note:      &model.LocalizedNote{ZhCN: "代价模型外连接基数推导未折算空值过滤导致选错索引", En: "Outer-join cost derivation misses null filter factor causing wrong index choice"},
+			},
+		},
+	})
+	var dryOut, dryErr bytes.Buffer
+	if err := executeTriage([]string{"--stdin", "--dry-run"}, bytes.NewReader(dryDecBytes), &dryOut, &dryErr); err != nil {
+		t.Fatalf("expected offline local --dry-run without DB to succeed without seeding embedded dataset, got %v", err)
+	}
+	if !strings.Contains(dryOut.String(), `"db_validated": false`) {
+		t.Fatalf("expected db_validated=false when local DB does not exist, got %s", dryOut.String())
+	}
+
+	// 2. Setup Machine A with an active issue #81001 that is missing notes AND has needs_retriage=true
+	dbPathA := filepath.Join(tmp, "notes_a.db")
+	stA, err := store.Open(dbPathA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stA.Close()
+	if err := stA.IngestSyncedDataset(model.Dataset{
+		SyncMeta: model.SyncMeta{SchemaVersion: 2, SnapshotUTC: "2026-11-12T10:00:00Z"},
+		Records: []model.IssueRecord{
+			{
+				Number:      81001,
+				Title:       "planner: missing bilingual note while flagged for retriage",
+				Author:      "alice",
+				Created:     "2026-11-01",
+				CreatedAt:   "2026-11-01T00:00:00Z",
+				UpdatedAt:   "2026-11-12T09:50:00Z",
+				Labels:      []string{"sig/planner", "type/bug", "severity/major"},
+				IsCanonical: true,
+				Cat:         "MEDIUM",
+				Severity:    "MAJOR",
+				GHSeverity:  "major",
+				Subsystem:   "logical_rewrite",
+				PRs:         []model.LinkedPRRef{{Repo: "pingcap/tidb", Num: 81999, State: "OPEN"}},
+			},
+		},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Trigger needs_retriage on #81001 via PR #81999 transitioning OPEN -> MERGED after baseline
+	postBaseTS := time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
+	if err := stA.UpsertPRStatuses([]model.PRStatus{
+		{
+			Repo:      "pingcap/tidb",
+			Num:       81999,
+			State:     "MERGED",
+			UpdatedAt: postBaseTS,
+			MergedAt:  postBaseTS,
+		},
+	}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	srvA := server.New(stA, syncer.NewWithRunner(stA, &fakeGraphQLRunner{}), server.Options{AuthToken: "notes-tok"})
+	httpA := httptest.NewServer(srvA.Handler())
+	defer httpA.Close()
+
+	t.Setenv("TRIAGE_HUB_URL", httpA.URL)
+	t.Setenv("TRIAGE_HUB_TOKEN", "notes-tok")
+
+	// 2a. `pending --re-triage 81001` leaves decisions_template.overrides empty ({})
+	var rtOut, rtErr bytes.Buffer
+	if err := executePending([]string{"--re-triage", "81001", "--compact", "--enrich-prs=false"}, &rtOut, &rtErr); err != nil {
+		t.Fatalf("pending --re-triage failed: %v", err)
+	}
+	var rtBundle struct {
+		DecisionsTemplate model.BatchTriageDecisions `json:"decisions_template"`
+	}
+	if err := json.Unmarshal(rtOut.Bytes(), &rtBundle); err != nil {
+		t.Fatal(err)
+	}
+	if len(rtBundle.DecisionsTemplate.Overrides) != 0 {
+		t.Fatalf("expected empty decisions_template.overrides for --re-triage, got %+v", rtBundle.DecisionsTemplate.Overrides)
+	}
+
+	// 2b. `pending --backfill-notes 5` emits decisions_template.notes (NOT overrides)
+	var bfOut, bfErr bytes.Buffer
+	if err := executePending([]string{"--backfill-notes", "5", "--compact", "--enrich-prs=false"}, &bfOut, &bfErr); err != nil {
+		t.Fatalf("pending --backfill-notes failed: %v", err)
+	}
+	var bfBundle struct {
+		BackfillCount     int                        `json:"backfill_count"`
+		DecisionsTemplate model.BatchTriageDecisions `json:"decisions_template"`
+	}
+	if err := json.Unmarshal(bfOut.Bytes(), &bfBundle); err != nil {
+		t.Fatal(err)
+	}
+	if bfBundle.BackfillCount != 1 || len(bfBundle.DecisionsTemplate.Notes) != 1 || len(bfBundle.DecisionsTemplate.Overrides) != 0 {
+		t.Fatalf("expected backfill_count=1 in decisions_template.notes and 0 overrides, got %+v", bfBundle)
+	}
+
+	// 2c. Applying `notes` via remote `triage` updates bilingual note WITHOUT clearing needs_retriage,
+	//     and still triggers post-triage auto-backup!
+	bfBundle.DecisionsTemplate.Notes["81001"] = model.NotePatchRequest{
+		ZhCN:              "补充根因说明：外连接谓词下推未保留空值拒绝属性导致结果错误",
+		En:                "Backfilled root cause: outer-join predicate pushdown drops null-rejecting check causing wrong result",
+		IfUnmodifiedSince: bfBundle.DecisionsTemplate.Notes["81001"].IfUnmodifiedSince,
+	}
+	wrappedNotesPayload, _ := json.Marshal(map[string]any{
+		"decisions_template": bfBundle.DecisionsTemplate,
+	})
+	bakNotesPath := filepath.Join(tmp, "notes_backup.db")
+	var trOut, trErr bytes.Buffer
+	if err := executeTriage([]string{"--stdin", "--backup-path", bakNotesPath}, bytes.NewReader(wrappedNotesPayload), &trOut, &trErr); err != nil {
+		t.Fatalf("remote triage with notes failed: %v", err)
+	}
+	if !strings.Contains(trOut.String(), `"noted_issues"`) || !strings.Contains(trErr.String(), "[backup] saved remote SQLite snapshot") {
+		t.Fatalf("expected noted_issues and auto-backup on notes triage, stdout=%s stderr=%s", trOut.String(), trErr.String())
+	}
+
+	dsAfter, err := stA.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dsAfter.Records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(dsAfter.Records))
+	}
+	rec := dsAfter.Records[0]
+	if rec.Note == nil || !strings.Contains(rec.Note.En, "Backfilled root cause") {
+		t.Fatalf("expected backfilled note saved, got %+v", rec.Note)
+	}
+	if !rec.NeedsRetriage {
+		t.Fatalf("expected notes-only patch NOT to clear needs_retriage on #81001, got NeedsRetriage=false")
+	}
+	if rec.ManualOverride {
+		t.Fatalf("expected notes-only patch NOT to set ManualOverride=true on #81001")
 	}
 }

@@ -534,13 +534,37 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 		t.Fatalf("expected untrusted peer X-Forwarded-Proto to be ignored (Secure=false), got %+v", extLoginRec.Result().Cookies())
 	}
 
-	// Trusted loopback reverse proxy sets Secure cookie via X-Forwarded-Proto
+	// Without TrustProxy=true, even loopback RemoteAddr ignores X-Forwarded-Proto (Secure=false)
+	loopLogin := httptest.NewRequest(http.MethodPost, "/api/session/login", bytes.NewBufferString(`{"token":"secret-maint-token"}`))
+	loopLogin.RemoteAddr = "127.0.0.1:54321"
+	loopLogin.Header.Set("Content-Type", "application/json")
+	loopLogin.Header.Set("X-Forwarded-Proto", "https")
+	loopRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(loopRec, loopLogin)
+	if loopRec.Code != http.StatusOK || loopRec.Result().Cookies()[0].Secure {
+		t.Fatalf("expected loopback peer without TrustProxy=true to ignore X-Forwarded-Proto (Secure=false), got %+v", loopRec.Result().Cookies())
+	}
+
+	// With TrustProxy=true, rightmost X-Forwarded-Proto / X-Forwarded-Host hop wins (blocking leftmost client spoofing)
+	proxySrv := New(st, syncer.New(st), Options{
+		WebDir:     filepath.Join(tmp, "nonexistent_web_dir"),
+		AuthToken:  "secret-maint-token",
+		TrustProxy: true,
+	})
+	spoofProtoLogin := httptest.NewRequest(http.MethodPost, "/api/session/login", bytes.NewBufferString(`{"token":"secret-maint-token"}`))
+	spoofProtoLogin.Header.Set("Content-Type", "application/json")
+	spoofProtoLogin.Header.Set("X-Forwarded-Proto", "https, http")
+	spoofProtoRec := httptest.NewRecorder()
+	proxySrv.Handler().ServeHTTP(spoofProtoRec, spoofProtoLogin)
+	if spoofProtoRec.Code != http.StatusOK || spoofProtoRec.Result().Cookies()[0].Secure {
+		t.Fatalf("expected rightmost hop 'http' in 'https, http' to set Secure=false, got %+v", spoofProtoRec.Result().Cookies())
+	}
+
 	okLogin := httptest.NewRequest(http.MethodPost, "/api/session/login", bytes.NewBufferString(`{"token":"secret-maint-token"}`))
-	okLogin.RemoteAddr = "127.0.0.1:54321"
 	okLogin.Header.Set("Content-Type", "application/json")
-	okLogin.Header.Set("X-Forwarded-Proto", "https, http")
+	okLogin.Header.Set("X-Forwarded-Proto", "http, https")
 	okRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(okRec, okLogin)
+	proxySrv.Handler().ServeHTTP(okRec, okLogin)
 	if okRec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for valid login token, got %d: %s", okRec.Code, okRec.Body.String())
 	}
@@ -549,7 +573,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 		t.Fatalf("expected Secure HttpOnly SameSiteLax cookie, got %+v", cookies)
 	}
 
-	// Untrusted external peer cannot spoof X-Forwarded-Host to bypass Origin CSRF guard
+	// Untrusted server (TrustProxy=false) rejects X-Forwarded-Host bypass
 	spoofPatch := httptest.NewRequest(http.MethodPatch, "http://internal:8787/api/issues/72001/triage", bytes.NewBufferString(`{"cat":"HARD","severity":"CRITICAL","subsystem":"logical_rewrite"}`))
 	spoofPatch.RemoteAddr = "203.0.113.9:54321"
 	spoofPatch.Header.Set("Content-Type", "application/json")
@@ -562,18 +586,29 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 		t.Fatalf("expected 403 when untrusted peer spoofs X-Forwarded-Host, got %d", spoofRec.Code)
 	}
 
-	// Cookie unlocks browser PATCH behind trusted loopback X-Forwarded-Host reverse proxy
+	// Trusted proxy server accepts rightmost X-Forwarded-Host and rejects leftmost spoofed X-Forwarded-Host
+	leftmostSpoofPatch := httptest.NewRequest(http.MethodPatch, "http://internal:8787/api/issues/72001/triage", bytes.NewBufferString(`{"cat":"HARD","severity":"CRITICAL","subsystem":"logical_rewrite"}`))
+	leftmostSpoofPatch.Header.Set("Content-Type", "application/json")
+	leftmostSpoofPatch.Header.Set("Origin", "https://evil.example")
+	leftmostSpoofPatch.Header.Set("X-Forwarded-Proto", "https")
+	leftmostSpoofPatch.Header.Set("X-Forwarded-Host", "evil.example, hub.example.com")
+	leftmostSpoofPatch.AddCookie(cookies[0])
+	leftmostSpoofRec := httptest.NewRecorder()
+	proxySrv.Handler().ServeHTTP(leftmostSpoofRec, leftmostSpoofPatch)
+	if leftmostSpoofRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when leftmost X-Forwarded-Host is spoofed, got %d", leftmostSpoofRec.Code)
+	}
+
 	patchReq := httptest.NewRequest(http.MethodPatch, "http://internal:8787/api/issues/72001/triage", bytes.NewBufferString(`{"cat":"HARD","severity":"CRITICAL","subsystem":"logical_rewrite","note":{"zh-CN":"已校准","en":"Calibrated"}}`))
-	patchReq.RemoteAddr = "127.0.0.1:54321"
 	patchReq.Header.Set("Content-Type", "application/json")
 	patchReq.Header.Set("Origin", "https://hub.example.com")
-	patchReq.Header.Set("X-Forwarded-Proto", "https")
-	patchReq.Header.Set("X-Forwarded-Host", "hub.example.com, internal:8787")
+	patchReq.Header.Set("X-Forwarded-Proto", "http, https")
+	patchReq.Header.Set("X-Forwarded-Host", "spoofed.example, hub.example.com")
 	patchReq.AddCookie(cookies[0])
 	patchRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(patchRec, patchReq)
+	proxySrv.Handler().ServeHTTP(patchRec, patchReq)
 	if patchRec.Code != http.StatusOK {
-		t.Fatalf("expected 200 for cookie-authenticated PATCH, got %d: %s", patchRec.Code, patchRec.Body.String())
+		t.Fatalf("expected 200 for cookie-authenticated PATCH via rightmost X-Forwarded-Host, got %d: %s", patchRec.Code, patchRec.Body.String())
 	}
 
 	// 4. Bearer token unlocks Machine B endpoints (/api/triage/pending & /api/admin/backup.db)
@@ -819,5 +854,155 @@ func TestBackupTimeoutHeaderAndPreMutationPRFetch(t *testing.T) {
 	srv.Handler().ServeHTTP(bakRec, bakReq)
 	if bakRec.Code != http.StatusOK || bakRec.Body.Len() < 100 {
 		t.Fatalf("expected 200 OK SQLite snapshot with X-Triage-Timeout-Ms=600000, got code=%d len=%d", bakRec.Code, bakRec.Body.Len())
+	}
+}
+
+func TestProxyTrustRightmostHopSameSiteReadHTTP2DeleteAndPendingConflict(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "sec_bounds.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.IngestSyncedDataset(model.Dataset{
+		SyncMeta: model.SyncMeta{SchemaVersion: 2, SnapshotUTC: "2026-11-12T10:00:00Z"},
+		Records: []model.IssueRecord{{
+			Number:         89001,
+			Title:          "planner: issue with manual override",
+			Author:         "alice",
+			Created:        "2026-11-12",
+			CreatedAt:      "2026-11-12T10:00:00Z",
+			UpdatedAt:      "2026-11-12T10:00:00Z",
+			Labels:         []string{"sig/planner", "type/bug"},
+			IsCanonical:    true,
+			Cat:            "MEDIUM",
+			Severity:       "MAJOR",
+			Subsystem:      "logical_rewrite",
+			ManualOverride: true,
+			Note:           &model.LocalizedNote{ZhCN: "测试HTTP/2空DELETE", En: "Test HTTP/2 empty DELETE"},
+		}},
+	}, []model.PendingCandidate{{
+		Number:    89101,
+		Title:     "planner: pending candidate conflict test",
+		Author:    "bob",
+		CreatedAt: "2026-11-12T10:00:00Z",
+		UpdatedAt: "2026-11-12T10:05:00Z",
+		Labels:    []string{"sig/planner", "type/bug"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// Ensure an override row exists so DELETE /api/issues/89001/triage exercises ResetIssueOverride
+	if _, err := st.ApplyIssueOverride(89001, model.TriagePatchRequest{
+		Cat:       "HARD",
+		Severity:  "MAJOR",
+		Subsystem: "logical_rewrite",
+		Note:      &model.LocalizedNote{ZhCN: "覆盖行用于重置测试", En: "Override row for reset test"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	sy := syncer.NewWithRunner(st, &mergedPRGraphQLRunner{})
+
+	// 1. TrustProxy=false ignores X-Forwarded-Proto even from non-loopback peer (Secure=false)
+	srvUntrusted := New(st, sy, Options{AuthToken: "sec-tok", TrustProxy: false})
+	loginUntrusted := httptest.NewRequest(http.MethodPost, "http://10.0.0.10:8787/api/session/login", strings.NewReader(`{"token":"sec-tok"}`))
+	loginUntrusted.RemoteAddr = "10.0.0.1:54321"
+	loginUntrusted.Header.Set("Content-Type", "application/json")
+	loginUntrusted.Header.Set("X-Forwarded-Proto", "https")
+	recUntrusted := httptest.NewRecorder()
+	srvUntrusted.Handler().ServeHTTP(recUntrusted, loginUntrusted)
+	if recUntrusted.Code != http.StatusOK || len(recUntrusted.Result().Cookies()) != 1 || recUntrusted.Result().Cookies()[0].Secure {
+		t.Fatalf("expected Secure=false when TrustProxy=false, got code=%d cookies=%+v", recUntrusted.Code, recUntrusted.Result().Cookies())
+	}
+
+	// 2. TrustProxy=true reads RIGHTMOST hop of X-Forwarded-Proto & enforces scheme match in Origin
+	srvTrusted := New(st, sy, Options{AuthToken: "sec-tok", TrustProxy: true})
+	loginRightHTTPS := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/api/session/login", strings.NewReader(`{"token":"sec-tok"}`))
+	loginRightHTTPS.Header.Set("Content-Type", "application/json")
+	loginRightHTTPS.Header.Set("X-Forwarded-Proto", "http, https")
+	loginRightHTTPS.Header.Set("X-Forwarded-Host", "evil.example.com, hub.example.com")
+	loginRightHTTPS.Header.Set("Origin", "https://hub.example.com")
+	recRightHTTPS := httptest.NewRecorder()
+	srvTrusted.Handler().ServeHTTP(recRightHTTPS, loginRightHTTPS)
+	if recRightHTTPS.Code != http.StatusOK || len(recRightHTTPS.Result().Cookies()) != 1 || !recRightHTTPS.Result().Cookies()[0].Secure {
+		t.Fatalf("expected Secure=true from rightmost X-Forwarded-Proto=https, got code=%d body=%s", recRightHTTPS.Code, recRightHTTPS.Body.String())
+	}
+	maintCookie := recRightHTTPS.Result().Cookies()[0]
+
+	// Scheme mismatch in Origin (http vs https) is rejected with 403
+	badSchemeMut := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/api/session/logout", strings.NewReader(`{}`))
+	badSchemeMut.Header.Set("Content-Type", "application/json")
+	badSchemeMut.Header.Set("X-Forwarded-Proto", "https")
+	badSchemeMut.Header.Set("X-Forwarded-Host", "hub.example.com")
+	badSchemeMut.Header.Set("Origin", "http://hub.example.com")
+	badSchemeMut.AddCookie(maintCookie)
+	recBadScheme := httptest.NewRecorder()
+	srvTrusted.Handler().ServeHTTP(recBadScheme, badSchemeMut)
+	if recBadScheme.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on scheme-mismatched Origin, got %d", recBadScheme.Code)
+	}
+
+	// 3. Cross-site Fetch Metadata (`Sec-Fetch-Site: cross-site`) is rejected with 403 + CORP: same-origin on all session-varying GETs
+	for _, ep := range []string{"/bootstrap.js", "/api/session", "/api/state", "/api/triage/pending", "/api/excluded", "/api/admin/backup.db"} {
+		csReq := httptest.NewRequest(http.MethodGet, ep, nil)
+		csReq.AddCookie(maintCookie)
+		csReq.Header.Set("Sec-Fetch-Site", "cross-site")
+		csRec := httptest.NewRecorder()
+		srvUntrusted.Handler().ServeHTTP(csRec, csReq)
+		if csRec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 on cross-site GET %s, got %d", ep, csRec.Code)
+		}
+		if csRec.Header().Get("Cross-Origin-Resource-Policy") != "same-origin" {
+			t.Fatalf("expected Cross-Origin-Resource-Policy=same-origin on %s, got %q", ep, csRec.Header().Get("Cross-Origin-Resource-Policy"))
+		}
+	}
+
+	// 4. Anonymous GET /api/status?check_gh=0 omits pending_count/retriage_count while authenticated sees them
+	anonStatReq := httptest.NewRequest(http.MethodGet, "/api/status?check_gh=0", nil)
+	anonStatRec := httptest.NewRecorder()
+	srvUntrusted.Handler().ServeHTTP(anonStatRec, anonStatReq)
+	if anonStatRec.Code != http.StatusOK || strings.Contains(anonStatRec.Body.String(), `"pending_count"`) {
+		t.Fatalf("expected anonymous /api/status to omit workbench counts, got code=%d body=%s", anonStatRec.Code, anonStatRec.Body.String())
+	}
+
+	// 5. HTTP/2 empty DELETE (`ContentLength = -1`, empty Content-Type, 0 bytes) succeeds,
+	//    while chunked non-empty POST (`ContentLength = -1`, empty Content-Type, body="a=1") fails with 415!
+	h2Del := httptest.NewRequest(http.MethodDelete, "/api/issues/89001/triage", strings.NewReader(""))
+	h2Del.ContentLength = -1
+	h2Del.Header.Del("Content-Type")
+	h2Del.AddCookie(maintCookie)
+	h2DelRec := httptest.NewRecorder()
+	srvUntrusted.Handler().ServeHTTP(h2DelRec, h2Del)
+	if h2DelRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on HTTP/2 empty DELETE (ContentLength=-1), got %d: %s", h2DelRec.Code, h2DelRec.Body.String())
+	}
+
+	chunkedForm := httptest.NewRequest(http.MethodPost, "/api/issues/89001/retriage/ack", strings.NewReader("a=1"))
+	chunkedForm.ContentLength = -1
+	chunkedForm.Header.Del("Content-Type")
+	chunkedForm.AddCookie(maintCookie)
+	chunkedFormRec := httptest.NewRecorder()
+	srvUntrusted.Handler().ServeHTTP(chunkedFormRec, chunkedForm)
+	if chunkedFormRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on chunked body without application/json Content-Type, got %d: %s", chunkedFormRec.Code, chunkedFormRec.Body.String())
+	}
+
+	// 6. POST /api/pending/89101/resolve with stale if_unmodified_since returns 409 Conflict
+	stalePendReq := httptest.NewRequest(http.MethodPost, "/api/pending/89101/resolve", strings.NewReader(`{
+		"action": "accept",
+		"cat": "EASY",
+		"severity": "MINOR",
+		"subsystem": "statistics",
+		"if_unmodified_since": "2020-01-01T00:00:00.000000000Z",
+		"note": {"zh-CN": "测试并发水位冲突返回409", "en": "Test stale sync_watermark returns 409 Conflict"}
+	}`))
+	stalePendReq.Header.Set("Content-Type", "application/json")
+	stalePendReq.AddCookie(maintCookie)
+	stalePendRec := httptest.NewRecorder()
+	srvUntrusted.Handler().ServeHTTP(stalePendRec, stalePendReq)
+	if stalePendRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on stale pending if_unmodified_since, got %d: %s", stalePendRec.Code, stalePendRec.Body.String())
 	}
 }

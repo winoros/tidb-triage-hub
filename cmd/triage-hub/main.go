@@ -40,9 +40,10 @@ Usage:
   triage-hub backup [flags]       Create an online SQLite backup snapshot (from --remote or local --db)
 
 Remote / Split-Deployment Environment Variables:
-  TRIAGE_HUB_URL       Remote Machine A base URL (enables remote HTTP mode for CLI subcommands)
-  TRIAGE_HUB_TOKEN     Shared maintainer token (server auth on ` + "`serve`" + `; Bearer token on CLI)
-  GH_TOKEN / GITHUB_TOKEN  GitHub PAT for pure-Go GraphQL sync without requiring ` + "`gh`" + ` CLI binary
+  TRIAGE_HUB_URL                  Remote Machine A base URL with explicit http:// or https:// scheme
+  TRIAGE_HUB_TOKEN                Shared maintainer token (server auth on ` + "`serve`" + `; Bearer token on CLI)
+  TRIAGE_HUB_ALLOW_INSECURE_HTTP  Set to 1 to allow sending token over non-loopback plain http://
+  GH_TOKEN / GITHUB_TOKEN         GitHub PAT for pure-Go GraphQL sync without requiring ` + "`gh`" + ` CLI binary
 
 Run "triage-hub <command> -h" for command-specific flags.
 `
@@ -194,7 +195,7 @@ func newServeFlagSet() *flag.FlagSet {
 	fs.String("seed-json", "seed/initial_dataset.json", "Initial seed dataset JSON (falls back to embedded seed if absent)")
 	fs.String("scripts-dir", "", "Deprecated (no-op): sync is now pure Go")
 	fs.String("auth-token", strings.TrimSpace(os.Getenv("TRIAGE_HUB_TOKEN")), "Shared maintainer token required for RW mutations & remote CLI (env: TRIAGE_HUB_TOKEN)")
-	fs.Bool("trust-proxy", envBoolDefault("TRIAGE_HUB_TRUST_PROXY", false), "Trust X-Forwarded-Proto / X-Forwarded-Host from non-loopback reverse proxies (env: TRIAGE_HUB_TRUST_PROXY)")
+	fs.Bool("trust-proxy", envBoolDefault("TRIAGE_HUB_TRUST_PROXY", false), "Trust rightmost X-Forwarded-Proto / X-Forwarded-Host hop from reverse proxies (env: TRIAGE_HUB_TRUST_PROXY)")
 	fs.Bool("readonly", false, "Serve dashboard in read-only mode (disable all triage edits & sync mutations)")
 	fs.Bool("sync-prs-once", false, "Fetch and classify all open PR statuses once and exit")
 	fs.Bool("sync-issues-once", false, "Run dual-stream incremental issue + PR sync once and exit")
@@ -716,7 +717,7 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 		if err := json.Unmarshal(raw, &dec); err != nil {
 			return fmt.Errorf("invalid decisions JSON: %w", err)
 		}
-		if len(dec.NewIssues) == 0 && len(dec.ExcludeIssues) == 0 && len(dec.Overrides) == 0 && len(dec.AckRetriage) == 0 && len(dec.ManualPRLinks) == 0 {
+		if len(dec.NewIssues) == 0 && len(dec.ExcludeIssues) == 0 && len(dec.Overrides) == 0 && len(dec.Notes) == 0 && len(dec.AckRetriage) == 0 && len(dec.ManualPRLinks) == 0 {
 			var wrapped struct {
 				DecisionsTemplate *model.BatchTriageDecisions `json:"decisions_template"`
 			}
@@ -758,6 +759,7 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 	if len(cleaned.NewIssues) == 0 &&
 		len(cleaned.ExcludeIssues) == 0 &&
 		len(cleaned.Overrides) == 0 &&
+		len(cleaned.Notes) == 0 &&
 		len(cleaned.AckRetriage) == 0 &&
 		len(cleaned.ManualPRLinks) == 0 {
 		return fmt.Errorf("no actionable entries remaining after validation (check if all entries were skipped by --skip-todo)")
@@ -775,8 +777,8 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 		syncFlag := *syncNewPRs
 		mqFlag := *minQuota
 		out, err := rc.postTriageDecisions(context.Background(), syncer.BatchTriageExecuteRequest{
-			Decisions:      dec,
-			SkipTodo:       *skipTodo,
+			Decisions:      cleaned,
+			SkipTodo:       false,
 			AllowEmptyNote: *allowEmptyNote,
 			StrictNotes:    *strictNotes,
 			SkipConflicts:  effectiveSkipConflicts,
@@ -794,11 +796,15 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 		writePrettyJSONTo(stdout, out)
 
 		if !*dryRun && *autoBackup && strings.TrimSpace(*backupPath) != "" && hasCommittedRemoteMutations(out) {
-			bakRC, bakRCErr := newRemoteClient(*rem, 45*time.Second)
+			bakTimeout := *timeout
+			if bakTimeout < 2*time.Minute {
+				bakTimeout = 2 * time.Minute
+			}
+			bakRC, bakRCErr := newRemoteClient(*rem, bakTimeout)
 			if bakRCErr != nil {
 				bakRC = rc
 			}
-			nBytes, bakErr := bakRC.downloadBackup(context.Background(), *backupPath)
+			nBytes, bakErr := bakRC.downloadBackup(context.Background(), *backupPath, *dbPath)
 			if bakErr != nil {
 				fmt.Fprintf(stderr, "[warn] post-triage remote backup failed: %v\n", bakErr)
 			} else {
@@ -815,15 +821,20 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 	if *dryRun {
 		dbChecked := false
 		var dryConflicts []model.TriageConflict
-		sp, fb := resolveSeedFallback(fs, *seedPath)
 		dbExists := false
 		if strings.TrimSpace(*dbPath) != "" {
 			if _, statErr := os.Stat(*dbPath); statErr == nil {
 				dbExists = true
+			} else if !os.IsNotExist(statErr) {
+				return fmt.Errorf("stat sqlite db %s: %w", *dbPath, statErr)
 			}
 		}
-		if dbExists || strings.TrimSpace(sp) != "" || len(fb) > 0 {
-			st, _, cleanup, openErr := openStoreAndSyncerMaybeDryRun(*dbPath, sp, fb, true)
+		explicitSeedPath := ""
+		if isFlagExplicit(fs, "seed-json") {
+			explicitSeedPath = strings.TrimSpace(*seedPath)
+		}
+		if dbExists || explicitSeedPath != "" {
+			st, _, cleanup, openErr := openStoreAndSyncerMaybeDryRun(*dbPath, explicitSeedPath, nil, true)
 			if openErr != nil {
 				return fmt.Errorf("open dataset for dry-run check: %w", openErr)
 			}
@@ -841,6 +852,7 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 			"new_issues_count":    len(cleaned.NewIssues),
 			"exclude_count":       len(cleaned.ExcludeIssues),
 			"overrides_count":     len(cleaned.Overrides),
+			"notes_count":         len(cleaned.Notes),
 			"ack_retriage_count":  len(cleaned.AckRetriage),
 			"manual_pr_links":     len(cleaned.ManualPRLinks),
 			"validation_warnings": warnings,
@@ -920,7 +932,7 @@ func executeBackup(args []string, stdout io.Writer) error {
 		if err != nil {
 			return err
 		}
-		nBytes, err := rc.downloadBackup(context.Background(), dest)
+		nBytes, err := rc.downloadBackup(context.Background(), dest, *dbPath)
 		if err != nil {
 			return err
 		}

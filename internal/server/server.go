@@ -13,7 +13,6 @@ import (
 	"io/fs"
 	"log"
 	"mime"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -60,7 +59,6 @@ type Server struct {
 	hasAuthToken  bool
 	authTokenHash [32]byte
 	sessionDigest string
-	backupMu      sync.Mutex
 	indexCacheMu  sync.RWMutex
 	indexCache    *cachedIndexAssets
 	mux           *http.ServeMux
@@ -129,11 +127,18 @@ func sessionCookieDigest(secret string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func firstHeaderHop(val string) string {
-	if idx := strings.IndexByte(val, ','); idx >= 0 {
+func lastHeaderHop(val string) string {
+	for {
+		idx := strings.LastIndexByte(val, ',')
+		if idx < 0 {
+			return strings.TrimSpace(val)
+		}
+		tail := strings.TrimSpace(val[idx+1:])
+		if tail != "" {
+			return tail
+		}
 		val = val[:idx]
 	}
-	return strings.TrimSpace(val)
 }
 
 func (s *Server) verifySecretToken(candidate string) bool {
@@ -144,21 +149,8 @@ func (s *Server) verifySecretToken(candidate string) bool {
 	return subtle.ConstantTimeCompare(got[:], s.authTokenHash[:]) == 1
 }
 
-func isLoopbackPeer(remoteAddr string) bool {
-	raw := strings.TrimSpace(remoteAddr)
-	if raw == "" {
-		return false
-	}
-	host := raw
-	if h, _, err := net.SplitHostPort(raw); err == nil {
-		host = h
-	}
-	ip := net.ParseIP(strings.Trim(host, "[]"))
-	return ip != nil && ip.IsLoopback()
-}
-
-func (s *Server) isTrustedProxyPeer(r *http.Request) bool {
-	return s.opts.TrustProxy || isLoopbackPeer(r.RemoteAddr)
+func (s *Server) isTrustedProxyPeer(_ *http.Request) bool {
+	return s.opts.TrustProxy
 }
 
 func (s *Server) effectiveRequestScheme(r *http.Request) string {
@@ -166,7 +158,7 @@ func (s *Server) effectiveRequestScheme(r *http.Request) string {
 		return "https"
 	}
 	if s.isTrustedProxyPeer(r) {
-		xfp := firstHeaderHop(r.Header.Get("X-Forwarded-Proto"))
+		xfp := lastHeaderHop(r.Header.Get("X-Forwarded-Proto"))
 		if strings.EqualFold(xfp, "https") {
 			return "https"
 		}
@@ -275,18 +267,7 @@ func (s *Server) requireSyncSession(w http.ResponseWriter, r *http.Request) (mod
 }
 
 func (s *Server) writeSessionCookie(w http.ResponseWriter, r *http.Request, value string, maxAge int) {
-	secure := false
-	if r.TLS != nil {
-		secure = true
-	} else if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && origin != "null" {
-		if u, err := url.Parse(origin); err == nil && u.Scheme != "" {
-			secure = strings.EqualFold(u.Scheme, "https")
-		} else {
-			secure = s.effectiveRequestScheme(r) == "https"
-		}
-	} else {
-		secure = s.effectiveRequestScheme(r) == "https"
-	}
+	secure := s.effectiveRequestScheme(r) == "https"
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    value,
@@ -513,6 +494,8 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	w.Header().Set("X-Frame-Options", "DENY")
 	_, _ = io.WriteString(w, assets.htmlPrefix)
 	if assets.hasPlaceholder {
 		_, _ = io.WriteString(w, "<script>\n")
@@ -524,6 +507,9 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBootstrapJS(w http.ResponseWriter, r *http.Request) {
+	if !s.guardSameSiteRead(w, r) {
+		return
+	}
 	bootJS, err := s.buildBootstrapPayloadJS(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -535,6 +521,9 @@ func (s *Server) handleBootstrapJS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
+	if !s.guardSameSiteRead(w, r) {
+		return
+	}
 	if s.hasInvalidAuthHeader(r) {
 		writeErr(w, http.StatusUnauthorized, fmt.Errorf("unauthorized: invalid bearer token"))
 		return
@@ -597,7 +586,7 @@ func (s *Server) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 	if dbDisp == "" {
 		dbDisp = "remote:tidb_triage.db"
 	}
-	out, err := s.syncer.BuildStatusReport(r.Context(), dbDisp, wantGH)
+	out, err := s.syncer.BuildStatusReportWithOptions(r.Context(), dbDisp, wantGH, sess.Permissions.CanTriage)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -605,18 +594,13 @@ func (s *Server) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 	if wantGHReq && !wantGH && s.opts.ReadOnly {
 		out["gh_check_error"] = "GitHub quota check is disabled on read-only server"
 	}
-	if !sess.Permissions.CanTriage {
-		if dbMap, ok := out["database"].(map[string]any); ok {
-			dbMap["db_path"] = "redacted"
-			delete(dbMap, "pending_numbers")
-			delete(dbMap, "retriage_numbers")
-		}
-		out["recent_sync_runs"] = []store.SyncRunRecord{}
-	}
 	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleGetTriagePending(w http.ResponseWriter, r *http.Request) {
+	if !s.guardSameSiteRead(w, r) {
+		return
+	}
 	if _, ok := s.requireTriageSession(w, r); !ok {
 		return
 	}
@@ -715,15 +699,15 @@ func (s *Server) handlePostTriageDecisions(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleGetBackupDB(w http.ResponseWriter, r *http.Request) {
+	if !s.guardSameSiteRead(w, r) {
+		return
+	}
 	if _, ok := s.requireTriageSession(w, r); !ok {
 		return
 	}
 	reqTimeout := resolveRequestTimeout(r, 2*time.Minute, 30*time.Minute)
 	bakCtx, cancel := context.WithTimeout(r.Context(), reqTimeout)
 	defer cancel()
-
-	s.backupMu.Lock()
-	defer s.backupMu.Unlock()
 
 	stageParent := ""
 	if dbp := strings.TrimSpace(s.store.DBPath()); dbp != "" {
@@ -797,6 +781,9 @@ func (s *Server) handleGetDatasetJSON(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
+	if !s.guardSameSiteRead(w, r) {
+		return
+	}
 	if s.hasInvalidAuthHeader(r) {
 		writeErr(w, http.StatusUnauthorized, fmt.Errorf("unauthorized: invalid bearer token"))
 		return
@@ -823,12 +810,63 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) isSameOriginHeader(r *http.Request, origin string) bool {
+	if origin == "null" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u == nil || u.Host == "" {
+		return false
+	}
+	reqScheme := s.effectiveRequestScheme(r)
+	if !strings.EqualFold(u.Scheme, reqScheme) {
+		return false
+	}
+	originHost := httputil.NormalizeOriginHost(u.Host, u.Scheme)
+	if originHost == "" {
+		return false
+	}
+	if originHost == httputil.NormalizeOriginHost(r.Host, reqScheme) {
+		return true
+	}
+	if s.isTrustedProxyPeer(r) {
+		xfh := httputil.NormalizeOriginHost(lastHeaderHop(r.Header.Get("X-Forwarded-Host")), reqScheme)
+		if xfh != "" && originHost == xfh {
+			return true
+		}
+	}
+	return false
+}
+
+// guardSameSiteRead blocks cross-site XSSI / fetch / subresource exfiltration on sensitive GET endpoints
+// (such as /bootstrap.js, /api/state, /api/triage/pending, /api/excluded, /api/admin/backup.db)
+// while allowing same-origin browser fetches, direct top-level downloads (`Sec-Fetch-Site: none`),
+// and non-browser CLI requests.
+func (s *Server) guardSameSiteRead(w http.ResponseWriter, r *http.Request) bool {
+	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if sfs := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); sfs != "" {
+		if !strings.EqualFold(sfs, "same-origin") && !strings.EqualFold(sfs, "none") {
+			writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: cross-site %s request blocked", r.Method))
+			return false
+		}
+	}
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		if !s.isSameOriginHeader(r, origin) {
+			writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: cross-origin %s request blocked", r.Method))
+			return false
+		}
+	}
+	return true
+}
+
 // guardMutation enforces CSRF defenses on state-changing HTTP endpoints:
 // 1. Sec-Fetch-Site (if sent by browser) must be "same-origin" or "none".
-// 2. Origin (if sent by browser) must have an http/https scheme (no https->http downgrade)
-//    and match normalized r.Host (or X-Forwarded-Host when peer is a trusted proxy).
-// 3. Requests carrying a body or Content-Type header must use "application/json"
-//    (blocking cross-origin HTML form / navigator.sendBeacon simple-request CSRF).
+// 2. Origin (if sent by browser) must match the effective request scheme and host
+//    (or rightmost X-Forwarded-Host when TrustProxy is explicitly enabled).
+// 3. Requests carrying a non-empty body or Content-Type header must use "application/json"
+//    (allowing genuinely empty HTTP/2 DELETE streams with ContentLength == -1 while still
+//    blocking chunked HTML form / navigator.sendBeacon simple-request CSRF).
 func (s *Server) guardMutation(w http.ResponseWriter, r *http.Request) bool {
 	if sfs := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); sfs != "" {
 		if !strings.EqualFold(sfs, "same-origin") && !strings.EqualFold(sfs, "none") {
@@ -837,31 +875,8 @@ func (s *Server) guardMutation(w http.ResponseWriter, r *http.Request) bool {
 		}
 	}
 	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
-		u, err := url.Parse(origin)
-		schemeOK := u != nil && (strings.EqualFold(u.Scheme, "http") || strings.EqualFold(u.Scheme, "https"))
-		if schemeOK && s.effectiveRequestScheme(r) == "https" && !strings.EqualFold(u.Scheme, "https") {
-			schemeOK = false
-		}
-		hostOK := false
-		if schemeOK && u.Host != "" {
-			originHost := httputil.NormalizeOriginHost(u.Host, u.Scheme)
-			reqHost := httputil.NormalizeOriginHost(r.Host, u.Scheme)
-			hostOK = originHost != "" && originHost == reqHost
-			if !hostOK && s.isTrustedProxyPeer(r) {
-				xfh := httputil.NormalizeOriginHost(firstHeaderHop(r.Header.Get("X-Forwarded-Host")), u.Scheme)
-				hostOK = xfh != "" && originHost == xfh
-			}
-		}
-		if origin == "null" || err != nil || !schemeOK || !hostOK {
+		if !s.isSameOriginHeader(r, origin) {
 			writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: cross-origin %s request blocked", r.Method))
-			return false
-		}
-	}
-	rawCT := strings.TrimSpace(r.Header.Get("Content-Type"))
-	if r.ContentLength != 0 || rawCT != "" {
-		mediaType, _, err := mime.ParseMediaType(rawCT)
-		if err != nil || !strings.EqualFold(mediaType, "application/json") {
-			writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: application/json Content-Type required"))
 			return false
 		}
 	}
@@ -871,6 +886,22 @@ func (s *Server) guardMutation(w http.ResponseWriter, r *http.Request) bool {
 			baseW = u.Unwrap()
 		}
 		r.Body = http.MaxBytesReader(baseW, r.Body, 4<<20)
+	}
+	rawCT := strings.TrimSpace(r.Header.Get("Content-Type"))
+	if rawCT != "" || r.ContentLength > 0 {
+		mediaType, _, err := mime.ParseMediaType(rawCT)
+		if err != nil || !strings.EqualFold(mediaType, "application/json") {
+			writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: application/json Content-Type required"))
+			return false
+		}
+	} else if r.ContentLength < 0 && r.Body != nil {
+		var probe [1]byte
+		n, err := r.Body.Read(probe[:])
+		if n > 0 || (err != nil && !errors.Is(err, io.EOF)) {
+			writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: application/json Content-Type required"))
+			return false
+		}
+		r.Body = http.NoBody
 	}
 	return true
 }
@@ -1149,6 +1180,9 @@ func (s *Server) handleExcludeIssue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetExcluded(w http.ResponseWriter, r *http.Request) {
+	if !s.guardSameSiteRead(w, r) {
+		return
+	}
 	if _, ok := s.requireTriageSession(w, r); !ok {
 		return
 	}
@@ -1223,9 +1257,12 @@ func (s *Server) handleResolvePending(w http.ResponseWriter, r *http.Request) {
 	}
 	missingTargets, err := s.store.ResolvePendingCandidateWithTargets(num, req)
 	if err != nil {
-		if errors.Is(err, store.ErrIssueNotFound) {
+		switch {
+		case errors.Is(err, store.ErrOverrideConflict):
+			writeErr(w, http.StatusConflict, err)
+		case errors.Is(err, store.ErrIssueNotFound):
 			writeErr(w, http.StatusNotFound, err)
-		} else {
+		default:
 			writeErr(w, http.StatusBadRequest, err)
 		}
 		return

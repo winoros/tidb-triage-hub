@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,17 +25,22 @@ import (
 	"github.com/winoros/tidb-triage-hub/internal/syncer"
 )
 
-const sqliteHeaderMagic = "SQLite format 3\x00"
+const (
+	sqliteHeaderMagic = "SQLite format 3\x00"
+	maxBackupBytes    = int64(2 << 30) // 2 GiB safety limit for remote backup stream
+)
 
 type remoteConfig struct {
-	BaseURL string
-	Token   string
+	BaseURL           string
+	Token             string
+	AllowInsecureHTTP bool
 }
 
 func bindRemoteFlags(fs *flag.FlagSet) *remoteConfig {
 	cfg := &remoteConfig{}
-	fs.StringVar(&cfg.BaseURL, "remote", strings.TrimSpace(os.Getenv("TRIAGE_HUB_URL")), "Remote triage-hub server URL (env: TRIAGE_HUB_URL)")
+	fs.StringVar(&cfg.BaseURL, "remote", strings.TrimSpace(os.Getenv("TRIAGE_HUB_URL")), "Remote triage-hub server URL with explicit http:// or https:// scheme (env: TRIAGE_HUB_URL)")
 	fs.StringVar(&cfg.Token, "token", strings.TrimSpace(os.Getenv("TRIAGE_HUB_TOKEN")), "Maintainer bearer token for remote server (env: TRIAGE_HUB_TOKEN)")
+	fs.BoolVar(&cfg.AllowInsecureHTTP, "allow-insecure-http", envBoolDefault("TRIAGE_HUB_ALLOW_INSECURE_HTTP", false), "Allow sending bearer token over non-loopback plain http:// (env: TRIAGE_HUB_ALLOW_INSECURE_HTTP)")
 	return cfg
 }
 
@@ -92,6 +98,10 @@ func newRemoteClient(cfg remoteConfig, timeout time.Duration) (*remoteClient, er
 	if err != nil {
 		return nil, err
 	}
+	tok := strings.TrimSpace(cfg.Token)
+	if strings.EqualFold(u.Scheme, "http") && tok != "" && !httputil.IsLoopbackHost(u.Host) && !cfg.AllowInsecureHTTP {
+		return nil, fmt.Errorf("refusing to send bearer token over plain http:// to non-loopback host %q; use https:// or pass --allow-insecure-http (TRIAGE_HUB_ALLOW_INSECURE_HTTP=1)", u.Host)
+	}
 
 	if timeout <= 0 {
 		timeout = 2 * time.Minute
@@ -99,7 +109,7 @@ func newRemoteClient(cfg remoteConfig, timeout time.Duration) (*remoteClient, er
 	return &remoteClient{
 		baseURL:    u.String(),
 		parsedBase: u,
-		token:      strings.TrimSpace(cfg.Token),
+		token:      tok,
 		reqTimeout: timeout,
 		httpCli: &http.Client{
 			CheckRedirect: ghgql.SafeRedirectPolicy,
@@ -148,6 +158,9 @@ func (rc *remoteClient) doJSON(ctx context.Context, method, subpath string, quer
 	req.Header.Set("Accept", "application/json")
 	if bodyReader != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if method != http.MethodGet && method != http.MethodHead {
+		req.Header.Set("X-Triage-CSRF", "1")
 	}
 	if rc.token != "" {
 		req.Header.Set("Authorization", "Bearer "+rc.token)
@@ -282,7 +295,53 @@ func (rc *remoteClient) postTriageDecisions(ctx context.Context, req syncer.Batc
 	return out, nil
 }
 
-func (rc *remoteClient) downloadBackup(ctx context.Context, destPath string) (int64, error) {
+func rejectActiveDBOverwrite(destPath, activeDBPath string) error {
+	activeDBPath = strings.TrimSpace(activeDBPath)
+	if activeDBPath == "" {
+		return nil
+	}
+	// Only guard when activeDBPath (or its WAL/SHM sidecar) actually exists on disk.
+	activeExists := false
+	for _, p := range []string{activeDBPath, activeDBPath + "-wal", activeDBPath + "-shm"} {
+		if _, err := os.Stat(p); err == nil {
+			activeExists = true
+			break
+		}
+	}
+	if !activeExists {
+		return nil
+	}
+
+	destAbs, err := filepath.Abs(destPath)
+	if err != nil {
+		return err
+	}
+	destParentInfo, destParentErr := os.Stat(filepath.Dir(destAbs))
+	destInfo, destStatErr := os.Stat(destAbs)
+
+	for _, protected := range []string{activeDBPath, activeDBPath + "-wal", activeDBPath + "-shm"} {
+		protAbs, pErr := filepath.Abs(protected)
+		if pErr != nil {
+			continue
+		}
+		if filepath.Clean(destAbs) == filepath.Clean(protAbs) {
+			return fmt.Errorf("refusing to overwrite local SQLite database file %q with remote backup (choose a separate --out / --backup-path)", protected)
+		}
+		if destStatErr == nil {
+			if protInfo, err := os.Stat(protAbs); err == nil && os.SameFile(destInfo, protInfo) {
+				return fmt.Errorf("refusing to overwrite local SQLite database file %q with remote backup (choose a separate --out / --backup-path)", protected)
+			}
+		}
+		if destParentErr == nil && filepath.Base(destAbs) == filepath.Base(protAbs) {
+			if protParentInfo, err := os.Stat(filepath.Dir(protAbs)); err == nil && os.SameFile(destParentInfo, protParentInfo) {
+				return fmt.Errorf("refusing to overwrite local SQLite database file %q with remote backup (choose a separate --out / --backup-path)", protected)
+			}
+		}
+	}
+	return nil
+}
+
+func (rc *remoteClient) downloadBackup(ctx context.Context, destPath, activeDBPath string) (int64, error) {
 	reqCtx, cancel := rc.ensureContextDeadline(ctx)
 	defer cancel()
 
@@ -292,6 +351,9 @@ func (rc *remoteClient) downloadBackup(ctx context.Context, destPath string) (in
 	}
 	destDir := filepath.Dir(destPath)
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return 0, err
+	}
+	if err := rejectActiveDBOverwrite(destPath, activeDBPath); err != nil {
 		return 0, err
 	}
 
@@ -323,6 +385,22 @@ func (rc *remoteClient) downloadBackup(ctx context.Context, destPath string) (in
 		}
 		return 0, fmt.Errorf("remote backup HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(rawErr)))
 	}
+	if resp.ContentLength > maxBackupBytes {
+		return 0, fmt.Errorf("remote backup exceeds maximum allowed size (%d bytes)", resp.ContentLength)
+	}
+
+	// Verify the 16-byte SQLite format 3 magic header BEFORE creating a temp file or streaming body.
+	var hdr [16]byte
+	nHdr, hdrErr := io.ReadFull(resp.Body, hdr[:])
+	if hdrErr != nil {
+		if errors.Is(hdrErr, io.EOF) || errors.Is(hdrErr, io.ErrUnexpectedEOF) {
+			return 0, fmt.Errorf("downloaded backup file too small (%d bytes)", nHdr)
+		}
+		return 0, hdrErr
+	}
+	if string(hdr[:]) != sqliteHeaderMagic {
+		return 0, fmt.Errorf("downloaded backup is not a valid SQLite database (unexpected header)")
+	}
 
 	tmpFile, err := os.CreateTemp(destDir, ".triage-backup-*.tmp")
 	if err != nil {
@@ -331,22 +409,32 @@ func (rc *remoteClient) downloadBackup(ctx context.Context, destPath string) (in
 	tmpPath := tmpFile.Name()
 	cleanupTmp := func() { _ = os.Remove(tmpPath) }
 
-	n, copyErr := io.Copy(tmpFile, resp.Body)
+	if _, wErr := tmpFile.Write(hdr[:]); wErr != nil {
+		_ = tmpFile.Close()
+		cleanupTmp()
+		return 0, wErr
+	}
+	rest, copyErr := io.Copy(tmpFile, io.LimitReader(resp.Body, (maxBackupBytes-int64(len(hdr)))+1))
 	if copyErr != nil {
 		_ = tmpFile.Close()
 		cleanupTmp()
 		return 0, copyErr
 	}
+	n := int64(len(hdr)) + rest
+	if n > maxBackupBytes {
+		_ = tmpFile.Close()
+		cleanupTmp()
+		return 0, fmt.Errorf("downloaded backup exceeds maximum allowed size (%d bytes)", maxBackupBytes)
+	}
+	if resp.ContentLength >= 0 && n != resp.ContentLength {
+		_ = tmpFile.Close()
+		cleanupTmp()
+		return 0, fmt.Errorf("downloaded backup truncated (%d of %d bytes)", n, resp.ContentLength)
+	}
 	if n < 100 {
 		_ = tmpFile.Close()
 		cleanupTmp()
 		return 0, fmt.Errorf("downloaded backup file too small (%d bytes)", n)
-	}
-	var hdr [16]byte
-	if _, rErr := tmpFile.ReadAt(hdr[:], 0); rErr != nil || string(hdr[:]) != sqliteHeaderMagic {
-		_ = tmpFile.Close()
-		cleanupTmp()
-		return 0, fmt.Errorf("downloaded backup is not a valid SQLite database (unexpected header)")
 	}
 	if closeErr := tmpFile.Close(); closeErr != nil {
 		cleanupTmp()
@@ -386,7 +474,7 @@ func hasCommittedRemoteMutations(out map[string]any) bool {
 	if out == nil {
 		return false
 	}
-	for _, k := range []string{"accepted_issues", "excluded_issues", "overridden_issues", "acknowledged_issues"} {
+	for _, k := range []string{"accepted_issues", "excluded_issues", "overridden_issues", "noted_issues", "acknowledged_issues"} {
 		if arr, ok := out[k].([]any); ok && len(arr) > 0 {
 			return true
 		}

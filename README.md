@@ -64,16 +64,20 @@ SQLite runs in `WAL` mode (`busy_timeout=15000`), so CLI commands safely run con
 ```bash
 # Machine A (Web Dashboard + SQLite + GitHub Sync):
 # Anonymous visitors see Read-Only mode; maintainers click "Unlock RW" in browser; Machine B uses Bearer token.
+# Add --trust-proxy (or TRIAGE_HUB_TRUST_PROXY=1) when serving behind a TLS/reverse proxy (reads rightmost X-Forwarded-* hop).
 GITHUB_TOKEN=ghp_xxx \
 TRIAGE_HUB_TOKEN=your-strong-secret \
 ./bin/triage-hub serve \
-  --addr 0.0.0.0:8787 \
+  --addr 127.0.0.1:8787 \
+  --trust-proxy \
   --db /var/lib/triage-hub/tidb_triage.db \
   --sync-prs-interval 30m \
   --sync-issues-interval 2h
 
 # Machine B (AI Triage Worker with local TiDB repo & gh CLI — zero local SQLite state):
-export TRIAGE_HUB_URL="http://machine-a:8787"
+# Explicit http:// or https:// scheme is required. Sending a token over non-loopback plain http://
+# is refused unless --allow-insecure-http (or TRIAGE_HUB_ALLOW_INSECURE_HTTP=1) is explicitly set.
+export TRIAGE_HUB_URL="https://triage.example.com"
 export TRIAGE_HUB_TOKEN="your-strong-secret"
 
 ./bin/triage-hub status
