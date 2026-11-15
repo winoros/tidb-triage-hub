@@ -41,41 +41,52 @@ type BatchTriageExecuteRequest struct {
 }
 
 func (sy *Syncer) BuildStatusReport(ctx context.Context, dbDisplay string, checkGH bool) (map[string]any, error) {
-	ds, err := sy.store.BuildDataset(true)
+	return sy.BuildStatusReportWithOptions(ctx, dbDisplay, checkGH, true)
+}
+
+func (sy *Syncer) BuildStatusReportWithOptions(ctx context.Context, dbDisplay string, checkGH bool, includeWorkbench bool) (map[string]any, error) {
+	meta, err := sy.store.LoadStatusSummary(includeWorkbench)
 	if err != nil {
-		return nil, fmt.Errorf("build dataset: %w", err)
+		return nil, fmt.Errorf("load status summary: %w", err)
 	}
-	pendNums := ds.SyncMeta.PendingCandidateNums
-	if pendNums == nil {
-		pendNums = []int{}
+
+	dbMap := map[string]any{
+		"db_path":                         dbDisplay,
+		"total_candidates":                meta.TotalCandidates,
+		"canonical_candidates":            meta.CanonicalCandidates,
+		"real_bugs":                       meta.RealBugs,
+		"open_pr_count":                   meta.OpenPRCount,
+		"mainline_open_pr_count":          meta.MainlineOpenPRCount,
+		"issue_snapshot_utc8":             meta.SnapshotUTC8,
+		"issue_watermark_utc8":            meta.MaxIssueUpdatedUTC8,
+		"pr_snapshot_utc8":                meta.PRSnapshotUTC8,
+		"incremental_gh_search_qualifier": meta.IncrementalGHSearchQualifier,
 	}
-	retriageNums := ds.SyncMeta.RetriageIssueNums
-	if retriageNums == nil {
-		retriageNums = []int{}
-	}
-	runs, _ := sy.store.RecentSyncRuns(5)
-	if runs == nil {
-		runs = []store.SyncRunRecord{}
+
+	runs := []store.SyncRunRecord{}
+	if includeWorkbench {
+		pendNums := meta.PendingCandidateNums
+		if pendNums == nil {
+			pendNums = []int{}
+		}
+		retriageNums := meta.RetriageIssueNums
+		if retriageNums == nil {
+			retriageNums = []int{}
+		}
+		dbMap["pending_count"] = len(pendNums)
+		dbMap["pending_numbers"] = pendNums
+		dbMap["retriage_count"] = len(retriageNums)
+		dbMap["retriage_numbers"] = retriageNums
+		dbMap["excluded_count"] = len(meta.ExcludedIssueNums)
+		if r, rErr := sy.store.RecentSyncRuns(5); rErr == nil && r != nil {
+			runs = r
+		}
+	} else {
+		dbMap["db_path"] = "redacted"
 	}
 
 	out := map[string]any{
-		"database": map[string]any{
-			"db_path":                         dbDisplay,
-			"total_candidates":                ds.SyncMeta.TotalCandidates,
-			"canonical_candidates":            ds.SyncMeta.CanonicalCandidates,
-			"real_bugs":                       ds.SyncMeta.RealBugs,
-			"open_pr_count":                   ds.SyncMeta.OpenPRCount,
-			"mainline_open_pr_count":          ds.SyncMeta.MainlineOpenPRCount,
-			"pending_count":                   len(pendNums),
-			"pending_numbers":                 pendNums,
-			"retriage_count":                  len(retriageNums),
-			"retriage_numbers":                retriageNums,
-			"excluded_count":                  len(ds.SyncMeta.ExcludedIssueNums),
-			"issue_snapshot_utc8":             ds.SyncMeta.SnapshotUTC8,
-			"issue_watermark_utc8":            ds.SyncMeta.MaxIssueUpdatedUTC8,
-			"pr_snapshot_utc8":                ds.SyncMeta.PRSnapshotUTC8,
-			"incremental_gh_search_qualifier": ds.SyncMeta.IncrementalGHSearchQualifier,
-		},
+		"database":         dbMap,
 		"recent_sync_runs": runs,
 	}
 
@@ -93,6 +104,9 @@ func (sy *Syncer) BuildStatusReport(ctx context.Context, dbDisplay string, check
 }
 
 func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOptions) (map[string]any, int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
 	// Mode A: Backfill notes for existing issues lacking root-cause notes
 	if opts.BackfillNotes > 0 {
 		exportedAt := model.NowRFC3339Nano()
@@ -101,13 +115,17 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 			return nil, 0, fmt.Errorf("list backfill candidates: %w", err)
 		}
 		var prDetailMap map[string]model.PendingPRDetail
+		var bfEnrichErr error
 		if opts.EnrichPRs && len(recs) <= 30 {
 			var allPRs []model.LinkedPRRef
 			for _, r := range recs {
 				allPRs = append(allPRs, triage.FilterRelevantKernelPRs(r.PRs)...)
 			}
 			if len(allPRs) > 0 {
-				prDetailMap, _ = triage.FetchPendingPRDetails(ctx, sy.Runner(), nil, allPRs)
+				prDetailMap, bfEnrichErr = triage.FetchPendingPRDetails(ctx, sy.Runner(), nil, allPRs)
+				if err := ctx.Err(); err != nil {
+					return nil, 0, err
+				}
 			}
 		}
 
@@ -125,13 +143,17 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 			PRDetails   []model.PendingPRDetail `json:"pr_details,omitempty"`
 		}
 		items := make([]backfillItem, 0, len(recs))
-		tmplOvr := make(map[string]model.TriagePatchRequest, len(recs))
+		tmplNotes := make(map[string]model.NotePatchRequest, len(recs))
 		for _, r := range recs {
 			var dets []model.PendingPRDetail
 			for _, p := range triage.FilterRelevantKernelPRs(r.PRs) {
 				if d, ok := prDetailMap[model.PRKey(p.Repo, p.Num)]; ok {
 					dets = append(dets, d)
 				}
+			}
+			syncedPRs := r.PRs
+			if len(prDetailMap) > 0 {
+				syncedPRs, _ = triage.SyncPRRefsWithDetails(r.PRs, prDetailMap)
 			}
 			items = append(items, backfillItem{
 				Number:      r.Number,
@@ -143,32 +165,30 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 				Severity:    r.Severity,
 				Subsystem:   r.Subsystem,
 				Labels:      r.Labels,
-				PRs:         r.PRs,
+				PRs:         syncedPRs,
 				PRDetails:   dets,
 			})
-			tmplOvr[strconv.Itoa(r.Number)] = model.NewTemplateOverridePatch(
-				r.Cat,
-				r.Severity,
-				r.Subsystem,
-				r.TriagedAt,
-				&model.LocalizedNote{
-					ZhCN: "TODO: 填写中文根因与影响简述",
-					En:   "TODO: Fill in concise English root-cause & impact note",
-				},
-			)
+			tmplNotes[strconv.Itoa(r.Number)] = model.NotePatchRequest{
+				ZhCN:              "TODO: 填写中文根因与影响简述",
+				En:                "TODO: Fill in concise English root-cause & impact note",
+				IfUnmodifiedSince: r.TriagedAt,
+			}
 		}
 
 		bundle := map[string]any{
 			"mode":            "backfill_notes",
 			"exported_at_utc": exportedAt,
 			"backfill_count":  len(items),
-			"instructions":    "Inspect each issue & linked PR diff (`gh issue view <num> --repo pingcap/tidb --comments`, `gh pr diff <pr> --repo pingcap/tidb`), fill in `overrides` notes (preserving `base_exported_at` and `if_unmodified_since`), and apply via `triage-hub triage --stdin --skip-todo`.",
+			"instructions":    "Inspect each issue & linked PR diff (`gh issue view <num> --repo pingcap/tidb --comments`, `gh pr diff <pr> --repo pingcap/tidb`), fill in `notes` (preserving `base_exported_at` and `if_unmodified_since`), and apply via `triage-hub triage --stdin --skip-todo`.",
 			"triage_rubric":   triage.DefaultRubric(opts.Compact),
 			"backfill_issues": items,
 			"decisions_template": model.BatchTriageDecisions{
 				BaseExportedAt: exportedAt,
-				Overrides:      tmplOvr,
+				Notes:          tmplNotes,
 			},
+		}
+		if bfEnrichErr != nil {
+			bundle["enrichment_warning"] = fmt.Sprintf("PR file enrichment degraded: %v", bfEnrichErr)
 		}
 		return bundle, len(items), nil
 	}
@@ -236,6 +256,7 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 		}
 	}
 
+	var enrichWarnings []string
 	dirtyIdx := make([]int, 0)
 	for i := range pending {
 		if pending[i].SuggestedTriage == nil || (opts.EnrichPRs && triage.CandidateNeedsPREnrichment(pending[i])) {
@@ -248,11 +269,21 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 			toEnrich[k] = pending[idx]
 		}
 		enriched, enrichErr := triage.EnrichAndAnalyzePending(ctx, sy.Runner(), nil, toEnrich, opts.EnrichPRs)
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		if enrichErr != nil {
+			enrichWarnings = append(enrichWarnings, enrichErr.Error())
+		}
 		var toPersist []model.PendingCandidate
 		for k, idx := range dirtyIdx {
-			wasUnanalyzed := pending[idx].SuggestedTriage == nil
+			prevSug := pending[idx].SuggestedTriage
+			wasUnanalyzed := prevSug == nil
+			if enrichErr != nil && !wasUnanalyzed && triage.CandidateNeedsPREnrichment(enriched[k]) {
+				enriched[k].SuggestedTriage = prevSug
+			}
 			pending[idx] = enriched[k]
-			if enrichErr == nil || !opts.EnrichPRs || wasUnanalyzed || !triage.CandidateNeedsPREnrichment(enriched[k]) {
+			if enrichErr == nil || (!opts.EnrichPRs && wasUnanalyzed) || !triage.CandidateNeedsPREnrichment(enriched[k]) {
 				toPersist = append(toPersist, enriched[k])
 			}
 		}
@@ -270,13 +301,23 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 		}
 		var detMap map[string]model.PendingPRDetail
 		if len(allPRs) > 0 {
-			detMap, _ = triage.FetchPendingPRDetails(ctx, sy.Runner(), nil, allPRs)
+			var rtEnrichErr error
+			detMap, rtEnrichErr = triage.FetchPendingPRDetails(ctx, sy.Runner(), nil, allPRs)
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+			if rtEnrichErr != nil {
+				enrichWarnings = append(enrichWarnings, rtEnrichErr.Error())
+			}
 		}
 		for i := range retriageList {
 			for _, p := range triage.FilterRelevantKernelPRs(retriageList[i].PRs) {
 				if d, ok := detMap[model.PRKey(p.Repo, p.Num)]; ok {
 					retriageList[i].PRDetails = append(retriageList[i].PRDetails, d)
 				}
+			}
+			if len(detMap) > 0 {
+				retriageList[i].PRs, _ = triage.SyncPRRefsWithDetails(retriageList[i].PRs, detMap)
 			}
 			retriageList[i].Clues = triage.ExtractClues(
 				retriageList[i].Title, retriageList[i].Body, retriageList[i].Labels,
@@ -316,10 +357,11 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 			}
 		}
 		tmplNew[strconv.Itoa(pc.Number)] = model.TriagePatchRequest{
-			Cat:              cat,
-			Severity:         sev,
-			Subsystem:        subsys,
-			IsBorderlineKept: borderline,
+			Cat:               cat,
+			Severity:          sev,
+			Subsystem:         subsys,
+			IsBorderlineKept:  borderline,
+			IfUnmodifiedSince: pc.SyncWatermark,
 			Note: &model.LocalizedNote{
 				ZhCN: "TODO: 填写中文根因与影响简述",
 				En:   "TODO: Fill in concise English root-cause & impact note",
@@ -328,26 +370,12 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 	}
 
 	tmplOvr := make(map[string]model.TriagePatchRequest)
-	for _, rc := range retriageList {
-		if len(specificRetriageNums) > 0 {
-			tmplOvr[strconv.Itoa(rc.Number)] = model.NewTemplateOverridePatch(
-				rc.CurrentCat,
-				rc.CurrentSeverity,
-				rc.CurrentSubsys,
-				rc.TriagedAt,
-				&model.LocalizedNote{
-					ZhCN: "TODO: 填写重审后的中文根因与影响简述（原备注见 retriage_candidates[].current_note）",
-					En:   "TODO: Fill in recalibrated English root-cause & impact note (see retriage_candidates[].current_note)",
-				},
-			)
-		}
-	}
 
 	bundle := map[string]any{
 		"exported_at_utc": exportedAt,
 		"pending_count":   len(pending),
 		"retriage_count":  len(retriageList),
-		"instructions":    "Independently judge `pending_candidates` (SQL realism/reachability, PR diff, difficulty, and severity — do NOT blindly accept `decisions_template` pre-fills) and `retriage_candidates` against `triage_rubric` (including `retriage_guide`). Preserve `base_exported_at` (and `if_unmodified_since` on `overrides`) so concurrent Web UI edits are safely detected. Submit decisions via `triage-hub triage --stdin` (supports `new_issues`, `exclude_issues`, `overrides`, `ack_retriage`, `manual_pr_links`, `--skip-todo`, and `--dry-run`). Canonical (`sig/planner` + `type/bug`) issues must NEVER be put in `exclude_issues`.",
+		"instructions":    "Independently judge `pending_candidates` (SQL realism/reachability, PR diff, difficulty, and severity — do NOT blindly accept `decisions_template` pre-fills) and `retriage_candidates` against `triage_rubric` (including `retriage_guide`). Preserve `base_exported_at` and `if_unmodified_since` so concurrent edits/syncs are safely detected. For each `retriage_candidates` item, explicitly add it to ONE of `overrides` (classification recalibration; copy `triaged_at` to `if_unmodified_since`), `ack_retriage` (classification unchanged, advance baseline), `notes` (note-only update without resetting baseline), or `exclude_issues` (supplemental non-optimizer only). Submit via `triage-hub triage --stdin` (`--skip-todo`, `--dry-run`). Canonical (`sig/planner` + `type/bug`) issues must NEVER be put in `exclude_issues`.",
 		"valid_enums": map[string]any{
 			"cat":       model.ValidCategories,
 			"severity":  model.ValidSeverities,
@@ -367,6 +395,9 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 	if len(suggestedExcludesHint) > 0 {
 		bundle["suggested_excludes_hint"] = suggestedExcludesHint
 	}
+	if len(enrichWarnings) > 0 {
+		bundle["enrichment_warning"] = fmt.Sprintf("PR file enrichment degraded: %s", strings.Join(enrichWarnings, "; "))
+	}
 
 	return bundle, len(pending) + len(retriageList), nil
 }
@@ -385,6 +416,7 @@ func (sy *Syncer) ExecuteBatchTriage(ctx context.Context, req BatchTriageExecute
 	if len(cleaned.NewIssues) == 0 &&
 		len(cleaned.ExcludeIssues) == 0 &&
 		len(cleaned.Overrides) == 0 &&
+		len(cleaned.Notes) == 0 &&
 		len(cleaned.AckRetriage) == 0 &&
 		len(cleaned.ManualPRLinks) == 0 {
 		return nil, fmt.Errorf("%w: no actionable entries remaining after validation (check if all entries were skipped by --skip-todo)", ErrBatchInputInvalid)
@@ -405,6 +437,7 @@ func (sy *Syncer) ExecuteBatchTriage(ctx context.Context, req BatchTriageExecute
 			"new_issues_count":    len(cleaned.NewIssues),
 			"exclude_count":       len(cleaned.ExcludeIssues),
 			"overrides_count":     len(cleaned.Overrides),
+			"notes_count":         len(cleaned.Notes),
 			"ack_retriage_count":  len(cleaned.AckRetriage),
 			"manual_pr_links":     len(cleaned.ManualPRLinks),
 			"validation_warnings": warnings,

@@ -273,6 +273,9 @@ func (sy *Syncer) SyncIssuesWithOptions(ctx context.Context, opts IssueSyncOptio
 	var enrichWarn string
 	if len(plan.UpsertPending) > 0 {
 		enriched, enrichErr := triage.EnrichAndAnalyzePending(ctx, sy.runner, tracker, plan.UpsertPending, true)
+		if err := ctx.Err(); err != nil {
+			return IssueSyncResult{}, err
+		}
 		plan.UpsertPending = enriched
 		if enrichErr != nil {
 			enrichWarn = enrichErr.Error()
@@ -300,15 +303,15 @@ func (sy *Syncer) SyncIssuesWithOptions(ctx context.Context, opts IssueSyncOptio
 	}
 
 	prevSummaryDS := buildPrevSummaryDataset(syncState, nil)
-	nextDS, applied, err := sy.store.ApplyIssueSyncWithOutcome(plan)
+	nextMeta, applied, err := sy.store.ApplyIssueSyncSummary(plan)
 	if err != nil {
 		return IssueSyncResult{}, err
 	}
 	plan.Applied = &applied
 
-	summary := issuesync.FormatSyncSummary(plan, prevSummaryDS, nextDS)
-	pendNums := nextDS.SyncMeta.PendingCandidateNums
-	retriageNums := nextDS.SyncMeta.RetriageIssueNums
+	summary := issuesync.FormatSyncSummary(plan, prevSummaryDS, model.Dataset{SyncMeta: nextMeta})
+	pendNums := nextMeta.PendingCandidateNums
+	retriageNums := nextMeta.RetriageIssueNums
 
 	var prStats prstatus.FetchStats
 	if !opts.SkipPRs {

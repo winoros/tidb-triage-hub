@@ -1535,12 +1535,13 @@ func TestRound2SpecialDBPathSyncRacesReconcileAndTypoDetection(t *testing.T) {
 		t.Fatalf("expected ErrOverrideConflict on stale IfUnmodifiedSince, got %v", err)
 	}
 
-	// Simulate post-override PR sync discovering #78901 was actually MERGED!
+	// Simulate post-override PR sync discovering #78901 was actually MERGED BEFORE baseline (MergedAt=09:30:00Z <= 10:00:00Z)!
 	if err := st.UpsertPRStatuses([]model.PRStatus{{
 		Repo:      "pingcap/tidb",
 		Num:       78901,
 		Title:     "planner: already merged fix",
 		State:     "MERGED",
+		MergedAt:  "2026-11-12T09:30:00Z",
 		UpdatedAt: "2026-11-12T12:00:00Z",
 	}}, time.Now().UTC()); err != nil {
 		t.Fatalf("UpsertPRStatuses(78901=MERGED): %v", err)
@@ -1868,5 +1869,234 @@ func TestConvergenceInvariantsMonotonicFreshnessRevisionAndChunking(t *testing.T
 	}
 	if !foundFirst || !foundSecond {
 		t.Fatalf("expected chunked ListRetriageCandidates to populate bodies & comments across both chunks (first=%v, second=%v)", foundFirst, foundSecond)
+	}
+}
+
+func TestExplicitFactModelUnknownManualPRSyncWatermarkAndReopen(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "facts.db")
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Seed 3 active issues + 1 issue with an OPEN PR that will close and reopen + 1 pending candidate
+	if err := st.IngestSyncedDataset(model.Dataset{
+		SyncMeta: model.SyncMeta{SchemaVersion: 2, SnapshotUTC: "2026-11-12T10:00:00Z"},
+		Records: []model.IssueRecord{
+			{
+				Number:      91001,
+				Title:       "planner: manual PR turns out OPEN",
+				Author:      "alice",
+				Created:     "2026-11-12",
+				CreatedAt:   "2026-11-12T10:00:00Z",
+				UpdatedAt:   "2026-11-12T10:00:00Z",
+				Labels:      []string{"sig/planner", "type/bug"},
+				IsCanonical: true,
+				Cat:         "MEDIUM",
+				Severity:    "MAJOR",
+				Subsystem:   "logical_rewrite",
+				Note:        &model.LocalizedNote{ZhCN: "测试未知手动PR验证为OPEN", En: "Test unknown manual PR verified as OPEN"},
+			},
+			{
+				Number:      91002,
+				Title:       "planner: manual PR merges AFTER triage ack",
+				Author:      "alice",
+				Created:     "2026-11-12",
+				CreatedAt:   "2026-11-12T10:00:00Z",
+				UpdatedAt:   "2026-11-12T10:00:00Z",
+				Labels:      []string{"sig/planner", "type/bug"},
+				IsCanonical: true,
+				Cat:         "MEDIUM",
+				Severity:    "MAJOR",
+				Subsystem:   "logical_rewrite",
+				Note:        &model.LocalizedNote{ZhCN: "测试未知手动PR在分诊后合并触发重审", En: "Test unknown manual PR merged after ack triggers retriage"},
+			},
+			{
+				Number:      91003,
+				Title:       "planner: manual PR had ALREADY merged BEFORE triage ack",
+				Author:      "alice",
+				Created:     "2026-11-12",
+				CreatedAt:   "2026-11-12T10:00:00Z",
+				UpdatedAt:   "2026-11-12T10:00:00Z",
+				Labels:      []string{"sig/planner", "type/bug"},
+				IsCanonical: true,
+				Cat:         "MEDIUM",
+				Severity:    "MAJOR",
+				Subsystem:   "logical_rewrite",
+				Note:        &model.LocalizedNote{ZhCN: "测试未知手动PR早已合并则不自触发重审", En: "Test unknown manual PR merged before ack does not self-flag"},
+			},
+			{
+				Number:      91004,
+				Title:       "planner: PR closes and later reopens",
+				Author:      "alice",
+				Created:     "2026-11-12",
+				CreatedAt:   "2026-11-12T10:00:00Z",
+				UpdatedAt:   "2026-11-12T10:00:00Z",
+				Labels:      []string{"sig/planner", "type/bug"},
+				IsCanonical: true,
+				Cat:         "MEDIUM",
+				Severity:    "MAJOR",
+				Subsystem:   "logical_rewrite",
+				Note:        &model.LocalizedNote{ZhCN: "测试关闭后重开的PR再次触发new_fix_pr", En: "Test closed then reopened PR triggers new_fix_pr"},
+				PRs:         []model.LinkedPRRef{{Repo: "pingcap/tidb", Num: 95004, State: "OPEN", UpdatedAt: "2026-11-12T10:00:00Z"}},
+			},
+		},
+	}, []model.PendingCandidate{
+		{
+			Number:    92001,
+			Title:     "planner: pending candidate with sync_watermark CAS",
+			Author:    "bob",
+			CreatedAt: "2026-11-12T10:00:00Z",
+			UpdatedAt: "2026-11-12T10:05:00Z",
+			Labels:    []string{"sig/planner", "type/bug"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Attach uncached manual_pr_links offline -> stored as PRStateUnknown ("UNKNOWN") with non-empty ack_at
+	if _, err := st.ApplyBatchTriageDecisions(model.BatchTriageDecisions{
+		ManualPRLinks: map[string][]string{
+			"91001": {"95001"},
+			"91002": {"95002"},
+			"91003": {"95003"},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyBatchTriageDecisions(ManualPRLinks): %v", err)
+	}
+
+	dsUnknown, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byNum := make(map[int]model.IssueRecord)
+	for _, r := range dsUnknown.Records {
+		byNum[r.Number] = r
+	}
+	if len(byNum[91001].PRs) != 1 || byNum[91001].PRs[0].State != model.PRStateUnknown || byNum[91001].PRs[0].AckAt == "" {
+		t.Fatalf("expected uncached manual PR #95001 stored as UNKNOWN with AckAt, got %+v", byNum[91001].PRs)
+	}
+	ackAt := byNum[91002].PRs[0].AckAt
+	ackParsed, err := time.Parse(time.RFC3339Nano, ackAt)
+	if err != nil {
+		t.Fatalf("parse AckAt %q: %v", ackAt, err)
+	}
+	beforeAck := ackParsed.Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+	afterAck := ackParsed.Add(10 * time.Minute).UTC().Format(time.RFC3339)
+
+	// 2. Verify PR states via UpsertPRStatuses:
+	//    - #95001 = OPEN -> NO new_fix_pr (AckAt != "")
+	//    - #95002 = MERGED at afterAck -> FIRES fix_pr_merged_still_open (MergedAt > baseline/AckAt)
+	//    - #95003 = MERGED at beforeAck -> NO fix_pr_merged_still_open (MergedAt <= baseline/AckAt)
+	//    - #95004 = CLOSED -> clears ack_at on #95004
+	if err := st.UpsertPRStatuses([]model.PRStatus{
+		{Repo: "pingcap/tidb", Num: 95001, State: "OPEN", UpdatedAt: afterAck},
+		{Repo: "pingcap/tidb", Num: 95002, State: "MERGED", UpdatedAt: afterAck, MergedAt: afterAck},
+		{Repo: "pingcap/tidb", Num: 95003, State: "MERGED", UpdatedAt: afterAck, MergedAt: beforeAck},
+		{Repo: "pingcap/tidb", Num: 95004, State: "CLOSED", UpdatedAt: afterAck},
+	}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	// Acknowledge any retriage or check #91001, #91002, #91003, and then reopen #95004!
+	dsVerified, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byNum = make(map[int]model.IssueRecord)
+	for _, r := range dsVerified.Records {
+		byNum[r.Number] = r
+	}
+	if byNum[91001].NeedsRetriage {
+		t.Fatalf("expected #91001 (UNKNOWN -> OPEN) NOT to trigger new_fix_pr, got reasons=%v", byNum[91001].RetriageReasons)
+	}
+	if !byNum[91002].NeedsRetriage || len(byNum[91002].RetriageReasons) != 1 || byNum[91002].RetriageReasons[0] != "fix_pr_merged_still_open" {
+		t.Fatalf("expected #91002 (UNKNOWN -> post-ack MERGED) to trigger fix_pr_merged_still_open, got NeedsRetriage=%v reasons=%v", byNum[91002].NeedsRetriage, byNum[91002].RetriageReasons)
+	}
+	if byNum[91003].NeedsRetriage {
+		t.Fatalf("expected #91003 (UNKNOWN -> pre-ack MERGED) NOT to self-flag retriage, got reasons=%v", byNum[91003].RetriageReasons)
+	}
+
+	// Acknowledge #91004 at CLOSED state (so baseOpen is empty), then reopen #95004 -> MUST fire new_fix_pr!
+	if _, err := st.AcknowledgeIssueRetriage(91004, "maintainer"); err != nil {
+		t.Fatal(err)
+	}
+	reopenTS := ackParsed.Add(20 * time.Minute).UTC().Format(time.RFC3339)
+	if err := st.UpsertPRStatuses([]model.PRStatus{
+		{Repo: "pingcap/tidb", Num: 95004, State: "OPEN", UpdatedAt: reopenTS},
+	}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	dsReopened, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range dsReopened.Records {
+		if r.Number == 91004 && !r.NeedsRetriage {
+			t.Fatalf("expected reopened PR #95004 (OPEN -> CLOSED -> OPEN) to fire new_fix_pr on #91004")
+		}
+	}
+
+	// 3. Pending SyncWatermark stays stable across enrichment cache writes, advances on core sync change,
+	//    and enforces IfUnmodifiedSince on ResolvePendingCandidate!
+	pList1, err := st.ListPendingCandidates()
+	if err != nil || len(pList1) != 1 || pList1[0].SyncWatermark == "" {
+		t.Fatalf("expected pending #92001 with non-empty SyncWatermark, got %+v err=%v", pList1, err)
+	}
+	wm1 := pList1[0].SyncWatermark
+
+	// Enrichment cache update does NOT bump SyncWatermark
+	enriched := pList1[0]
+	enriched.SuggestedTriage = &model.SuggestedTriage{Cat: "EASY", Severity: "MINOR", Subsystem: "statistics"}
+	if err := st.UpdatePendingCandidates([]model.PendingCandidate{enriched}); err != nil {
+		t.Fatal(err)
+	}
+	pListEnriched, err := st.ListPendingCandidates()
+	if err != nil || pListEnriched[0].SyncWatermark != wm1 {
+		t.Fatalf("expected UpdatePendingCandidates NOT to change SyncWatermark (%q vs %q)", pListEnriched[0].SyncWatermark, wm1)
+	}
+
+	// Core sync update (new PR discovered on #92001) DOES advance SyncWatermark monotonically
+	if _, err := st.ApplyIssueSync(issuesync.SyncPlan{
+		SnapshotUTC: "2026-11-12T10:20:00Z",
+		UpsertPending: []model.PendingCandidate{{
+			Number:    92001,
+			Title:     "planner: pending candidate with sync_watermark CAS",
+			Author:    "bob",
+			CreatedAt: "2026-11-12T10:00:00Z",
+			UpdatedAt: "2026-11-12T10:05:00Z",
+			Labels:    []string{"sig/planner", "type/bug"},
+			PRs:       []model.LinkedPRRef{{Repo: "pingcap/tidb", Num: 95999, State: "OPEN"}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pList2, err := st.ListPendingCandidates()
+	if err != nil || pList2[0].SyncWatermark <= wm1 {
+		t.Fatalf("expected SyncWatermark to advance after PR discovery (%q <= %q)", pList2[0].SyncWatermark, wm1)
+	}
+	wm2 := pList2[0].SyncWatermark
+
+	// Stale wm1 is rejected with ErrOverrideConflict; fresh wm2 succeeds!
+	if err := st.ResolvePendingCandidate(92001, model.PendingResolveRequest{
+		Action:            "accept",
+		Cat:               "EASY",
+		Severity:          "MINOR",
+		Subsystem:         "statistics",
+		IfUnmodifiedSince: wm1,
+		Note:              &model.LocalizedNote{ZhCN: "过期水位线应冲突", En: "Stale watermark must fail"},
+	}); !errors.Is(err, ErrOverrideConflict) {
+		t.Fatalf("expected ErrOverrideConflict on stale SyncWatermark, got %v", err)
+	}
+	if err := st.ResolvePendingCandidate(92001, model.PendingResolveRequest{
+		Action:            "accept",
+		Cat:               "EASY",
+		Severity:          "MINOR",
+		Subsystem:         "statistics",
+		IfUnmodifiedSince: wm2,
+		Note:              &model.LocalizedNote{ZhCN: "最新水位线正常入库", En: "Fresh watermark resolves cleanly"},
+	}); err != nil {
+		t.Fatalf("expected fresh SyncWatermark to succeed, got %v", err)
 	}
 }
