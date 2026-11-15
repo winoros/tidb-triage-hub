@@ -113,6 +113,7 @@ type RawPRInput struct {
 	Mergeable          string // MERGEABLE, CONFLICTING, UNKNOWN
 	CreatedAt          string
 	UpdatedAt          string
+	MergedAt           string
 	LastCommitAt       string
 	Labels             []string
 	RequestedReviewers []string
@@ -521,6 +522,7 @@ func ClassifyPR(in RawPRInput, now time.Time) model.PRStatus {
 		SizeLabel:          sizeLabel,
 		CreatedAt:          in.CreatedAt,
 		UpdatedAt:          in.UpdatedAt,
+		MergedAt:           in.MergedAt,
 		UpdatedDisplay:     ToUTC8Display(in.UpdatedAt),
 		LastCommitAt:       in.LastCommitAt,
 		WaitingSince:       waitingSince,

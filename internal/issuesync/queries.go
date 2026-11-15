@@ -115,6 +115,7 @@ query($q: String!, $cursor: String) {
         state
         isDraft
         updatedAt
+        mergedAt
         labels(first: 10) { nodes { name } }
         repository { nameWithOwner }
         closingIssuesReferences(first: 20) {

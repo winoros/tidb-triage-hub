@@ -3,31 +3,133 @@ package httputil
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
+func isValidRegName(host string) bool {
+	if host == "" || strings.HasPrefix(host, ".") || strings.Contains(host, "..") {
+		return false
+	}
+	for i := 0; i < len(host); i++ {
+		c := host[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+		if !isAlphaNum && c != '-' && c != '.' && c != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func parseCanonicalPort(rawPort string) (string, bool) {
+	if rawPort == "" {
+		return "", false
+	}
+	for i := 0; i < len(rawPort); i++ {
+		if rawPort[i] < '0' || rawPort[i] > '9' {
+			return "", false
+		}
+	}
+	n, err := strconv.Atoi(rawPort)
+	if err != nil || n < 1 || n > 65535 {
+		return "", false
+	}
+	return strconv.Itoa(n), true
+}
+
+// ExtractCanonicalHostname extracts the normalized hostname (without brackets or port) from a valid host[:port] authority.
+// Returns ("", false) if hostPort is malformed.
+func ExtractCanonicalHostname(hostPort string) (string, bool) {
+	norm := NormalizeOriginHost(hostPort, "http")
+	if norm == "" {
+		return "", false
+	}
+	if strings.HasPrefix(norm, "[") {
+		if strings.HasSuffix(norm, "]") {
+			return norm[1 : len(norm)-1], true
+		}
+		h, _, err := net.SplitHostPort(norm)
+		if err != nil {
+			return "", false
+		}
+		return h, true
+	}
+	if h, _, err := net.SplitHostPort(norm); err == nil {
+		return h, true
+	}
+	return norm, true
+}
+
 // NormalizeOriginHost normalizes a host[:port] authority for Web Origin comparison
-// under the given scheme ("http" or "https"), stripping default ports (:80 for http, :443 for https)
-// and lowercasing ASCII hostnames while preserving IPv6 brackets.
+// under the given scheme ("http" or "https"), stripping default ports (:80 for http, :443 for https),
+// canonicalizing IPv4/IPv6 literals and numeric ports, and rejecting malformed authorities.
 func NormalizeOriginHost(hostPort string, scheme string) string {
 	hp := strings.ToLower(strings.TrimSpace(hostPort))
-	if hp == "" {
+	if hp == "" || strings.ContainsAny(hp, " \t\r\n/\\?#@%") {
 		return ""
 	}
-	h, port, err := net.SplitHostPort(hp)
-	if err != nil {
-		// No port present (or unbracketed IPv6 literal without port); reject malformed trailing colon.
-		if strings.HasSuffix(hp, ":") && !strings.HasSuffix(hp, "::") {
+
+	var h, rawPort string
+	isBracketedV6 := strings.HasPrefix(hp, "[")
+	if isBracketedV6 {
+		if strings.HasSuffix(hp, "]") {
+			h = hp[1 : len(hp)-1]
+		} else {
+			var err error
+			h, rawPort, err = net.SplitHostPort(hp)
+			if err != nil || rawPort == "" {
+				return ""
+			}
+		}
+		addr, err := netip.ParseAddr(h)
+		if err != nil || !addr.Is6() {
 			return ""
 		}
-		return hp
+		h = addr.String()
+	} else {
+		colonCount := strings.Count(hp, ":")
+		if colonCount > 1 {
+			// Unbracketed IPv6 literal in URL authority is invalid per RFC 3986.
+			return ""
+		}
+		if colonCount == 1 {
+			var err error
+			h, rawPort, err = net.SplitHostPort(hp)
+			if err != nil || h == "" || rawPort == "" {
+				return ""
+			}
+		} else {
+			h = hp
+		}
+		if strings.ContainsAny(h, "[]:") {
+			return ""
+		}
+		if addr, err := netip.ParseAddr(h); err == nil {
+			if !addr.Is4() {
+				return ""
+			}
+			h = addr.String()
+		} else if !isValidRegName(h) {
+			return ""
+		}
 	}
-	if h == "" || port == "" {
-		return ""
+
+	port := ""
+	if rawPort != "" {
+		var ok bool
+		port, ok = parseCanonicalPort(rawPort)
+		if !ok {
+			return ""
+		}
 	}
-	if (strings.EqualFold(scheme, "https") && port == "443") || (strings.EqualFold(scheme, "http") && port == "80") {
-		if strings.Contains(h, ":") {
+
+	isDefaultPort := port == "" ||
+		(strings.EqualFold(scheme, "https") && port == "443") ||
+		(strings.EqualFold(scheme, "http") && port == "80")
+	if isDefaultPort {
+		if isBracketedV6 {
 			return "[" + h + "]"
 		}
 		return h
@@ -51,61 +153,50 @@ func SameOrigin(a, b *url.URL) bool {
 	return ha != "" && ha == hb
 }
 
-// IsLocalOrPrivateHost reports whether hostPort targets localhost, .local mDNS,
-// loopback, RFC1918 private IPs, link-local unicast, or CGNAT/Tailscale (100.64.0.0/10).
-func IsLocalOrPrivateHost(hostPort string) bool {
-	host := strings.TrimSpace(hostPort)
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	host = strings.Trim(host, "[]")
-	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".local") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
+// IsLoopbackHost reports whether hostPort targets localhost or a loopback IP (127.0.0.0/8 or ::1).
+func IsLoopbackHost(hostPort string) bool {
+	host, ok := ExtractCanonicalHostname(hostPort)
+	if !ok {
 		return false
 	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
-	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
-		return true
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
 	}
-	return false
+	return addr.Unmap().IsLoopback()
 }
 
 // ParseBaseURL parses and canonicalizes a remote HTTP(S) base URL:
-//   - Defaults scheme-less local/private hosts to http:// and public hosts to https://
-//   - Rejects non-http/https schemes
+//   - Requires an explicit http:// or https:// scheme
+//   - Rejects userinfo credentials and malformed host[:port] authorities
 //   - Strips query (? and ForceQuery), fragment (#), RawPath, and trailing slashes
 func ParseBaseURL(rawInput string) (*url.URL, error) {
 	raw := strings.TrimSpace(rawInput)
 	if raw == "" {
 		return nil, fmt.Errorf("remote URL is empty")
 	}
-	if idx := strings.Index(raw, "://"); idx >= 0 {
-		scheme := strings.ToLower(strings.TrimSpace(raw[:idx]))
-		if scheme != "http" && scheme != "https" {
-			return nil, fmt.Errorf("unsupported scheme %q in remote URL %q (expected http or https)", scheme, rawInput)
-		}
-		raw = scheme + raw[idx:]
-	} else {
-		hostPart := raw
-		if cut := strings.IndexAny(hostPart, "/?#"); cut >= 0 {
-			hostPart = hostPart[:cut]
-		}
-		if IsLocalOrPrivateHost(hostPart) {
-			raw = "http://" + raw
-		} else {
-			raw = "https://" + raw
-		}
+	idx := strings.Index(raw, "://")
+	if idx < 0 {
+		return nil, fmt.Errorf("remote URL %q must include an explicit http:// or https:// scheme", rawInput)
 	}
+	scheme := strings.ToLower(strings.TrimSpace(raw[:idx]))
+	if scheme != "http" && scheme != "https" {
+		return nil, fmt.Errorf("unsupported scheme %q in remote URL %q (expected http or https)", scheme, rawInput)
+	}
+	raw = scheme + raw[idx:]
 	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" || NormalizeOriginHost(u.Host, u.Scheme) == "" {
+	if err != nil || u.User != nil || u.Host == "" {
 		return nil, fmt.Errorf("invalid remote URL %q", rawInput)
 	}
-	u.Scheme = strings.ToLower(u.Scheme)
+	normHost := NormalizeOriginHost(u.Host, scheme)
+	if normHost == "" {
+		return nil, fmt.Errorf("invalid remote URL %q", rawInput)
+	}
+	u.Scheme = scheme
+	u.Host = normHost
 	u.RawQuery = ""
 	u.ForceQuery = false
 	u.Fragment = ""

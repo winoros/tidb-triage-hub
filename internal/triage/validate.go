@@ -77,8 +77,9 @@ func normalizeIssueKey(k string) (int, error) {
 	return n, nil
 }
 
-// ValidateAndPrepareDecisions cleans template conflicts, optionally skips TODO entries,
-// normalizes N/A severities, and validates bilingual root-cause notes.
+// ValidateAndPrepareDecisions validates and normalizes batch triage decisions, enforcing
+// pairwise mutual exclusion across `new_issues`, `exclude_issues`, `overrides`, `notes`, and `ack_retriage`
+// (auto-resolving only untouched `TODO:` template entries in `new_issues` when moved to `exclude_issues`).
 func ValidateAndPrepareDecisions(
 	dec model.BatchTriageDecisions,
 	opts ValidateOptions,
@@ -87,6 +88,7 @@ func ValidateAndPrepareDecisions(
 		NewIssues:     make(map[string]model.TriagePatchRequest),
 		ExcludeIssues: make(map[string]string),
 		Overrides:     make(map[string]model.TriagePatchRequest),
+		Notes:         make(map[string]model.NotePatchRequest),
 		ManualPRLinks: make(map[string][]string),
 	}
 	if rawBase := strings.TrimSpace(dec.BaseExportedAt); rawBase != "" {
@@ -113,16 +115,17 @@ func ValidateAndPrepareDecisions(
 
 	var warnings []ValidationWarning
 
-	validateNote := func(num int, cat string, isBorderline bool, note *model.LocalizedNote, requireNote bool) error {
-		if isBorderline && !model.IsRealBugCategory(cat) {
+	validateNote := func(num int, cat string, isBorderline bool, note *model.LocalizedNote, requireNote bool, forceComplete bool) error {
+		if cat != "" && isBorderline && !model.IsRealBugCategory(cat) {
 			warnings = append(warnings, ValidationWarning{
 				Issue:   num,
 				Field:   "is_borderline_kept",
 				Message: fmt.Sprintf("`is_borderline_kept` should only be true on EASY/MEDIUM/HARD bugs (got %s); auto-cleared", cat),
 			})
 		}
+		allowEmpty := opts.AllowEmptyNote && !forceComplete
 		if note == nil || note.IsEmpty() {
-			if requireNote && !opts.AllowEmptyNote {
+			if requireNote && !allowEmpty {
 				return fmt.Errorf("issue #%d: bilingual `note` (`zh-CN` and `en`) is required (pass --allow-empty-note to bypass)", num)
 			}
 			return nil
@@ -133,7 +136,7 @@ func ValidateAndPrepareDecisions(
 
 		zh := strings.TrimSpace(note.ZhCN)
 		en := strings.TrimSpace(note.En)
-		if !opts.AllowEmptyNote && (zh == "" || en == "") {
+		if !allowEmpty && (zh == "" || en == "") {
 			return fmt.Errorf("issue #%d: both `note.zh-CN` and `note.en` must be non-empty", num)
 		}
 		if strings.Count(zh, "`")%2 != 0 {
@@ -142,16 +145,16 @@ func ValidateAndPrepareDecisions(
 		if strings.Count(en, "`")%2 != 0 {
 			return fmt.Errorf("issue #%d: `note.en` has unmatched backtick (`)", num)
 		}
-		if zh != "" && en != "" && zh == en && !opts.AllowEmptyNote {
+		if zh != "" && en != "" && zh == en && !allowEmpty {
 			return fmt.Errorf("issue #%d: `note.zh-CN` and `note.en` must not be identical", num)
 		}
-		if zh != "" && !containsHan(zh) && !opts.AllowEmptyNote {
+		if zh != "" && !containsHan(zh) && !allowEmpty {
 			return fmt.Errorf("issue #%d: `note.zh-CN` must contain Chinese characters", num)
 		}
 
 		zhLen := utf8.RuneCountInString(zh)
 		enLen := utf8.RuneCountInString(en)
-		if model.IsRealBugCategory(cat) {
+		if cat == "" || model.IsRealBugCategory(cat) {
 			if zh != "" && (zhLen < 12 || zhLen > 140) {
 				warnings = append(warnings, ValidationWarning{
 					Issue:   num,
@@ -171,7 +174,7 @@ func ValidateAndPrepareDecisions(
 	}
 
 	seenNew := make(map[int]string)
-	skippedTodoNums := make(map[int]bool)
+	skippedNewTodoNums := make(map[int]bool)
 	for k, patch := range dec.NewIssues {
 		num, err := normalizeIssueKey(k)
 		if err != nil {
@@ -182,7 +185,7 @@ func ValidateAndPrepareDecisions(
 		}
 		seenNew[num] = k
 		if _, isExcluded := excludedByNum[num]; isExcluded {
-			// Auto-resolve template residue if `note` was left as TODO
+			// Auto-resolve untouched pending template entry when moved to `exclude_issues`
 			if patch.Note == nil || patch.Note.IsEmpty() || isTodoNote(patch.Note) {
 				continue
 			}
@@ -190,7 +193,7 @@ func ValidateAndPrepareDecisions(
 		}
 		if isTodoNote(patch.Note) {
 			if opts.SkipTodo {
-				skippedTodoNums[num] = true
+				skippedNewTodoNums[num] = true
 				continue
 			}
 			return out, nil, fmt.Errorf("issue #%d: `note` still contains `TODO:` placeholder (complete the note or pass --skip-todo)", num)
@@ -207,7 +210,7 @@ func ValidateAndPrepareDecisions(
 		if err := model.ValidateTriageFields(patch.Cat, patch.Severity, patch.Subsystem); err != nil {
 			return out, nil, fmt.Errorf("issue #%d: %w", num, err)
 		}
-		if err := validateNote(num, patch.Cat, patch.IsBorderlineKept, patch.Note, true); err != nil {
+		if err := validateNote(num, patch.Cat, patch.IsBorderlineKept, patch.Note, true, false); err != nil {
 			return out, nil, err
 		}
 		if !model.IsRealBugCategory(patch.Cat) {
@@ -227,20 +230,13 @@ func ValidateAndPrepareDecisions(
 		}
 		seenOvr[num] = k
 		if _, isExcluded := excludedByNum[num]; isExcluded {
-			if patch.Note == nil || patch.Note.IsEmpty() || isTodoNote(patch.Note) {
-				continue
-			}
 			return out, nil, fmt.Errorf("issue #%d appears in both `overrides` and `exclude_issues`; remove one", num)
 		}
-		if isTodoNote(patch.Note) {
-			if opts.SkipTodo {
-				skippedTodoNums[num] = true
-				continue
-			}
-			return out, nil, fmt.Errorf("issue #%d: `note` still contains `TODO:` placeholder (complete the note or pass --skip-todo)", num)
-		}
-		if _, inNew := out.NewIssues[strconv.Itoa(num)]; inNew {
+		if _, inNew := seenNew[num]; inNew {
 			return out, nil, fmt.Errorf("issue #%d appears in both `new_issues` and `overrides`; keep only one", num)
+		}
+		if isTodoNote(patch.Note) {
+			return out, nil, fmt.Errorf("override #%d: `note` still contains `TODO:` placeholder", num)
 		}
 		if rawIf := strings.TrimSpace(patch.IfUnmodifiedSince); rawIf != "" {
 			norm, ok := model.NormalizeRFC3339NanoFixed(rawIf)
@@ -254,13 +250,54 @@ func ValidateAndPrepareDecisions(
 			return out, nil, fmt.Errorf("override #%d: %w", num, err)
 		}
 		requireNote := patch.Note != nil
-		if err := validateNote(num, patch.Cat, patch.IsBorderlineKept, patch.Note, requireNote); err != nil {
+		if err := validateNote(num, patch.Cat, patch.IsBorderlineKept, patch.Note, requireNote, false); err != nil {
 			return out, nil, err
 		}
 		if !model.IsRealBugCategory(patch.Cat) {
 			patch.IsBorderlineKept = false
 		}
 		out.Overrides[strconv.Itoa(num)] = patch
+	}
+
+	seenNotes := make(map[int]string)
+	for k, np := range dec.Notes {
+		num, err := normalizeIssueKey(k)
+		if err != nil {
+			return out, nil, err
+		}
+		if prevKey, dup := seenNotes[num]; dup {
+			return out, nil, fmt.Errorf("duplicate issue #%d in `notes` (%q and %q)", num, prevKey, k)
+		}
+		seenNotes[num] = k
+		if _, isExcluded := excludedByNum[num]; isExcluded {
+			return out, nil, fmt.Errorf("issue #%d appears in both `notes` and `exclude_issues`; remove one", num)
+		}
+		if _, inNew := seenNew[num]; inNew {
+			return out, nil, fmt.Errorf("issue #%d appears in both `new_issues` and `notes`; keep only one", num)
+		}
+		if _, inOvr := seenOvr[num]; inOvr {
+			return out, nil, fmt.Errorf("issue #%d appears in both `overrides` and `notes`; keep only one", num)
+		}
+		noteObj := np.LocalizedNote()
+		if isTodoNote(noteObj) {
+			if opts.SkipTodo {
+				continue
+			}
+			return out, nil, fmt.Errorf("issue #%d: `notes` entry still contains `TODO:` placeholder (complete the note or pass --skip-todo)", num)
+		}
+		if rawIf := strings.TrimSpace(np.IfUnmodifiedSince); rawIf != "" {
+			norm, ok := model.NormalizeRFC3339NanoFixed(rawIf)
+			if !ok {
+				return out, nil, fmt.Errorf("notes #%d: invalid `if_unmodified_since` timestamp %q (expected RFC3339 UTC)", num, np.IfUnmodifiedSince)
+			}
+			np.IfUnmodifiedSince = norm
+		}
+		if err := validateNote(num, "", false, noteObj, true, true); err != nil {
+			return out, nil, err
+		}
+		np.ZhCN = strings.TrimSpace(np.ZhCN)
+		np.En = strings.TrimSpace(np.En)
+		out.Notes[strconv.Itoa(num)] = np
 	}
 
 	seenManual := make(map[int]string)
@@ -288,12 +325,8 @@ func ValidateAndPrepareDecisions(
 			cleaned = append(cleaned, s)
 		}
 		if len(cleaned) > 0 {
-			if skippedTodoNums[num] {
-				if _, activeNew := out.NewIssues[strconv.Itoa(num)]; !activeNew {
-					if _, activeOvr := out.Overrides[strconv.Itoa(num)]; !activeOvr {
-						continue
-					}
-				}
+			if skippedNewTodoNums[num] {
+				continue
 			}
 			out.ManualPRLinks[strconv.Itoa(num)] = cleaned
 		}
@@ -301,20 +334,25 @@ func ValidateAndPrepareDecisions(
 
 	seenAck := make(map[int]bool, len(dec.AckRetriage))
 	for _, num := range dec.AckRetriage {
-		if num <= 0 || seenAck[num] {
+		if num <= 0 {
+			return out, nil, fmt.Errorf("invalid issue number %d in `ack_retriage`", num)
+		}
+		if seenAck[num] {
 			continue
 		}
 		if _, isExcluded := excludedByNum[num]; isExcluded {
 			return out, nil, fmt.Errorf("issue #%d appears in both `ack_retriage` and `exclude_issues`", num)
 		}
-		seenAck[num] = true
-		if skippedTodoNums[num] {
-			if _, activeNew := out.NewIssues[strconv.Itoa(num)]; !activeNew {
-				if _, activeOvr := out.Overrides[strconv.Itoa(num)]; !activeOvr {
-					continue
-				}
-			}
+		if _, inNew := seenNew[num]; inNew {
+			return out, nil, fmt.Errorf("issue #%d appears in both `new_issues` and `ack_retriage`", num)
 		}
+		if _, inOvr := seenOvr[num]; inOvr {
+			return out, nil, fmt.Errorf("issue #%d appears in both `overrides` and `ack_retriage`; `overrides` already resets the re-triage baseline", num)
+		}
+		if _, inNotes := seenNotes[num]; inNotes {
+			return out, nil, fmt.Errorf("issue #%d appears in both `notes` and `ack_retriage`; use `overrides` to update note while acknowledging re-triage", num)
+		}
+		seenAck[num] = true
 		out.AckRetriage = append(out.AckRetriage, num)
 	}
 

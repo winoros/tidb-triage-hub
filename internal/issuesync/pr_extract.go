@@ -104,20 +104,24 @@ func SortLinkedPRRefs(prs []model.LinkedPRRef) {
 			return 0
 		case p.State == "DRAFT" && !p.IsCherryPick:
 			return 1
-		case p.State == "MERGED" && !p.IsCherryPick:
+		case p.State == model.PRStateUnknown && !p.IsCherryPick:
 			return 2
-		case p.State == "OPEN" && p.IsCherryPick:
+		case p.State == "MERGED" && !p.IsCherryPick:
 			return 3
-		case p.State == "DRAFT" && p.IsCherryPick:
+		case p.State == "OPEN" && p.IsCherryPick:
 			return 4
-		case p.State == "MERGED" && p.IsCherryPick:
+		case p.State == "DRAFT" && p.IsCherryPick:
 			return 5
-		case p.State == "CLOSED" && !p.IsCherryPick:
+		case p.State == model.PRStateUnknown && p.IsCherryPick:
 			return 6
-		case p.State == "CLOSED" && p.IsCherryPick:
+		case p.State == "MERGED" && p.IsCherryPick:
 			return 7
-		default:
+		case p.State == "CLOSED" && !p.IsCherryPick:
 			return 8
+		case p.State == "CLOSED" && p.IsCherryPick:
+			return 9
+		default:
+			return 10
 		}
 	}
 	sort.Slice(prs, func(i, j int) bool {

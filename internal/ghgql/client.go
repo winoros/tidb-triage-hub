@@ -62,22 +62,50 @@ type HTTPRunner struct {
 	BaseBackoff time.Duration
 }
 
+// RedirectBlockedError indicates a deterministic redirect policy violation that must not be retried.
+type RedirectBlockedError struct {
+	msg string
+}
+
+func (e *RedirectBlockedError) Error() string {
+	return e.msg
+}
+
 // SafeRedirectPolicy blocks HTTPS->HTTP scheme downgrades, cross-origin redirects (including
-// same-hostname cross-port redirects that would leak Bearer tokens), and 301/302 method rewrites (POST -> GET).
+// same-hostname cross-port redirects that would leak Bearer tokens), and 301/302 method rewrites (POST -> GET),
+// while permitting same-authority HTTP -> HTTPS scheme upgrades when the HTTP method is preserved.
 func SafeRedirectPolicy(req *http.Request, via []*http.Request) error {
 	if len(via) >= 5 {
-		return fmt.Errorf("stopped after %d redirects", len(via))
+		return &RedirectBlockedError{msg: fmt.Sprintf("stopped after %d redirects", len(via))}
 	}
 	if len(via) == 0 {
 		return nil
 	}
 	orig := via[0]
+	prev := via[len(via)-1]
 	if orig.URL != nil && req.URL != nil {
-		if strings.EqualFold(orig.URL.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
-			return fmt.Errorf("refusing insecure HTTPS -> %s redirect to %s", req.URL.Scheme, req.URL.Redacted())
+		origScheme := strings.ToLower(strings.TrimSpace(orig.URL.Scheme))
+		prevScheme := ""
+		if prev != nil && prev.URL != nil {
+			prevScheme = strings.ToLower(strings.TrimSpace(prev.URL.Scheme))
 		}
-		if !httputil.SameOrigin(orig.URL, req.URL) {
-			return fmt.Errorf("refusing cross-host redirect from %s to %s", orig.URL.Host, req.URL.Host)
+		reqScheme := strings.ToLower(strings.TrimSpace(req.URL.Scheme))
+		if reqScheme != "http" && reqScheme != "https" {
+			return &RedirectBlockedError{msg: fmt.Sprintf("refusing unsupported %s redirect to %s", req.URL.Scheme, req.URL.Redacted())}
+		}
+		if (origScheme == "https" || prevScheme == "https") && reqScheme != "https" {
+			return &RedirectBlockedError{msg: fmt.Sprintf("refusing insecure HTTPS -> %s redirect to %s", req.URL.Scheme, req.URL.Redacted())}
+		}
+		sameAuthUpgrade := origScheme == "http" && reqScheme == "https" &&
+			httputil.NormalizeOriginHost(orig.URL.Host, "http") != "" &&
+			httputil.NormalizeOriginHost(orig.URL.Host, "http") == httputil.NormalizeOriginHost(req.URL.Host, "https")
+		if !httputil.SameOrigin(orig.URL, req.URL) && !sameAuthUpgrade {
+			origHost, ok1 := httputil.ExtractCanonicalHostname(orig.URL.Host)
+			reqHost, ok2 := httputil.ExtractCanonicalHostname(req.URL.Host)
+			if !ok1 || !ok2 || origHost != reqHost {
+				return &RedirectBlockedError{msg: fmt.Sprintf("refusing cross-host redirect from %s to %s", orig.URL.Host, req.URL.Host)}
+			}
+			return &RedirectBlockedError{msg: fmt.Sprintf("refusing cross-port redirect from %s://%s to %s://%s", origScheme, orig.URL.Host, reqScheme, req.URL.Host)}
 		}
 	}
 	if orig.Method != http.MethodGet && orig.Method != http.MethodHead && req.Method != orig.Method {
@@ -86,7 +114,7 @@ func SafeRedirectPolicy(req *http.Request, via []*http.Request) error {
 			u := &url.URL{Scheme: req.URL.Scheme, Host: req.URL.Host}
 			targetBase = u.String()
 		}
-		return fmt.Errorf("refusing %s -> %s redirect (configure target URL %s directly)", orig.Method, req.Method, targetBase)
+		return &RedirectBlockedError{msg: fmt.Sprintf("refusing %s -> %s redirect (configure target URL %s directly)", orig.Method, req.Method, targetBase)}
 	}
 	return nil
 }
@@ -175,9 +203,8 @@ func (r *HTTPRunner) Query(ctx context.Context, gql string, vars map[string]stri
 		resp, doErr := hc.Do(req)
 		if doErr != nil {
 			lastErr = doErr
-			if strings.Contains(doErr.Error(), "refusing insecure HTTPS") ||
-				strings.Contains(doErr.Error(), "refusing cross-host redirect") ||
-				strings.Contains(doErr.Error(), " redirect (configure target URL") {
+			var redirErr *RedirectBlockedError
+			if errors.As(doErr, &redirErr) {
 				return nil, lastErr
 			}
 		} else {
@@ -373,7 +400,9 @@ func (r *CLIRunner) Query(ctx context.Context, gql string, vars map[string]strin
 	for attempt := 0; attempt < attempts; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		cmd := exec.CommandContext(attemptCtx, "gh", args...)
+		cmd.WaitDelay = 5 * time.Second
 		out, err := cmd.Output()
+		attemptErr := attemptCtx.Err()
 		cancel()
 		if err == nil {
 			if isTransientGraphQLError(out) {
@@ -383,6 +412,10 @@ func (r *CLIRunner) Query(ctx context.Context, gql string, vars map[string]strin
 			} else {
 				return out, nil
 			}
+		} else if ctx.Err() != nil {
+			return nil, fmt.Errorf("gh api graphql: %w", ctx.Err())
+		} else if attemptErr != nil {
+			lastErr = fmt.Errorf("gh api graphql attempt timeout: %w", attemptErr)
 		} else if errors.Is(err, exec.ErrNotFound) {
 			return nil, err
 		} else if ee, ok := err.(*exec.ExitError); ok {

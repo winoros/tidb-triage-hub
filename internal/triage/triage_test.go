@@ -611,7 +611,8 @@ func TestFetchPendingPRDetailsNullDataCacheFreshnessAndSkipTodoCompanions(t *tes
 		t.Fatalf("expected SuggestedTriage subsystem=cbo_cost_join_reorder (ignoring closed statistics PR), got %+v", enriched[0].SuggestedTriage)
 	}
 
-	// 3. SkipTodo skips companion manual_pr_links and ack_retriage for skipped TODO issues
+	// 3. SkipTodo skips incomplete new_issues (and its companion manual_pr_links) and incomplete notes,
+	// while enforcing strict mutual exclusion across overrides, notes, exclude_issues, and ack_retriage.
 	todoDec := model.BatchTriageDecisions{
 		NewIssues: map[string]model.TriagePatchRequest{
 			"74100": {
@@ -627,20 +628,22 @@ func TestFetchPendingPRDetailsNullDataCacheFreshnessAndSkipTodoCompanions(t *tes
 				Note:      &model.LocalizedNote{ZhCN: "统计信息直方图边界缺少空值判断导致估算偏差", En: "Missing null check in histogram boundary causes misestimation"},
 			},
 		},
-		Overrides: map[string]model.TriagePatchRequest{
+		Notes: map[string]model.NotePatchRequest{
 			"74200": {
-				Cat:       "HARD",
-				Severity:  "CRITICAL",
-				Subsystem: "logical_rewrite",
-				Note:      &model.LocalizedNote{ZhCN: "TODO: 待确认重分拣结论", En: "TODO: verify retriage"},
+				ZhCN: "TODO: 待补充历史备注",
+				En:   "TODO: backfill note",
+			},
+			"74201": {
+				ZhCN:              "`buildRange` 处理前缀索引时未截断上界导致结果集偏小",
+				En:                "`buildRange` fails to truncate upper bound on prefix index, causing missing rows",
+				IfUnmodifiedSince: "2026-11-12T10:00:00Z",
 			},
 		},
 		ManualPRLinks: map[string][]string{
 			"74100": {"75001"},
 			"74101": {"75002"},
-			"74200": {"75003"},
 		},
-		AckRetriage: model.FlexIntList{74200, 74300},
+		AckRetriage: model.FlexIntList{74300},
 	}
 	cleaned, _, err := ValidateAndPrepareDecisions(todoDec, ValidateOptions{SkipTodo: true})
 	if err != nil {
@@ -649,13 +652,89 @@ func TestFetchPendingPRDetailsNullDataCacheFreshnessAndSkipTodoCompanions(t *tes
 	if _, has74100 := cleaned.ManualPRLinks["74100"]; has74100 {
 		t.Fatalf("expected companion manual_pr_links for skipped TODO new_issue #74100 to be omitted, got %+v", cleaned.ManualPRLinks)
 	}
-	if _, has74200 := cleaned.ManualPRLinks["74200"]; has74200 {
-		t.Fatalf("expected companion manual_pr_links for skipped TODO override #74200 to be omitted, got %+v", cleaned.ManualPRLinks)
-	}
 	if len(cleaned.ManualPRLinks["74101"]) != 1 || cleaned.ManualPRLinks["74101"][0] != "75002" {
 		t.Fatalf("expected manual_pr_links for active #74101 preserved, got %+v", cleaned.ManualPRLinks)
 	}
+	if len(cleaned.Notes) != 1 || cleaned.Notes["74201"].IfUnmodifiedSince != "2026-11-12T10:00:00.000000000Z" {
+		t.Fatalf("expected only completed note #74201 with normalized IfUnmodifiedSince, got %+v", cleaned.Notes)
+	}
 	if len(cleaned.AckRetriage) != 1 || cleaned.AckRetriage[0] != 74300 {
-		t.Fatalf("expected companion ack_retriage for skipped TODO #74200 to be omitted while keeping #74300, got %v", cleaned.AckRetriage)
+		t.Fatalf("expected ack_retriage [74300] preserved, got %v", cleaned.AckRetriage)
+	}
+
+	// 4. Strict mutual exclusion: overrides (even with Note == nil) + exclude_issues MUST fail
+	if _, _, err := ValidateAndPrepareDecisions(model.BatchTriageDecisions{
+		ExcludeIssues: map[string]string{"74500": "non-opt"},
+		Overrides: map[string]model.TriagePatchRequest{
+			"74500": {Cat: "EASY", Severity: "MINOR", Subsystem: "statistics", Note: nil},
+		},
+	}, ValidateOptions{}); err == nil || !strings.Contains(err.Error(), "both `overrides` and `exclude_issues`") {
+		t.Fatalf("expected Note==nil override + exclude_issues to fail, got %v", err)
+	}
+	// overrides + ack_retriage MUST fail
+	if _, _, err := ValidateAndPrepareDecisions(model.BatchTriageDecisions{
+		Overrides: map[string]model.TriagePatchRequest{
+			"74501": {Cat: "EASY", Severity: "MINOR", Subsystem: "statistics", Note: nil},
+		},
+		AckRetriage: model.FlexIntList{74501},
+	}, ValidateOptions{}); err == nil || !strings.Contains(err.Error(), "both `overrides` and `ack_retriage`") {
+		t.Fatalf("expected overrides + ack_retriage to fail, got %v", err)
+	}
+	// notes + overrides MUST fail
+	if _, _, err := ValidateAndPrepareDecisions(model.BatchTriageDecisions{
+		Overrides: map[string]model.TriagePatchRequest{
+			"74502": {Cat: "EASY", Severity: "MINOR", Subsystem: "statistics", Note: nil},
+		},
+		Notes: map[string]model.NotePatchRequest{
+			"74502": {ZhCN: "统计信息直方图边界缺少空值判断导致估算偏差", En: "Missing null check in histogram boundary causes misestimation"},
+		},
+	}, ValidateOptions{}); err == nil || !strings.Contains(err.Error(), "both `overrides` and `notes`") {
+		t.Fatalf("expected overrides + notes to fail, got %v", err)
+	}
+
+	// 5. EvaluateRetriage pre-baseline vs post-baseline merge detection for UNKNOWN manual PR links
+	openKeys, mergedKeys := ExtractMainlinePRKeySets([]model.LinkedPRRef{
+		{Repo: "pingcap/tidb", Num: 80001, State: model.PRStateUnknown},
+	})
+	if len(openKeys) != 1 || openKeys[0] != "pingcap/tidb#80001" || len(mergedKeys) != 0 {
+		t.Fatalf("expected UNKNOWN PR to be recorded in openKeys baseline, got open=%v merged=%v", openKeys, mergedKeys)
+	}
+	// Merged BEFORE AckAt (even if UpdatedAt was bumped later by a post-merge comment) -> must NOT trigger fix_pr_merged_still_open
+	preMergedReasons, _ := EvaluateRetriage(RetriageEvalInput{
+		CurrentCat:         "MEDIUM",
+		CurrentSeverity:    "MAJOR",
+		BaselineOpenPRKeys: openKeys,
+		TriagedAt:          "2026-11-15T10:00:00Z",
+		CurrentPRs: []model.LinkedPRRef{{
+			Repo:      "pingcap/tidb",
+			Num:       80001,
+			Label:     "#80001",
+			State:     "MERGED",
+			MergedAt:  "2026-11-14T08:00:00Z",
+			UpdatedAt: "2026-11-15T12:00:00Z",
+			AckAt:     "2026-11-15T10:00:00Z",
+		}},
+	})
+	if len(preMergedReasons) != 0 {
+		t.Fatalf("expected pre-baseline merged manual PR not to trigger retriage, got %v", preMergedReasons)
+	}
+	// Merged AFTER AckAt -> MUST trigger fix_pr_merged_still_open
+	postMergedReasons, _ := EvaluateRetriage(RetriageEvalInput{
+		CurrentCat:         "MEDIUM",
+		CurrentSeverity:    "MAJOR",
+		BaselineOpenPRKeys: openKeys,
+		TriagedAt:          "2026-11-15T10:00:00Z",
+		CurrentPRs: []model.LinkedPRRef{{
+			Repo:      "pingcap/tidb",
+			Num:       80001,
+			Label:     "#80001",
+			State:     "MERGED",
+			MergedAt:  "2026-11-15T11:00:00Z",
+			UpdatedAt: "2026-11-15T11:00:00Z",
+			AckAt:     "2026-11-15T10:00:00Z",
+		}},
+	})
+	if len(postMergedReasons) != 1 || postMergedReasons[0] != model.RetriageFixPRMergedOpen {
+		t.Fatalf("expected post-baseline merged PR to trigger fix_pr_merged_still_open, got %v", postMergedReasons)
 	}
 }

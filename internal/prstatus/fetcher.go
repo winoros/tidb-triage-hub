@@ -25,6 +25,7 @@ fragment PRStatusFields on PullRequest {
   mergeable
   createdAt
   updatedAt
+  mergedAt
   author { login }
   labels(first: 30) { nodes { name } }
   reviewRequests(first: 15) {
@@ -115,6 +116,7 @@ type gqlPRNode struct {
 	Mergeable   string `json:"mergeable"`
 	CreatedAt   string `json:"createdAt"`
 	UpdatedAt   string `json:"updatedAt"`
+	MergedAt    string `json:"mergedAt"`
 	Author    *struct {
 		Login string `json:"login"`
 	} `json:"author"`
@@ -302,6 +304,7 @@ func toRawPRInput(repo string, sources []string, n gqlPRNode) RawPRInput {
 		Mergeable:          n.Mergeable,
 		CreatedAt:          n.CreatedAt,
 		UpdatedAt:          n.UpdatedAt,
+		MergedAt:           n.MergedAt,
 		LastCommitAt:       lastCommitAt,
 		Labels:             labels,
 		RequestedReviewers: reqRevs,

@@ -21,6 +21,7 @@ fragment PRFileEnrichFields on PullRequest {
   state
   isDraft
   updatedAt
+  mergedAt
   baseRefName
   additions
   deletions
@@ -90,6 +91,7 @@ type gqlPREnrichNode struct {
 	State        string `json:"state"`
 	IsDraft      bool   `json:"isDraft"`
 	UpdatedAt    string `json:"updatedAt"`
+	MergedAt     string `json:"mergedAt"`
 	BaseRefName  string `json:"baseRefName"`
 	Additions    int    `json:"additions"`
 	Deletions    int    `json:"deletions"`
@@ -155,6 +157,9 @@ func FetchPendingPRDetails(
 		nums := byRepo[repo]
 		sort.Slice(nums, func(i, j int) bool { return nums[i] > nums[j] })
 		for i := 0; i < len(nums); i += batchSize {
+			if err := ctx.Err(); err != nil {
+				return out, err
+			}
 			end := i + batchSize
 			if end > len(nums) {
 				end = len(nums)
@@ -254,6 +259,7 @@ func FetchPendingPRDetails(
 					Title:             node.Title,
 					State:             state,
 					UpdatedAt:         node.UpdatedAt,
+					MergedAt:          node.MergedAt,
 					Author:            author,
 					BaseRefName:       node.BaseRefName,
 					IsCherryPick:      isCP,

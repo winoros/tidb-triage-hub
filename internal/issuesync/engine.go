@@ -179,6 +179,7 @@ type gqlPRSearchNode struct {
 	State       string `json:"state"`
 	IsDraft     bool   `json:"isDraft"`
 	UpdatedAt   string `json:"updatedAt"`
+	MergedAt    string `json:"mergedAt"`
 	Labels      struct {
 		Nodes []struct {
 			Name string `json:"name"`
@@ -326,6 +327,7 @@ type gqlTimelinePR struct {
 	BaseRefName string `json:"baseRefName"`
 	URL         string `json:"url"`
 	UpdatedAt   string `json:"updatedAt"`
+	MergedAt    string `json:"mergedAt"`
 	Labels      struct {
 		Nodes []struct {
 			Name string `json:"name"`
@@ -397,6 +399,7 @@ func (it gqlFullIssueNode) toLiveUpdate() LiveIssueUpdate {
 			pr.Repo.NameWithOwner, pr.Number, pr.Title, pr.State, pr.IsDraft,
 			pr.URL, pr.UpdatedAt, pr.labelNames(), pr.BaseRefName, model.LinkSourceTimeline,
 		)
+		ref.MergedAt = strings.TrimSpace(pr.MergedAt)
 		byURL[ref.URL] = ref
 	}
 	prs := make([]model.LinkedPRRef, 0, len(byURL))
@@ -464,7 +467,13 @@ func (it gqlFullIssueNode) toPendingCandidate(
 		if prev, ok := prMap[k]; ok {
 			if model.CompareRFC3339(p.UpdatedAt, prev.UpdatedAt) > 0 {
 				p.Source = prev.Source
+				if p.MergedAt == "" && prev.MergedAt != "" {
+					p.MergedAt = prev.MergedAt
+				}
 				prMap[k] = p
+			} else if prev.MergedAt == "" && p.MergedAt != "" {
+				prev.MergedAt = p.MergedAt
+				prMap[k] = prev
 			}
 			continue
 		}
@@ -831,6 +840,7 @@ func (e *Engine) PlanSync(ctx context.Context, state SyncState, opts Options) (S
 			prNode.State, prNode.IsDraft, prNode.URL, prNode.UpdatedAt,
 			prNode.labelNames(), prNode.BaseRefName, model.LinkSourcePRRef,
 		)
+		ref.MergedAt = strings.TrimSpace(prNode.MergedAt)
 		prKey := model.PRKey(ref.Repo, ref.Num)
 		if prevIssues, ok := prevPRToIssues[prKey]; ok {
 			directPRUpdates[prKey] = ref
@@ -1329,8 +1339,10 @@ func (e *Engine) PlanSync(ctx context.Context, state SyncState, opts Options) (S
 		}
 	}
 
-	// Filter StreamBPRRefs to only active/restored/pending issues so we don't store links for unrelated TiDB issues
-	relevantIssues := make(map[int]bool, len(state.TrackedIssues)+len(restoredIssues)+len(upsertPending))
+	// Filter StreamBPRRefs to only active/restored/pending issues so we don't store links for unrelated TiDB issues.
+	// Include pendingLiveUpdates and pendingScopes so any pending candidate concurrently accepted into `issues`
+	// while PlanSync was running still receives its Stream B PR links when ApplyIssueSync executes.
+	relevantIssues := make(map[int]bool, len(state.TrackedIssues)+len(restoredIssues)+len(upsertPending)+len(pendingScopes))
 	for n := range state.TrackedIssues {
 		relevantIssues[n] = true
 	}
@@ -1340,8 +1352,17 @@ func (e *Engine) PlanSync(ctx context.Context, state SyncState, opts Options) (S
 	for _, p := range upsertPending {
 		relevantIssues[p.Number] = true
 	}
+	for n := range pendingLiveUpdates {
+		relevantIssues[n] = true
+	}
+	for n := range pendingScopes {
+		relevantIssues[n] = true
+	}
 	for _, c := range closedRemovals {
 		delete(relevantIssues, c.Number)
+	}
+	for _, cp := range closedPendingRemovals {
+		delete(relevantIssues, cp.Number)
 	}
 	for _, g := range graduatedRemovals {
 		delete(relevantIssues, g.Number)

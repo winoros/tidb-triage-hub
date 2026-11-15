@@ -147,7 +147,7 @@ func SuggestTriage(
 			continue
 		}
 		allMainlineDetails = append(allMainlineDetails, d)
-		if d.State != "CLOSED" {
+		if d.State != "CLOSED" && d.State != model.PRStateUnknown {
 			activeOrMergedDetails = append(activeOrMergedDetails, d)
 		}
 	}
@@ -392,7 +392,7 @@ func AnalyzeCandidate(pc *model.PendingCandidate) {
 func FilterRelevantKernelPRs(prs []model.LinkedPRRef) []model.LinkedPRRef {
 	hasActiveOrMerged := false
 	for _, pr := range prs {
-		if !pr.IsCherryPick && pr.State != "CLOSED" && issuesync.IsKernelRepo(pr.Repo) {
+		if !pr.IsCherryPick && pr.State != "CLOSED" && pr.State != model.PRStateUnknown && pr.State != "" && issuesync.IsKernelRepo(pr.Repo) {
 			hasActiveOrMerged = true
 			break
 		}
@@ -411,6 +411,12 @@ func FilterRelevantKernelPRs(prs []model.LinkedPRRef) []model.LinkedPRRef {
 }
 
 func isCachedPRDetailFresh(prev model.PendingPRDetail, pr model.LinkedPRRef) bool {
+	if prev.State == "" || prev.State == model.PRStateUnknown {
+		return false
+	}
+	if pr.State == model.PRStateUnknown {
+		return true
+	}
 	if pr.UpdatedAt == "" {
 		return prev.State == pr.State
 	}
@@ -425,6 +431,63 @@ func isCachedPRDetailFresh(prev model.PendingPRDetail, pr model.LinkedPRRef) boo
 		return true
 	}
 	return prev.State == pr.State
+}
+
+// SyncPRRefsWithDetails updates a slice of LinkedPRRefs monotonically using fetched PendingPRDetails
+// (propagating State, UpdatedAt, MergedAt, Title, and IsCherryPick when the detail is at least as fresh)
+// and returns the filtered relevant PRDetails slice for clue extraction and triage suggestions.
+func SyncPRRefsWithDetails(
+	prs []model.LinkedPRRef,
+	detailMap map[string]model.PendingPRDetail,
+) ([]model.LinkedPRRef, []model.PendingPRDetail) {
+	if len(prs) == 0 {
+		return prs, nil
+	}
+	syncedPRs := make([]model.LinkedPRRef, len(prs))
+	copy(syncedPRs, prs)
+	if len(detailMap) == 0 {
+		return syncedPRs, nil
+	}
+	for j := range syncedPRs {
+		d, ok := detailMap[model.PRKey(syncedPRs[j].Repo, syncedPRs[j].Num)]
+		if !ok {
+			continue
+		}
+		canApply := false
+		switch {
+		case syncedPRs[j].State == "" || syncedPRs[j].State == model.PRStateUnknown:
+			canApply = d.State != "" && d.State != model.PRStateUnknown
+		case syncedPRs[j].UpdatedAt == "":
+			canApply = d.State != "" && d.State != model.PRStateUnknown
+		case d.UpdatedAt != "":
+			cmp := model.CompareRFC3339(d.UpdatedAt, syncedPRs[j].UpdatedAt)
+			canApply = cmp > 0 || (cmp == 0 && !(syncedPRs[j].State == "MERGED" && d.State != "MERGED"))
+		}
+		if canApply {
+			if d.State != "" && d.State != model.PRStateUnknown {
+				syncedPRs[j].State = d.State
+			}
+			if d.UpdatedAt != "" {
+				syncedPRs[j].UpdatedAt = d.UpdatedAt
+			}
+			if d.MergedAt != "" {
+				syncedPRs[j].MergedAt = d.MergedAt
+			}
+			if d.Title != "" {
+				syncedPRs[j].Title = d.Title
+			}
+			syncedPRs[j].IsCherryPick = d.IsCherryPick
+		} else if syncedPRs[j].MergedAt == "" && d.MergedAt != "" {
+			syncedPRs[j].MergedAt = d.MergedAt
+		}
+	}
+	var dets []model.PendingPRDetail
+	for _, pr := range FilterRelevantKernelPRs(syncedPRs) {
+		if d, ok := detailMap[model.PRKey(pr.Repo, pr.Num)]; ok {
+			dets = append(dets, d)
+		}
+	}
+	return syncedPRs, dets
 }
 
 // CandidateNeedsPREnrichment reports whether any active/merged kernel mainline PR on `c`
@@ -488,34 +551,7 @@ func EnrichAndAnalyzePending(
 	for i := range candidates {
 		pc := candidates[i]
 		if len(detailMap) > 0 {
-			if len(pc.PRs) > 0 {
-				syncedPRs := make([]model.LinkedPRRef, len(pc.PRs))
-				copy(syncedPRs, pc.PRs)
-				for j := range syncedPRs {
-					if d, ok := detailMap[model.PRKey(syncedPRs[j].Repo, syncedPRs[j].Num)]; ok {
-						if d.UpdatedAt == "" || syncedPRs[j].UpdatedAt == "" || model.CompareRFC3339(d.UpdatedAt, syncedPRs[j].UpdatedAt) >= 0 {
-							if d.State != "" {
-								syncedPRs[j].State = d.State
-							}
-							if d.UpdatedAt != "" {
-								syncedPRs[j].UpdatedAt = d.UpdatedAt
-							}
-							if d.Title != "" {
-								syncedPRs[j].Title = d.Title
-							}
-							syncedPRs[j].IsCherryPick = d.IsCherryPick
-						}
-					}
-				}
-				pc.PRs = syncedPRs
-			}
-			var dets []model.PendingPRDetail
-			for _, pr := range FilterRelevantKernelPRs(pc.PRs) {
-				if d, ok := detailMap[model.PRKey(pr.Repo, pr.Num)]; ok {
-					dets = append(dets, d)
-				}
-			}
-			pc.PRDetails = dets
+			pc.PRs, pc.PRDetails = SyncPRRefsWithDetails(pc.PRs, detailMap)
 		}
 		AnalyzeCandidate(&pc)
 		out[i] = pc

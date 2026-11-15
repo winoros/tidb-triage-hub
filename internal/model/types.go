@@ -99,6 +99,8 @@ const (
 	LinkSourceManual   = "manual"
 	LinkSourcePRRef    = "pr_ref"
 	LinkSourceTimeline = "timeline"
+
+	PRStateUnknown = "UNKNOWN"
 )
 
 const (
@@ -135,6 +137,8 @@ type LinkedPRRef struct {
 	Title        string `json:"title"`
 	IsCherryPick bool   `json:"is_cherry_pick"`
 	UpdatedAt    string `json:"updated_at"`
+	MergedAt     string `json:"merged_at,omitempty"`
+	AckAt        string `json:"-"`
 	Source       string `json:"source,omitempty"`
 }
 
@@ -213,6 +217,7 @@ type PRStatus struct {
 	SizeLabel          string        `json:"size_label,omitempty"`
 	CreatedAt          string        `json:"created_at,omitempty"`
 	UpdatedAt          string        `json:"updated_at"`
+	MergedAt           string        `json:"merged_at,omitempty"`
 	UpdatedDisplay     string        `json:"updated_display"`
 	LastCommitAt       string        `json:"last_commit_at,omitempty"`
 	WaitingSince       string        `json:"waiting_since,omitempty"`
@@ -325,6 +330,7 @@ type PendingPRDetail struct {
 	Title             string       `json:"title"`
 	State             string       `json:"state"`
 	UpdatedAt         string       `json:"updated_at,omitempty"`
+	MergedAt          string       `json:"merged_at,omitempty"`
 	Author            string       `json:"author,omitempty"`
 	BaseRefName       string       `json:"base_ref_name,omitempty"`
 	IsCherryPick      bool         `json:"is_cherry_pick,omitempty"`
@@ -363,6 +369,7 @@ type SuggestedTriage struct {
 
 type PendingCandidate struct {
 	Revision        int               `json:"-"`
+	SyncWatermark   string            `json:"sync_watermark,omitempty"`
 	Number          int               `json:"number"`
 	URL             string            `json:"url"`
 	Title           string            `json:"title"`
@@ -456,11 +463,45 @@ type TriageConflict struct {
 	Message string `json:"message"`
 }
 
+type NotePatchRequest struct {
+	ZhCN              string `json:"zh-CN"`
+	En                string `json:"en"`
+	IfUnmodifiedSince string `json:"if_unmodified_since,omitempty"`
+}
+
+func (n NotePatchRequest) LocalizedNote() *LocalizedNote {
+	return &LocalizedNote{ZhCN: n.ZhCN, En: n.En}
+}
+
+func (n *NotePatchRequest) UnmarshalJSON(data []byte) error {
+	var aux struct {
+		ZhCN              string         `json:"zh-CN"`
+		En                string         `json:"en"`
+		Note              *LocalizedNote `json:"note"`
+		IfUnmodifiedSince string         `json:"if_unmodified_since"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	zh, en := aux.ZhCN, aux.En
+	if zh == "" && en == "" && aux.Note != nil {
+		zh = aux.Note.ZhCN
+		en = aux.Note.En
+	}
+	*n = NotePatchRequest{
+		ZhCN:              zh,
+		En:                en,
+		IfUnmodifiedSince: aux.IfUnmodifiedSince,
+	}
+	return nil
+}
+
 type BatchTriageDecisions struct {
 	BaseExportedAt string                        `json:"base_exported_at,omitempty"`
 	NewIssues      map[string]TriagePatchRequest `json:"new_issues,omitempty"`
 	ExcludeIssues  map[string]string             `json:"exclude_issues,omitempty"`
 	Overrides      map[string]TriagePatchRequest `json:"overrides,omitempty"`
+	Notes          map[string]NotePatchRequest   `json:"notes,omitempty"`
 	AckRetriage    FlexIntList                   `json:"ack_retriage,omitempty"`
 	ManualPRLinks  map[string][]string           `json:"manual_pr_links,omitempty"`
 }
@@ -696,14 +737,15 @@ func MaxRFC3339(vals ...string) string {
 }
 
 type PendingResolveRequest struct {
-	Action           string         `json:"action"` // "accept" or "exclude"
-	Cat              string         `json:"cat,omitempty"`
-	Severity         string         `json:"severity,omitempty"`
-	Subsystem        string         `json:"subsystem,omitempty"`
-	IsBorderlineKept bool           `json:"is_borderline_kept,omitempty"`
-	ForceKeep        bool           `json:"force_keep,omitempty"`
-	Note             *LocalizedNote `json:"note,omitempty"`
-	ExcludeReason    string         `json:"exclude_reason,omitempty"`
+	Action            string         `json:"action"` // "accept" or "exclude"
+	Cat               string         `json:"cat,omitempty"`
+	Severity          string         `json:"severity,omitempty"`
+	Subsystem         string         `json:"subsystem,omitempty"`
+	IsBorderlineKept  bool           `json:"is_borderline_kept,omitempty"`
+	ForceKeep         bool           `json:"force_keep,omitempty"`
+	Note              *LocalizedNote `json:"note,omitempty"`
+	ExcludeReason     string         `json:"exclude_reason,omitempty"`
+	IfUnmodifiedSince string         `json:"if_unmodified_since,omitempty"`
 }
 
 func IsRealBugCategory(cat string) bool {

@@ -26,6 +26,7 @@ type RetriageEvalInput struct {
 	BaselineOpenPRKeys   []string
 	BaselineMergedPRKeys []string
 	CommentWatermarkUTC  string
+	TriagedAt            string
 }
 
 var (
@@ -74,7 +75,8 @@ func cleanSubstantiveComment(body string) string {
 	return strings.TrimSpace(strings.Join(kept, " "))
 }
 
-// ExtractMainlinePRKeySets returns sorted slices of mainline OPEN/DRAFT PR keys and mainline MERGED PR keys.
+// ExtractMainlinePRKeySets returns sorted slices of mainline OPEN/DRAFT/UNKNOWN PR keys
+// (non-merged linked PRs known at baseline time) and mainline MERGED PR keys.
 func ExtractMainlinePRKeySets(prs []model.LinkedPRRef) (openKeys []string, mergedKeys []string) {
 	openSet := make(map[string]bool)
 	mergedSet := make(map[string]bool)
@@ -84,7 +86,7 @@ func ExtractMainlinePRKeySets(prs []model.LinkedPRRef) (openKeys []string, merge
 		}
 		k := model.PRKey(p.Repo, p.Num)
 		switch p.State {
-		case "OPEN", "DRAFT":
+		case "OPEN", "DRAFT", model.PRStateUnknown:
 			openSet[k] = true
 		case "MERGED":
 			mergedSet[k] = true
@@ -99,6 +101,24 @@ func ExtractMainlinePRKeySets(prs []model.LinkedPRRef) (openKeys []string, merge
 	sort.Strings(openKeys)
 	sort.Strings(mergedKeys)
 	return openKeys, mergedKeys
+}
+
+func wasPRAlreadyMergedAtBaseline(p model.LinkedPRRef, wasLinkedInOpenBaseline bool, fallbackTriagedAt string) bool {
+	ackAt := strings.TrimSpace(p.AckAt)
+	if !wasLinkedInOpenBaseline && ackAt == "" {
+		return false
+	}
+	if strings.TrimSpace(p.MergedAt) == "" {
+		return false
+	}
+	baseAt := ackAt
+	if baseAt == "" {
+		baseAt = strings.TrimSpace(fallbackTriagedAt)
+	}
+	if baseAt == "" {
+		return false
+	}
+	return model.CompareRFC3339(p.MergedAt, baseAt) <= 0
 }
 
 // EvaluateRetriage compares an issue's live state against its last acknowledged baseline.
@@ -134,11 +154,13 @@ func EvaluateRetriage(in RetriageEvalInput) ([]string, []model.RetriageTrigger) 
 			continue
 		}
 		k := model.PRKey(p.Repo, p.Num)
-		if (p.State == "OPEN" || p.State == "DRAFT") && !baseOpen[k] && !baseMerged[k] {
+		if (p.State == "OPEN" || p.State == "DRAFT") && !baseOpen[k] && !baseMerged[k] && strings.TrimSpace(p.AckAt) == "" {
 			newOpenLabels = append(newOpenLabels, p.Label)
 		}
 		if p.State == "MERGED" && !baseMerged[k] {
-			newMergedLabels = append(newMergedLabels, p.Label)
+			if !wasPRAlreadyMergedAtBaseline(p, baseOpen[k], in.TriagedAt) {
+				newMergedLabels = append(newMergedLabels, p.Label)
+			}
 		}
 	}
 	isFilteredCat := strings.HasPrefix(in.CurrentCat, "FILTER_")

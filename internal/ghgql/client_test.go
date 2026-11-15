@@ -3,6 +3,7 @@ package ghgql
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -243,8 +244,22 @@ func TestSafeRedirectDeterministicGraphQLUTF8AndQuotaEmptyGuard(t *testing.T) {
 		t.Fatalf("expected same-host 307 POST redirect to pass, got %v", err)
 	}
 	crossPort, _ := http.NewRequest(http.MethodPost, "https://api.github.com:8443/v2/graphql", nil)
-	if err := SafeRedirectPolicy(crossPort, []*http.Request{origHTTPS}); err == nil || !strings.Contains(err.Error(), "cross-host") {
-		t.Fatalf("expected same-hostname cross-port redirect to be blocked, got %v", err)
+	if err := SafeRedirectPolicy(crossPort, []*http.Request{origHTTPS}); err == nil || !strings.Contains(err.Error(), "cross-port") {
+		t.Fatalf("expected same-hostname cross-port redirect to be blocked with cross-port error, got %v", err)
+	}
+	origHTTP, _ := http.NewRequest(http.MethodGet, "http://hub.internal/api/status", nil)
+	upgradeHTTPS, _ := http.NewRequest(http.MethodGet, "https://hub.internal:443/api/status", nil)
+	if err := SafeRedirectPolicy(upgradeHTTPS, []*http.Request{origHTTP}); err != nil {
+		t.Fatalf("expected same-authority HTTP->HTTPS upgrade redirect to pass, got %v", err)
+	}
+	downgradeHop2, _ := http.NewRequest(http.MethodGet, "http://hub.internal/api/status", nil)
+	if err := SafeRedirectPolicy(downgradeHop2, []*http.Request{origHTTP, upgradeHTTPS}); err == nil || !strings.Contains(err.Error(), "insecure") {
+		t.Fatalf("expected second-hop HTTPS->HTTP downgrade to be blocked, got %v", err)
+	}
+	origHTTPPort, _ := http.NewRequest(http.MethodGet, "http://hub.internal:8787/api/status", nil)
+	upgradeDiffPort, _ := http.NewRequest(http.MethodGet, "https://hub.internal:8443/api/status", nil)
+	if err := SafeRedirectPolicy(upgradeDiffPort, []*http.Request{origHTTPPort}); err == nil || !strings.Contains(err.Error(), "cross-port") {
+		t.Fatalf("expected HTTP:8787 -> HTTPS:8443 cross-port redirect to be blocked, got %v", err)
 	}
 
 	// 2. Deterministic HTTP 200 GraphQL error fails fast (1 attempt), while secondary rate limit retries
@@ -299,5 +314,21 @@ func TestSafeRedirectDeterministicGraphQLUTF8AndQuotaEmptyGuard(t *testing.T) {
 	}
 	if _, err := CheckQuota(context.Background(), emptyQuotaRunner, 0); err == nil {
 		t.Fatal("expected CheckQuota to reject empty rateLimit response with Limit==0")
+	}
+
+	// 5. CLIRunner preserves context.DeadlineExceeded when canceled by deadline
+	tmp := t.TempDir()
+	fakeGH := filepath.Join(tmp, "gh")
+	sleepScript := "#!/bin/sh\nexec sleep 5\n"
+	if err := os.WriteFile(fakeGH, []byte(sleepScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", tmp+string(os.PathListSeparator)+os.Getenv("PATH"))
+	tctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	cliRunner := &CLIRunner{MaxAttempts: 1, BaseBackoff: 5 * time.Millisecond}
+	_, dErr := cliRunner.Query(tctx, "query { viewer { login } }", nil)
+	if !errors.Is(dErr, context.DeadlineExceeded) {
+		t.Fatalf("expected CLIRunner timeout error to wrap context.DeadlineExceeded, got %v", dErr)
 	}
 }
