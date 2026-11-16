@@ -109,7 +109,6 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 	}
 	// Mode A: Backfill notes for existing issues lacking root-cause notes
 	if opts.BackfillNotes > 0 {
-		exportedAt := model.NowRFC3339Nano()
 		recs, err := sy.store.ListBackfillNoteCandidates(opts.BackfillNotes, opts.CatFilter)
 		if err != nil {
 			return nil, 0, fmt.Errorf("list backfill candidates: %w", err)
@@ -126,8 +125,15 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 				if err := ctx.Err(); err != nil {
 					return nil, 0, err
 				}
+				if len(prDetailMap) > 0 {
+					_ = sy.store.SyncFetchedPRDetails(prDetailMap)
+					if refreshed, rErr := sy.store.ListBackfillNoteCandidates(opts.BackfillNotes, opts.CatFilter); rErr == nil {
+						recs = refreshed
+					}
+				}
 			}
 		}
+		exportedAt := model.NowRFC3339Nano()
 
 		type backfillItem struct {
 			Number      int                     `json:"number"`
@@ -145,15 +151,10 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 		items := make([]backfillItem, 0, len(recs))
 		tmplNotes := make(map[string]model.NotePatchRequest, len(recs))
 		for _, r := range recs {
-			var dets []model.PendingPRDetail
-			for _, p := range triage.FilterRelevantKernelPRs(r.PRs) {
-				if d, ok := prDetailMap[model.PRKey(p.Repo, p.Num)]; ok {
-					dets = append(dets, d)
-				}
-			}
 			syncedPRs := r.PRs
+			var dets []model.PendingPRDetail
 			if len(prDetailMap) > 0 {
-				syncedPRs, _ = triage.SyncPRRefsWithDetails(r.PRs, prDetailMap)
+				syncedPRs, dets = triage.SyncPRRefsWithDetails(r.PRs, prDetailMap)
 			}
 			items = append(items, backfillItem{
 				Number:      r.Number,
@@ -207,9 +208,32 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 	skipPending := opts.OnlyRetriage || (len(specificRetriageNums) > 0 && len(wantPendingNums) == 0)
 	skipRetriage := opts.OnlyPending || (len(wantPendingNums) > 0 && len(specificRetriageNums) == 0)
 
-	// Capture exportedAt and read both SQLite snapshots BEFORE running slow GraphQL PR enrichment,
-	// ensuring concurrency watermarks accurately match the database state exported here.
-	exportedAt := model.NowRFC3339Nano()
+	filterPendingSlice := func(list []model.PendingCandidate) []model.PendingCandidate {
+		if len(wantPendingNums) == 0 && strings.TrimSpace(opts.ScopeFilter) == "" {
+			return list
+		}
+		sf := strings.ToLower(strings.TrimSpace(opts.ScopeFilter))
+		filtered := make([]model.PendingCandidate, 0, len(list))
+		for _, pc := range list {
+			if len(wantPendingNums) > 0 && !wantPendingNums[pc.Number] {
+				continue
+			}
+			if sf != "" {
+				matched := false
+				for _, sc := range pc.MatchedScopes {
+					if strings.Contains(strings.ToLower(sc), sf) {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					continue
+				}
+			}
+			filtered = append(filtered, pc)
+		}
+		return filtered
+	}
 
 	var pending []model.PendingCandidate
 	if !skipPending {
@@ -218,39 +242,19 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 		if err != nil {
 			return nil, 0, fmt.Errorf("list pending candidates: %w", err)
 		}
-		if len(wantPendingNums) > 0 || strings.TrimSpace(opts.ScopeFilter) != "" {
-			sf := strings.ToLower(strings.TrimSpace(opts.ScopeFilter))
-			filtered := make([]model.PendingCandidate, 0, len(pending))
-			for _, pc := range pending {
-				if len(wantPendingNums) > 0 && !wantPendingNums[pc.Number] {
-					continue
-				}
-				if sf != "" {
-					matched := false
-					for _, sc := range pc.MatchedScopes {
-						if strings.Contains(strings.ToLower(sc), sf) {
-							matched = true
-							break
-						}
-					}
-					if !matched {
-						continue
-					}
-				}
-				filtered = append(filtered, pc)
-			}
-			pending = filtered
-		}
+		pending = filterPendingSlice(pending)
 	}
 
 	var retriageList []model.RetriageCandidate
+	loadRetriage := func() ([]model.RetriageCandidate, error) {
+		if len(specificRetriageNums) > 0 {
+			return sy.store.ListRetriageCandidates(false, specificRetriageNums)
+		}
+		return sy.store.ListRetriageCandidates(true, nil)
+	}
 	if !skipRetriage {
 		var err error
-		if len(specificRetriageNums) > 0 {
-			retriageList, err = sy.store.ListRetriageCandidates(false, specificRetriageNums)
-		} else {
-			retriageList, err = sy.store.ListRetriageCandidates(true, nil)
-		}
+		retriageList, err = loadRetriage()
 		if err != nil {
 			return nil, 0, fmt.Errorf("list retriage candidates: %w", err)
 		}
@@ -288,7 +292,39 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 			}
 		}
 		if len(toPersist) > 0 {
-			_ = sy.store.UpdatePendingCandidates(toPersist)
+			if persisted, pErr := sy.store.PersistEnrichedPendingCandidates(toPersist); pErr == nil {
+				persistedMap := make(map[int]model.PendingCandidate, len(persisted))
+				for _, pc := range persisted {
+					persistedMap[pc.Number] = pc
+				}
+				triedPersist := make(map[int]bool, len(toPersist))
+				for _, pc := range toPersist {
+					triedPersist[pc.Number] = true
+				}
+				nextPending := make([]model.PendingCandidate, 0, len(pending))
+				for _, pc := range pending {
+					if triedPersist[pc.Number] {
+						if livePC, ok := persistedMap[pc.Number]; ok {
+							nextPending = append(nextPending, livePC)
+						}
+						continue
+					}
+					nextPending = append(nextPending, pc)
+				}
+				pending = nextPending
+			}
+		} else if liveNums, nErr := sy.store.ListPendingCandidateNumbers(); nErr == nil {
+			liveSet := make(map[int]bool, len(liveNums))
+			for _, n := range liveNums {
+				liveSet[n] = true
+			}
+			nextPending := make([]model.PendingCandidate, 0, len(pending))
+			for _, pc := range pending {
+				if liveSet[pc.Number] {
+					nextPending = append(nextPending, pc)
+				}
+			}
+			pending = nextPending
 		}
 	}
 
@@ -309,15 +345,16 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 			if rtEnrichErr != nil {
 				enrichWarnings = append(enrichWarnings, rtEnrichErr.Error())
 			}
-		}
-		for i := range retriageList {
-			for _, p := range triage.FilterRelevantKernelPRs(retriageList[i].PRs) {
-				if d, ok := detMap[model.PRKey(p.Repo, p.Num)]; ok {
-					retriageList[i].PRDetails = append(retriageList[i].PRDetails, d)
+			if len(detMap) > 0 {
+				_ = sy.store.SyncFetchedPRDetails(detMap)
+				if refreshed, rErr := loadRetriage(); rErr == nil {
+					retriageList = refreshed
 				}
 			}
+		}
+		for i := range retriageList {
 			if len(detMap) > 0 {
-				retriageList[i].PRs, _ = triage.SyncPRRefsWithDetails(retriageList[i].PRs, detMap)
+				retriageList[i].PRs, retriageList[i].PRDetails = triage.SyncPRRefsWithDetails(retriageList[i].PRs, detMap)
 			}
 			retriageList[i].Clues = triage.ExtractClues(
 				retriageList[i].Title, retriageList[i].Body, retriageList[i].Labels,
@@ -329,6 +366,8 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 			)
 		}
 	}
+
+	exportedAt := model.NowRFC3339Nano()
 	if pending == nil {
 		pending = []model.PendingCandidate{}
 	}
@@ -402,6 +441,41 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 	return bundle, len(pending) + len(retriageList), nil
 }
 
+// HasActionableDecisions reports whether a prepared BatchTriageDecisions contains at least one mutation.
+func HasActionableDecisions(dec model.BatchTriageDecisions) bool {
+	return len(dec.NewIssues) > 0 ||
+		len(dec.ExcludeIssues) > 0 ||
+		len(dec.Overrides) > 0 ||
+		len(dec.Notes) > 0 ||
+		len(dec.AckRetriage) > 0 ||
+		len(dec.ManualPRLinks) > 0
+}
+
+// FormatDryRunBatchResult formats the canonical dry-run output map from post-conflict-filtered `planned` decisions.
+func FormatDryRunBatchResult(
+	planned model.BatchTriageDecisions,
+	dbValidated bool,
+	warnings []triage.ValidationWarning,
+	conflicts []model.TriageConflict,
+) map[string]any {
+	out := map[string]any{
+		"dry_run":             true,
+		"db_validated":        dbValidated,
+		"new_issues_count":    len(planned.NewIssues),
+		"exclude_count":       len(planned.ExcludeIssues),
+		"overrides_count":     len(planned.Overrides),
+		"notes_count":         len(planned.Notes),
+		"ack_retriage_count":  len(planned.AckRetriage),
+		"manual_pr_links":     len(planned.ManualPRLinks),
+		"validation_warnings": warnings,
+		"prepared_decisions":  planned,
+	}
+	if len(conflicts) > 0 {
+		out["skipped_conflicts"] = conflicts
+	}
+	return out
+}
+
 // ExecuteBatchTriage validates, optionally dry-runs, or applies batch triage decisions.
 func (sy *Syncer) ExecuteBatchTriage(ctx context.Context, req BatchTriageExecuteRequest) (any, error) {
 	cleaned, warnings, err := triage.ValidateAndPrepareDecisions(req.Decisions, triage.ValidateOptions{
@@ -413,40 +487,20 @@ func (sy *Syncer) ExecuteBatchTriage(ctx context.Context, req BatchTriageExecute
 		return nil, fmt.Errorf("%w: %v", ErrBatchInputInvalid, err)
 	}
 
-	if len(cleaned.NewIssues) == 0 &&
-		len(cleaned.ExcludeIssues) == 0 &&
-		len(cleaned.Overrides) == 0 &&
-		len(cleaned.Notes) == 0 &&
-		len(cleaned.AckRetriage) == 0 &&
-		len(cleaned.ManualPRLinks) == 0 {
+	if !HasActionableDecisions(cleaned) {
 		return nil, fmt.Errorf("%w: no actionable entries remaining after validation (check if all entries were skipped by --skip-todo)", ErrBatchInputInvalid)
 	}
 
 	applyOpts := store.BatchApplyOptions{SkipConflicts: req.SkipConflicts}
 	if req.DryRun {
-		conflicts, valErr := sy.store.ValidateBatchDecisionsWithOptions(cleaned, applyOpts)
+		planned, conflicts, valErr := sy.store.PlanBatchDecisionsWithOptions(cleaned, applyOpts)
 		if valErr != nil {
 			if errors.Is(valErr, store.ErrBatchConflict) || errors.Is(valErr, store.ErrCanonicalCannotExclude) {
 				return nil, valErr
 			}
 			return nil, fmt.Errorf("%w: %w", ErrBatchInputInvalid, valErr)
 		}
-		out := map[string]any{
-			"dry_run":             true,
-			"db_validated":        true,
-			"new_issues_count":    len(cleaned.NewIssues),
-			"exclude_count":       len(cleaned.ExcludeIssues),
-			"overrides_count":     len(cleaned.Overrides),
-			"notes_count":         len(cleaned.Notes),
-			"ack_retriage_count":  len(cleaned.AckRetriage),
-			"manual_pr_links":     len(cleaned.ManualPRLinks),
-			"validation_warnings": warnings,
-			"prepared_decisions":  cleaned,
-		}
-		if len(conflicts) > 0 {
-			out["skipped_conflicts"] = conflicts
-		}
-		return out, nil
+		return FormatDryRunBatchResult(planned, true, warnings, conflicts), nil
 	}
 
 	syncNewPRs := true

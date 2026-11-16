@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -83,6 +84,111 @@ func resolveMainDBFilePath(db *sql.DB) string {
 	return ""
 }
 
+// ResolveLocalDBPath extracts the canonical local filesystem path from either a plain file path
+// or a `file:` SQLite URI, returning "" for empty, `:memory:`, or `mode=memory` specifications.
+func ResolveLocalDBPath(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == ":memory:" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "file:") {
+		if strings.HasPrefix(trimmed, "file::memory:") {
+			return ""
+		}
+		u, err := url.Parse(trimmed)
+		if err != nil {
+			return ""
+		}
+		if strings.EqualFold(u.Query().Get("mode"), "memory") {
+			return ""
+		}
+		rawPath := u.Path
+		if rawPath == "" {
+			rawPath = u.Opaque
+			if qIdx := strings.IndexByte(rawPath, '?'); qIdx >= 0 {
+				rawPath = rawPath[:qIdx]
+			}
+		}
+		if rawPath == "" || rawPath == ":memory:" {
+			return ""
+		}
+		if p, aErr := filepath.Abs(filepath.FromSlash(rawPath)); aErr == nil {
+			return p
+		}
+		return ""
+	}
+	if p, err := filepath.Abs(trimmed); err == nil {
+		return p
+	}
+	return ""
+}
+
+// RejectDBTargetCollision verifies that `destPath` does not alias `activeDBPath` or its `-wal`/`-shm`
+// sidecar files (handling `file:` URIs, relative paths, and symlinked files or parent directories).
+func RejectDBTargetCollision(destPath, activeDBPath string) error {
+	activeResolved := ResolveLocalDBPath(activeDBPath)
+	if activeResolved == "" {
+		return nil
+	}
+	activeExists := false
+	for _, p := range []string{activeResolved, activeResolved + "-wal", activeResolved + "-shm"} {
+		if _, err := os.Stat(p); err == nil {
+			activeExists = true
+			break
+		}
+	}
+	if !activeExists {
+		return nil
+	}
+
+	destAbs := ResolveLocalDBPath(destPath)
+	if destAbs == "" {
+		var err error
+		destAbs, err = filepath.Abs(strings.TrimSpace(destPath))
+		if err != nil {
+			return err
+		}
+	}
+	destParentInfo, destParentErr := os.Stat(filepath.Dir(destAbs))
+	destInfo, destStatErr := os.Stat(destAbs)
+
+	for _, protected := range []string{activeResolved, activeResolved + "-wal", activeResolved + "-shm"} {
+		protAbs, pErr := filepath.Abs(protected)
+		if pErr != nil {
+			continue
+		}
+		if filepath.Clean(destAbs) == filepath.Clean(protAbs) {
+			return fmt.Errorf("backup destination %s cannot be the active SQLite database (%s)", destAbs, protected)
+		}
+		if destStatErr == nil {
+			if protInfo, err := os.Stat(protAbs); err == nil && os.SameFile(destInfo, protInfo) {
+				return fmt.Errorf("backup destination %s refers to the active SQLite database (%s)", destAbs, protected)
+			}
+		}
+		if destParentErr == nil && filepath.Base(destAbs) == filepath.Base(protAbs) {
+			if protParentInfo, err := os.Stat(filepath.Dir(protAbs)); err == nil && os.SameFile(destParentInfo, protParentInfo) {
+				return fmt.Errorf("backup destination %s refers to the active SQLite database (%s)", destAbs, protected)
+			}
+		}
+	}
+	return nil
+}
+
+func appendMissingURIQueryParam(rawURI, key, val string) string {
+	base, query, hasQ := strings.Cut(rawURI, "?")
+	for _, seg := range strings.Split(query, "&") {
+		k, v, _ := strings.Cut(seg, "=")
+		if strings.EqualFold(k, key) && (key != "_pragma" || strings.HasPrefix(strings.ToLower(v), strings.ToLower(strings.SplitN(val, "(", 2)[0]))) {
+			return rawURI
+		}
+	}
+	addition := key + "=" + val
+	if !hasQ || query == "" {
+		return base + "?" + addition
+	}
+	return base + "?" + query + "&" + addition
+}
+
 func Open(dbPath string) (*Store, error) {
 	trimmed := strings.TrimSpace(dbPath)
 	if trimmed == "" {
@@ -94,18 +200,21 @@ func Open(dbPath string) (*Store, error) {
 	)
 	switch {
 	case trimmed == ":memory:":
-		dsn = "file::memory:?_pragma=busy_timeout(15000)"
+		dsn = "file::memory:?_pragma=busy_timeout(15000)&_txlock=immediate"
 	case strings.HasPrefix(trimmed, "file:"):
-		dsn = trimmed
-		if u, uErr := url.Parse(trimmed); uErr == nil {
-			modeMem := strings.EqualFold(u.Query().Get("mode"), "memory") || strings.HasPrefix(trimmed, "file::memory:")
-			if !modeMem && u.Path != "" && u.Path != ":memory:" {
-				if p, aErr := filepath.Abs(filepath.FromSlash(u.Path)); aErr == nil {
-					absPath = p
-					_ = os.MkdirAll(filepath.Dir(absPath), 0o755)
-				}
+		absPath = ResolveLocalDBPath(trimmed)
+		if absPath != "" {
+			if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+				return nil, err
 			}
 		}
+		dsn = appendMissingURIQueryParam(trimmed, "_pragma", "busy_timeout(15000)")
+		if absPath != "" {
+			if u, uErr := url.Parse(trimmed); uErr != nil || !strings.EqualFold(u.Query().Get("mode"), "ro") {
+				dsn = appendMissingURIQueryParam(dsn, "_pragma", "journal_mode(WAL)")
+			}
+		}
+		dsn = appendMissingURIQueryParam(dsn, "_txlock", "immediate")
 	default:
 		p, err := filepath.Abs(trimmed)
 		if err != nil {
@@ -115,13 +224,14 @@ func Open(dbPath string) (*Store, error) {
 		if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 			return nil, err
 		}
-		dsn = sqliteFileURI(absPath, "_pragma=busy_timeout(15000)&_pragma=journal_mode(WAL)")
+		dsn = sqliteFileURI(absPath, "_pragma=busy_timeout(15000)&_pragma=journal_mode(WAL)&_txlock=immediate")
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
+	_, _ = db.Exec(`PRAGMA busy_timeout = 15000`)
 	s := &Store{db: db, dbPath: absPath}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
@@ -135,11 +245,91 @@ func Open(dbPath string) (*Store, error) {
 	return s, nil
 }
 
+// OpenSnapshotForDryRun opens a disposable temporary SQLite copy for `--dry-run` checks so that
+// schema migrations, WAL creation, and seed bootstrapping NEVER touch the live database file on disk.
+func OpenSnapshotForDryRun(dbPath, seedPath string, fallbackJSON []byte) (*Store, func(), error) {
+	tmpDir, err := os.MkdirTemp("", "triage-hub-dryrun-*")
+	if err != nil {
+		return nil, nil, fmt.Errorf("create temp dir for dry-run: %w", err)
+	}
+	cleanupDir := func() { _ = os.RemoveAll(tmpDir) }
+	tmpPath := filepath.Join(tmpDir, "snapshot.db")
+
+	srcPath := ResolveLocalDBPath(dbPath)
+	if srcPath != "" {
+		if info, statErr := os.Stat(srcPath); statErr == nil {
+			if info.Size() > 0 {
+				roDSN := sqliteFileURI(srcPath, "mode=ro&_pragma=busy_timeout(15000)")
+				snapCreated := false
+				if roDB, oErr := sql.Open("sqlite", roDSN); oErr == nil {
+					roDB.SetMaxOpenConns(1)
+					escaped := strings.ReplaceAll(tmpPath, "'", "''")
+					if _, vErr := roDB.Exec(fmt.Sprintf("VACUUM INTO '%s'", escaped)); vErr == nil {
+						snapCreated = true
+					}
+					_ = roDB.Close()
+				}
+				if !snapCreated {
+					srcFile, rErr := os.Open(srcPath)
+					if rErr != nil {
+						cleanupDir()
+						return nil, nil, rErr
+					}
+					dstFile, wErr := os.Create(tmpPath)
+					if wErr != nil {
+						_ = srcFile.Close()
+						cleanupDir()
+						return nil, nil, wErr
+					}
+					_, cErr := io.Copy(dstFile, srcFile)
+					_ = srcFile.Close()
+					_ = dstFile.Close()
+					if cErr != nil {
+						cleanupDir()
+						return nil, nil, cErr
+					}
+				}
+			}
+			st, oErr := Open(tmpPath)
+			if oErr != nil {
+				cleanupDir()
+				return nil, nil, fmt.Errorf("open dry-run snapshot of %s: %w", srcPath, oErr)
+			}
+			return st, func() {
+				_ = st.Close()
+				cleanupDir()
+			}, nil
+		} else if !os.IsNotExist(statErr) {
+			cleanupDir()
+			return nil, nil, fmt.Errorf("stat sqlite db %s: %w", srcPath, statErr)
+		}
+	}
+
+	st, err := Open(tmpPath)
+	if err != nil {
+		cleanupDir()
+		return nil, nil, err
+	}
+	if _, err := st.BootstrapIfEmptyWithFallback(seedPath, fallbackJSON); err != nil {
+		_ = st.Close()
+		cleanupDir()
+		return nil, nil, fmt.Errorf("bootstrap dry-run dataset: %w", err)
+	}
+	return st, func() {
+		_ = st.Close()
+		cleanupDir()
+	}, nil
+}
+
 func (s *Store) DBPath() string {
 	return s.dbPath
 }
 
 func (s *Store) Close() error {
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.db.Close()
 }
 
@@ -149,7 +339,7 @@ func (s *Store) BackupTo(destPath string) error {
 }
 
 // BackupToContext creates an online, self-contained SQLite snapshot at destPath using VACUUM INTO,
-// honoring ctx cancellation and preventing live-DB self-overwrite or fixed-.tmp races.
+// honoring ctx cancellation and preventing live-DB or WAL/SHM sidecar self-overwrite.
 func (s *Store) BackupToContext(ctx context.Context, destPath string) error {
 	destPath = strings.TrimSpace(destPath)
 	if destPath == "" {
@@ -160,13 +350,8 @@ func (s *Store) BackupToContext(ctx context.Context, destPath string) error {
 		return err
 	}
 	if s.dbPath != "" {
-		if filepath.Clean(absDest) == filepath.Clean(s.dbPath) {
-			return fmt.Errorf("backup destination %s cannot be the active SQLite database", absDest)
-		}
-		if srcInfo, err1 := os.Stat(s.dbPath); err1 == nil {
-			if dstInfo, err2 := os.Stat(absDest); err2 == nil && os.SameFile(srcInfo, dstInfo) {
-				return fmt.Errorf("backup destination %s refers to the active SQLite database", absDest)
-			}
+		if err := RejectDBTargetCollision(absDest, s.dbPath); err != nil {
+			return err
 		}
 	}
 	s.backupMu.Lock()
@@ -187,20 +372,9 @@ func (s *Store) BackupToContext(ctx context.Context, destPath string) error {
 		return ctxErr
 	}
 	escaped := strings.ReplaceAll(tmpPath, "'", "''")
-	var vacErr error
-	if s.dbPath != "" {
-		vacDB, openErr := sql.Open("sqlite", sqliteFileURI(s.dbPath, "_pragma=busy_timeout(15000)&_pragma=journal_mode(WAL)"))
-		if openErr != nil {
-			return openErr
-		}
-		vacDB.SetMaxOpenConns(1)
-		_, vacErr = vacDB.ExecContext(ctx, fmt.Sprintf("VACUUM INTO '%s'", escaped))
-		_ = vacDB.Close()
-	} else {
-		s.mu.Lock()
-		_, vacErr = s.db.ExecContext(ctx, fmt.Sprintf("VACUUM INTO '%s'", escaped))
-		s.mu.Unlock()
-	}
+	s.mu.Lock()
+	_, vacErr := s.db.ExecContext(ctx, fmt.Sprintf("VACUUM INTO '%s'", escaped))
+	s.mu.Unlock()
 	if vacErr != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("sqlite vacuum into %s: %w", absDest, vacErr)
@@ -299,6 +473,15 @@ CREATE TABLE IF NOT EXISTS issue_overrides (
   PRIMARY KEY (repo, number)
 );
 
+CREATE TABLE IF NOT EXISTS issue_notes (
+  repo TEXT NOT NULL,
+  number INTEGER NOT NULL,
+  note_zh TEXT NOT NULL DEFAULT '',
+  note_en TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (repo, number)
+);
+
 CREATE TABLE IF NOT EXISTS issue_pr_links (
   issue_repo TEXT NOT NULL,
   issue_num INTEGER NOT NULL,
@@ -381,6 +564,7 @@ CREATE TABLE IF NOT EXISTS issue_triage_state (
   needs_retriage INTEGER NOT NULL DEFAULT 0,
   retriage_reasons_json TEXT NOT NULL DEFAULT '[]',
   retriage_details_json TEXT NOT NULL DEFAULT '[]',
+  retriage_updated_at TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (repo, number)
 );
 
@@ -420,6 +604,7 @@ CREATE TABLE IF NOT EXISTS sync_runs (
 		{"pending_candidates", "revision", "INTEGER NOT NULL DEFAULT 1"},
 		{"issue_triage_state", "auto_baseline_json", "TEXT NOT NULL DEFAULT ''"},
 		{"issue_triage_state", "unverified_open_prs_json", "TEXT NOT NULL DEFAULT '[]'"},
+		{"issue_triage_state", "retriage_updated_at", "TEXT NOT NULL DEFAULT ''"},
 		{"excluded_issues", "title", "TEXT NOT NULL DEFAULT ''"},
 		{"excluded_issues", "excluded_labels_json", "TEXT NOT NULL DEFAULT '[]'"},
 		{"excluded_issues", "source", "TEXT NOT NULL DEFAULT 'triage'"},
@@ -472,6 +657,31 @@ ON CONFLICT(repo, number) DO NOTHING
 		return err
 	}
 
+	// Migrate any legacy note overrides stored inside issue_overrides into the orthogonal issue_notes table,
+	// then strip note-only rows from issue_overrides so ResetIssueOverride only resets classification overrides.
+	if _, err := s.db.Exec(`
+INSERT INTO issue_notes(repo, number, note_zh, note_en, updated_at)
+SELECT repo, number, COALESCE(note_zh, ''), COALESCE(note_en, ''), updated_at
+FROM issue_overrides
+WHERE has_note_override = 1
+ON CONFLICT(repo, number) DO NOTHING
+`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`
+UPDATE issue_overrides
+SET note_zh = NULL, note_en = NULL, has_note_override = 0
+WHERE has_note_override = 1
+`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`
+DELETE FROM issue_overrides
+WHERE COALESCE(cat, '') = '' AND COALESCE(has_force_keep_override, 0) = 0 AND is_borderline_kept IS NULL
+`); err != nil {
+		return err
+	}
+
 	// Preserve existing positive force_keep overrides created before has_force_keep_override existed
 	if _, err := s.db.Exec(`
 UPDATE issue_overrides
@@ -511,10 +721,13 @@ SET ack_at = COALESCE(
   (SELECT ts.triaged_at FROM issue_triage_state ts WHERE ts.repo = issue_pr_links.issue_repo AND ts.number = issue_pr_links.issue_num),
   ''
 )
-WHERE ack_at = ''
+WHERE ack_at = '' AND state != 'CLOSED'
 `); err != nil {
 			return err
 		}
+	}
+	if _, err := s.db.Exec(`UPDATE issue_pr_links SET ack_at = '' WHERE state = 'CLOSED' AND ack_at != ''`); err != nil {
+		return err
 	}
 	return nil
 }
@@ -658,10 +871,10 @@ WHERE issue_repo = ?`, DefaultRepo)
 INSERT INTO issue_triage_state(
   repo, number, triaged_at, triaged_by,
   baseline_labels_json, baseline_gh_severity, baseline_is_customer,
-  baseline_open_prs_json, baseline_merged_prs_json, unverified_open_prs_json,
+  baseline_open_prs_json, baseline_merged_prs_json,
   comment_watermark_utc, recent_comments_json, auto_baseline_json,
   needs_retriage, retriage_reasons_json, retriage_details_json
-) VALUES (?, ?, ?, 'seed', ?, ?, ?, ?, ?, '[]', ?, '[]', ?, 0, '[]', '[]')
+) VALUES (?, ?, ?, 'seed', ?, ?, ?, ?, ?, ?, '[]', ?, 0, '[]', '[]')
 ON CONFLICT(repo, number) DO NOTHING`,
 			DefaultRepo, m.number, triagedAt,
 			m.labelsJSON, m.ghSeverity, m.isCustomer,
@@ -669,7 +882,7 @@ ON CONFLICT(repo, number) DO NOTHING`,
 		); err != nil {
 			return err
 		}
-		if _, err := q.Exec(`UPDATE issue_pr_links SET ack_at = ? WHERE issue_repo = ? AND issue_num = ? AND ack_at = ''`,
+		if _, err := q.Exec(`UPDATE issue_pr_links SET ack_at = ? WHERE issue_repo = ? AND issue_num = ? AND ack_at = '' AND state != 'CLOSED'`,
 			triagedAt, DefaultRepo, m.number); err != nil {
 			return err
 		}
@@ -1114,6 +1327,134 @@ func mergeTrackSources(existing, incoming []string) ([]string, bool) {
 	return out, true
 }
 
+func syncIssuePRLinksFromSnapshotInTx(
+	tx *sql.Tx,
+	prRepo string,
+	prNum int,
+	state string,
+	title string,
+	isCherryPick bool,
+	updatedAt string,
+	mergedAt string,
+	affectedIssues map[int]bool,
+) error {
+	if state == "" || state == model.PRStateUnknown {
+		return nil
+	}
+	effMergedAt := mergedAt
+	if state != "MERGED" {
+		effMergedAt = ""
+	}
+
+	type linkRow struct {
+		issueNum int
+		state    string
+		updAt    string
+	}
+	var links []linkRow
+	lRows, err := tx.Query(`SELECT issue_num, state, updated_at FROM issue_pr_links WHERE issue_repo = ? AND pr_repo = ? AND pr_num = ?`,
+		DefaultRepo, prRepo, prNum)
+	if err != nil {
+		return err
+	}
+	for lRows.Next() {
+		var lr linkRow
+		if sErr := lRows.Scan(&lr.issueNum, &lr.state, &lr.updAt); sErr != nil {
+			_ = lRows.Close()
+			return sErr
+		}
+		links = append(links, lr)
+	}
+	if rErr := lRows.Err(); rErr != nil {
+		_ = lRows.Close()
+		return rErr
+	}
+	_ = lRows.Close()
+
+	for _, lr := range links {
+		if affectedIssues != nil {
+			affectedIssues[lr.issueNum] = true
+		}
+		if isIncomingPRSnapshotStale(lr.state, lr.updAt, state, updatedAt) {
+			if lr.state == "MERGED" && effMergedAt != "" {
+				if _, err := tx.Exec(`UPDATE issue_pr_links SET merged_at = CASE WHEN merged_at = '' THEN ? ELSE merged_at END WHERE issue_repo = ? AND issue_num = ? AND pr_repo = ? AND pr_num = ?`,
+					effMergedAt, DefaultRepo, lr.issueNum, prRepo, prNum); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if _, err := tx.Exec(`
+UPDATE issue_pr_links
+SET
+  state = ?,
+  title = CASE WHEN ? != '' THEN ? ELSE title END,
+  is_cherry_pick = ?,
+  updated_at = CASE WHEN ? != '' THEN ? ELSE updated_at END,
+  merged_at = CASE WHEN ? != 'MERGED' THEN '' WHEN ? != '' THEN ? ELSE merged_at END,
+  ack_at = CASE WHEN ? = 'CLOSED' THEN '' ELSE ack_at END
+WHERE issue_repo = ? AND issue_num = ? AND pr_repo = ? AND pr_num = ?`,
+			state, title, title, boolToInt(isCherryPick),
+			updatedAt, updatedAt,
+			state, effMergedAt, effMergedAt,
+			state,
+			DefaultRepo, lr.issueNum, prRepo, prNum,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SyncFetchedPRDetails persists freshly enriched PR states/titles/merge-timestamps onto `issue_pr_links`
+// and re-evaluates dynamic re-triage so exported retriage bundles stay consistent with SQLite state.
+func (s *Store) SyncFetchedPRDetails(detMap map[string]model.PendingPRDetail) error {
+	if len(detMap) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	keys := make([]string, 0, len(detMap))
+	for k := range detMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	affectedIssues := make(map[int]bool)
+	for _, k := range keys {
+		d := detMap[k]
+		if d.Repo == "" || d.Num <= 0 {
+			continue
+		}
+		if err := syncIssuePRLinksFromSnapshotInTx(tx, d.Repo, d.Num, d.State, d.Title, d.IsCherryPick, d.UpdatedAt, d.MergedAt, affectedIssues); err != nil {
+			return err
+		}
+		if d.State == "CLOSED" || d.State == "MERGED" {
+			if err := syncClosedPRStatusInTx(tx, d.Repo, d.Num, d.State, d.UpdatedAt, d.MergedAt); err != nil {
+				return err
+			}
+		}
+	}
+	if len(affectedIssues) > 0 {
+		nums := make([]int, 0, len(affectedIssues))
+		for n := range affectedIssues {
+			nums = append(nums, n)
+		}
+		sort.Ints(nums)
+		if err := s.reevaluateIssueRetriageInTx(tx, nums); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) UpsertPRStatuses(statuses []model.PRStatus, syncTime time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1135,25 +1476,11 @@ ON CONFLICT(repo, number) DO UPDATE SET
 	}
 	defer stmtPR.Close()
 
-	stmtLinkOne, err := tx.Prepare(`
-UPDATE issue_pr_links
-SET
-  state = ?,
-  title = CASE WHEN ? != '' THEN ? ELSE title END,
-  is_cherry_pick = ?,
-  updated_at = CASE WHEN ? != '' THEN ? ELSE updated_at END,
-  merged_at = CASE WHEN ? != '' THEN ? ELSE merged_at END,
-  ack_at = CASE WHEN ? = 'CLOSED' THEN '' ELSE ack_at END
-WHERE issue_repo = ? AND issue_num = ? AND pr_repo = ? AND pr_num = ?`)
-	if err != nil {
-		return err
-	}
-	defer stmtLinkOne.Close()
-
 	affectedIssues := make(map[int]bool)
 
 	for _, st := range statuses {
 		effSt := st
+		skipPRRowWrite := false
 		var curState, curUpdAt, curRaw string
 		var curIsCP int
 		rowErr := tx.QueryRow(`SELECT state, is_cherry_pick, updated_at, status_json FROM pull_requests WHERE repo = ? AND number = ?`,
@@ -1166,7 +1493,8 @@ WHERE issue_repo = ? AND issue_num = ? AND pr_repo = ? AND pr_num = ?`)
 			_ = json.Unmarshal([]byte(curRaw), &curObj)
 			if isIncomingPRSnapshotStale(curState, curUpdAt, st.State, st.UpdatedAt) {
 				// Incoming snapshot is older than the already-committed row: preserve fresher state,
-				// only merging any newly discovered TrackSources (or missing MergedAt) if present.
+				// merging any newly discovered TrackSources (or missing MergedAt), while STILL syncing
+				// any lagging/UNKNOWN rows in issue_pr_links below!
 				objChanged := false
 				if mergedSrcs, changed := mergeTrackSources(curObj.TrackSources, st.TrackSources); changed {
 					curObj.TrackSources = mergedSrcs
@@ -1184,69 +1512,36 @@ WHERE issue_repo = ? AND issue_num = ? AND pr_repo = ? AND pr_num = ?`)
 						}
 					}
 				}
-				continue
-			}
-			if effSt.State == "MERGED" && effSt.MergedAt == "" && curObj.MergedAt != "" {
-				effSt.MergedAt = curObj.MergedAt
-			}
-			if mergedSrcs, changed := mergeTrackSources(curObj.TrackSources, st.TrackSources); changed {
-				effSt.TrackSources = mergedSrcs
-			} else if len(effSt.TrackSources) == 0 && len(curObj.TrackSources) > 0 {
-				effSt.TrackSources = curObj.TrackSources
-			}
-		}
-
-		b, err := json.Marshal(effSt)
-		if err != nil {
-			return err
-		}
-		if _, err := stmtPR.Exec(effSt.Repo, effSt.Num, effSt.State, boolToInt(effSt.IsCherryPick), effSt.UpdatedAt, string(b)); err != nil {
-			return err
-		}
-
-		type linkRow struct {
-			issueNum int
-			state    string
-			updAt    string
-		}
-		var links []linkRow
-		lRows, err := tx.Query(`SELECT issue_num, state, updated_at FROM issue_pr_links WHERE issue_repo = ? AND pr_repo = ? AND pr_num = ?`,
-			DefaultRepo, effSt.Repo, effSt.Num)
-		if err != nil {
-			return err
-		}
-		for lRows.Next() {
-			var lr linkRow
-			if sErr := lRows.Scan(&lr.issueNum, &lr.state, &lr.updAt); sErr != nil {
-				_ = lRows.Close()
-				return sErr
-			}
-			links = append(links, lr)
-		}
-		if rErr := lRows.Err(); rErr != nil {
-			_ = lRows.Close()
-			return rErr
-		}
-		_ = lRows.Close()
-
-		for _, lr := range links {
-			affectedIssues[lr.issueNum] = true
-			if isIncomingPRSnapshotStale(lr.state, lr.updAt, effSt.State, effSt.UpdatedAt) {
-				if effSt.State == "MERGED" && effSt.MergedAt != "" {
-					_, _ = tx.Exec(`UPDATE issue_pr_links SET merged_at = CASE WHEN merged_at = '' THEN ? ELSE merged_at END WHERE issue_repo = ? AND issue_num = ? AND pr_repo = ? AND pr_num = ?`,
-						effSt.MergedAt, DefaultRepo, lr.issueNum, effSt.Repo, effSt.Num)
+				curObj.Repo = st.Repo
+				curObj.Num = st.Num
+				curObj.State = curState
+				curObj.IsCherryPick = curIsCP != 0
+				curObj.UpdatedAt = curUpdAt
+				effSt = curObj
+				skipPRRowWrite = true
+			} else {
+				if effSt.State == "MERGED" && effSt.MergedAt == "" && curObj.MergedAt != "" {
+					effSt.MergedAt = curObj.MergedAt
 				}
-				continue
+				mergedSrcs, _ := mergeTrackSources(curObj.TrackSources, st.TrackSources)
+				effSt.TrackSources = mergedSrcs
 			}
-			if _, err := stmtLinkOne.Exec(
-				effSt.State, effSt.Title, effSt.Title, boolToInt(effSt.IsCherryPick),
-				effSt.UpdatedAt, effSt.UpdatedAt,
-				effSt.MergedAt, effSt.MergedAt,
-				effSt.State,
-				DefaultRepo, lr.issueNum, effSt.Repo, effSt.Num,
-			); err != nil {
+		}
+
+		if !skipPRRowWrite {
+			b, err := json.Marshal(effSt)
+			if err != nil {
 				return err
 			}
+			if _, err := stmtPR.Exec(effSt.Repo, effSt.Num, effSt.State, boolToInt(effSt.IsCherryPick), effSt.UpdatedAt, string(b)); err != nil {
+				return err
+			}
+		}
+
+		if err := syncIssuePRLinksFromSnapshotInTx(
+			tx, effSt.Repo, effSt.Num, effSt.State, effSt.Title, effSt.IsCherryPick, effSt.UpdatedAt, effSt.MergedAt, affectedIssues,
+		); err != nil {
+			return err
 		}
 	}
 
@@ -1373,7 +1668,7 @@ INSERT INTO issue_overrides(
   repo, number, cat, severity, subsystem, is_borderline_kept,
   force_keep, has_force_keep_override,
   note_zh, note_en, has_note_override, is_new_decision, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, ?)
 ON CONFLICT(repo, number) DO UPDATE SET
   cat=excluded.cat,
   severity=excluded.severity,
@@ -1381,17 +1676,30 @@ ON CONFLICT(repo, number) DO UPDATE SET
   is_borderline_kept=CASE WHEN ? = 1 THEN excluded.is_borderline_kept ELSE issue_overrides.is_borderline_kept END,
   force_keep=CASE WHEN excluded.has_force_keep_override = 1 THEN excluded.force_keep ELSE issue_overrides.force_keep END,
   has_force_keep_override=CASE WHEN excluded.has_force_keep_override = 1 THEN 1 ELSE issue_overrides.has_force_keep_override END,
-  note_zh=CASE WHEN excluded.has_note_override = 1 THEN excluded.note_zh ELSE issue_overrides.note_zh END,
-  note_en=CASE WHEN excluded.has_note_override = 1 THEN excluded.note_en ELSE issue_overrides.note_en END,
-  has_note_override=CASE WHEN excluded.has_note_override = 1 THEN 1 ELSE issue_overrides.has_note_override END,
+  note_zh=NULL,
+  note_en=NULL,
+  has_note_override=0,
   is_new_decision=0,
   updated_at=excluded.updated_at`,
 		DefaultRepo, number, req.Cat, req.Severity, req.Subsystem, bdrVal,
 		fkVal, hasFK,
-		nZh, nEn, hasNote, nowISO,
+		nowISO,
 		hasBdr,
 	); err != nil {
 		return err
+	}
+	if hasNote != 0 {
+		if _, err := tx.Exec(`
+INSERT INTO issue_notes(repo, number, note_zh, note_en, updated_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(repo, number) DO UPDATE SET
+  note_zh=excluded.note_zh,
+  note_en=excluded.note_en,
+  updated_at=excluded.updated_at`,
+			DefaultRepo, number, nZh, nEn, nowISO,
+		); err != nil {
+			return err
+		}
 	}
 
 	return s.snapshotBaselineInTx(tx, number, "override", nowISO)
@@ -1413,12 +1721,19 @@ func (s *Store) applyIssueNoteInTx(tx *sql.Tx, number int, req model.NotePatchRe
 		return err
 	}
 
-	var exists int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM issues WHERE repo = ? AND number = ?`, DefaultRepo, number).Scan(&exists); err != nil {
-		return err
-	}
-	if exists == 0 {
+	var curZh, curEn string
+	err := tx.QueryRow(`
+SELECT
+  CASE WHEN nt.number IS NOT NULL THEN nt.note_zh ELSE i.auto_note_zh END,
+  CASE WHEN nt.number IS NOT NULL THEN nt.note_en ELSE i.auto_note_en END
+FROM issues i
+LEFT JOIN issue_notes nt ON i.repo = nt.repo AND i.number = nt.number
+WHERE i.repo = ? AND i.number = ?`, DefaultRepo, number).Scan(&curZh, &curEn)
+	if err == sql.ErrNoRows {
 		return fmt.Errorf("issue #%d not found: %w", number, ErrIssueNotFound)
+	}
+	if err != nil {
+		return err
 	}
 	if req.IfUnmodifiedSince != "" {
 		if conflict, msg := checkNoteConflict(tx, number, req, ""); conflict {
@@ -1426,20 +1741,24 @@ func (s *Store) applyIssueNoteInTx(tx *sql.Tx, number int, req model.NotePatchRe
 		}
 	}
 
-	// Update ONLY note columns in issue_overrides; NEVER modify classification or reset issue_triage_state.
-	_, err := tx.Exec(`
-INSERT INTO issue_overrides(
-  repo, number, cat, severity, subsystem, is_borderline_kept,
-  force_keep, has_force_keep_override,
-  note_zh, note_en, has_note_override, is_new_decision, updated_at
-) VALUES (?, ?, NULL, NULL, NULL, NULL, 0, 0, ?, ?, 1, 0, ?)
+	nextZh := curZh
+	if zh := strings.TrimSpace(note.ZhCN); zh != "" {
+		nextZh = zh
+	}
+	nextEn := curEn
+	if en := strings.TrimSpace(note.En); en != "" {
+		nextEn = en
+	}
+
+	// Update ONLY issue_notes; NEVER modify issue_overrides classification or reset issue_triage_state.
+	_, err = tx.Exec(`
+INSERT INTO issue_notes(repo, number, note_zh, note_en, updated_at)
+VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(repo, number) DO UPDATE SET
   note_zh=excluded.note_zh,
   note_en=excluded.note_en,
-  has_note_override=1,
-  is_new_decision=0,
   updated_at=excluded.updated_at`,
-		DefaultRepo, number, note.ZhCN, note.En, nowISO,
+		DefaultRepo, number, nextZh, nextEn, nowISO,
 	)
 	return err
 }
@@ -1488,12 +1807,24 @@ func (s *Store) SaveIssueOverride(number int, req model.TriagePatchRequest) (mod
 }
 
 func (s *Store) ResetIssueOverride(number int) ([]prstatus.PRTarget, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.resetIssueOverrideLocked(number)
+	return s.ResetIssueOverrideWithGuard(number, "")
 }
 
-func (s *Store) resetIssueOverrideLocked(number int) ([]prstatus.PRTarget, error) {
+func (s *Store) ResetIssueOverrideWithGuard(number int, ifUnmodifiedSince string) ([]prstatus.PRTarget, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.resetIssueOverrideLocked(number, ifUnmodifiedSince)
+}
+
+func (s *Store) resetIssueOverrideLocked(number int, ifUnmodifiedSince string) ([]prstatus.PRTarget, error) {
+	if rawIf := strings.TrimSpace(ifUnmodifiedSince); rawIf != "" {
+		norm, ok := model.NormalizeRFC3339NanoFixed(rawIf)
+		if !ok {
+			return nil, fmt.Errorf("invalid `if_unmodified_since` timestamp %q (expected RFC3339 UTC)", ifUnmodifiedSince)
+		}
+		ifUnmodifiedSince = norm
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -1507,7 +1838,14 @@ func (s *Store) resetIssueOverrideLocked(number int) ([]prstatus.PRTarget, error
 	if exists == 0 {
 		return nil, fmt.Errorf("issue #%d not found: %w", number, ErrIssueNotFound)
 	}
+	if ifUnmodifiedSince != "" {
+		curMod := queryIssueLastTriageMod(tx, number)
+		if curMod != "" && model.CompareRFC3339(curMod, ifUnmodifiedSince) > 0 {
+			return nil, fmt.Errorf("%w: issue #%d was modified at %s (expected unmodified since %s)", ErrOverrideConflict, number, curMod, ifUnmodifiedSince)
+		}
+	}
 
+	// Only remove classification overrides in issue_overrides; bilingual root-cause notes in issue_notes stay intact.
 	if _, err := tx.Exec(`DELETE FROM issue_overrides WHERE repo = ? AND number = ?`, DefaultRepo, number); err != nil {
 		return nil, err
 	}
@@ -1529,8 +1867,8 @@ SET
   baseline_is_customer = ?,
   baseline_open_prs_json = ?,
   baseline_merged_prs_json = ?,
-  unverified_open_prs_json = '[]',
-  comment_watermark_utc = ?
+  comment_watermark_utc = ?,
+  retriage_updated_at = ''
 WHERE repo = ? AND number = ?`,
 				nowISO, saved.TriagedBy,
 				saved.BaselineLabelsJSON, saved.BaselineGHSeverity, saved.BaselineIsCustomer,
@@ -1555,17 +1893,19 @@ WHERE repo = ? AND number = ?`,
 				}
 			}
 			type prLinkLite struct {
-				repo string
-				num  int
-				isCP int
-				src  string
+				repo  string
+				num   int
+				state string
+				isCP  int
+				src   string
+				ackAt string
 			}
 			var curLinks []prLinkLite
-			if lRows, lErr := tx.Query(`SELECT pr_repo, pr_num, is_cherry_pick, source FROM issue_pr_links WHERE issue_repo = ? AND issue_num = ?`,
+			if lRows, lErr := tx.Query(`SELECT pr_repo, pr_num, state, is_cherry_pick, source, ack_at FROM issue_pr_links WHERE issue_repo = ? AND issue_num = ?`,
 				DefaultRepo, number); lErr == nil {
 				for lRows.Next() {
 					var pl prLinkLite
-					if lRows.Scan(&pl.repo, &pl.num, &pl.isCP, &pl.src) == nil {
+					if lRows.Scan(&pl.repo, &pl.num, &pl.state, &pl.isCP, &pl.src, &pl.ackAt) == nil {
 						curLinks = append(curLinks, pl)
 					}
 				}
@@ -1573,7 +1913,13 @@ WHERE repo = ? AND number = ?`,
 			}
 			for _, pl := range curLinks {
 				nextAck := ""
-				if pl.isCP != 0 || pl.src == model.LinkSourceManual || knownAtSaved[model.PRKey(pl.repo, pl.num)] {
+				switch {
+				case pl.state == "CLOSED":
+					nextAck = ""
+				case (pl.src == model.LinkSourceManual || pl.isCP != 0) && pl.ackAt != "":
+					// Never rewind ack_at on manual/CP links added after saved.TriagedAt!
+					nextAck = pl.ackAt
+				case pl.src == model.LinkSourceManual || pl.isCP != 0 || knownAtSaved[model.PRKey(pl.repo, pl.num)]:
 					nextAck = saved.TriagedAt
 				}
 				if _, err := tx.Exec(`UPDATE issue_pr_links SET ack_at = ? WHERE issue_repo = ? AND issue_num = ? AND pr_repo = ? AND pr_num = ?`,
@@ -1585,7 +1931,7 @@ WHERE repo = ? AND number = ?`,
 		}
 	}
 	if !restoredBaseline {
-		_, _ = tx.Exec(`UPDATE issue_triage_state SET triaged_at = ? WHERE repo = ? AND number = ?`, nowISO, DefaultRepo, number)
+		_, _ = tx.Exec(`UPDATE issue_triage_state SET triaged_at = ?, retriage_updated_at = '' WHERE repo = ? AND number = ?`, nowISO, DefaultRepo, number)
 	}
 
 	if err := s.reevaluateIssueRetriageInTx(tx, []int{number}); err != nil {
@@ -1601,7 +1947,7 @@ func (s *Store) DeleteIssueOverride(number int) (model.IssueRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, err := s.resetIssueOverrideLocked(number); err != nil {
+	if _, err := s.resetIssueOverrideLocked(number, ""); err != nil {
 		return model.IssueRecord{}, err
 	}
 
@@ -1876,14 +2222,14 @@ ON CONFLICT(repo, number) DO UPDATE SET
 			return err
 		}
 	}
-	if _, err := tx.Exec(`UPDATE issue_pr_links SET ack_at = ? WHERE issue_repo = ? AND issue_num = ?`,
+	if _, err := tx.Exec(`UPDATE issue_pr_links SET ack_at = CASE WHEN state = 'CLOSED' THEN '' ELSE ? END WHERE issue_repo = ? AND issue_num = ?`,
 		nowISO, DefaultRepo, pc.Number); err != nil {
 		return err
 	}
 
 	var hydratedPRs []model.LinkedPRRef
 	lRows, err := tx.Query(`
-SELECT pr_repo, pr_num, label, url, state, title, is_cherry_pick, updated_at, merged_at, source
+SELECT pr_repo, pr_num, label, url, state, title, is_cherry_pick, updated_at, merged_at, ack_at, source
 FROM issue_pr_links
 WHERE issue_repo = ? AND issue_num = ?`, DefaultRepo, pc.Number)
 	if err != nil {
@@ -1892,12 +2238,11 @@ WHERE issue_repo = ? AND issue_num = ?`, DefaultRepo, pc.Number)
 	for lRows.Next() {
 		var hp model.LinkedPRRef
 		var isCP int
-		if sErr := lRows.Scan(&hp.Repo, &hp.Num, &hp.Label, &hp.URL, &hp.State, &hp.Title, &isCP, &hp.UpdatedAt, &hp.MergedAt, &hp.Source); sErr != nil {
+		if sErr := lRows.Scan(&hp.Repo, &hp.Num, &hp.Label, &hp.URL, &hp.State, &hp.Title, &isCP, &hp.UpdatedAt, &hp.MergedAt, &hp.AckAt, &hp.Source); sErr != nil {
 			_ = lRows.Close()
 			return sErr
 		}
 		hp.IsCherryPick = isCP != 0
-		hp.AckAt = nowISO
 		hydratedPRs = append(hydratedPRs, hp)
 	}
 	if err := lRows.Err(); err != nil {
@@ -1906,10 +2251,11 @@ WHERE issue_repo = ? AND issue_num = ?`, DefaultRepo, pc.Number)
 	}
 	_ = lRows.Close()
 
-	// Clean up any stale excluded_issues or archived_issues or old overrides
+	// Clean up any stale excluded_issues, archived_issues, or old overrides/notes
 	_, _ = tx.Exec(`DELETE FROM excluded_issues WHERE repo = ? AND number = ?`, DefaultRepo, pc.Number)
 	_, _ = tx.Exec(`DELETE FROM archived_issues WHERE repo = ? AND number = ?`, DefaultRepo, pc.Number)
 	_, _ = tx.Exec(`DELETE FROM issue_overrides WHERE repo = ? AND number = ?`, DefaultRepo, pc.Number)
+	_, _ = tx.Exec(`DELETE FROM issue_notes WHERE repo = ? AND number = ?`, DefaultRepo, pc.Number)
 	if _, err := tx.Exec(`DELETE FROM pending_candidates WHERE repo = ? AND number = ?`, DefaultRepo, number); err != nil {
 		return err
 	}
@@ -1937,10 +2283,10 @@ WHERE issue_repo = ? AND issue_num = ?`, DefaultRepo, pc.Number)
 INSERT INTO issue_triage_state(
   repo, number, triaged_at, triaged_by,
   baseline_labels_json, baseline_gh_severity, baseline_is_customer,
-  baseline_open_prs_json, baseline_merged_prs_json, unverified_open_prs_json,
+  baseline_open_prs_json, baseline_merged_prs_json,
   comment_watermark_utc, recent_comments_json, auto_baseline_json,
-  needs_retriage, retriage_reasons_json, retriage_details_json
-) VALUES (?, ?, ?, 'triage', ?, ?, ?, ?, ?, '[]', ?, ?, ?, 0, '[]', '[]')
+  needs_retriage, retriage_reasons_json, retriage_details_json, retriage_updated_at
+) VALUES (?, ?, ?, 'triage', ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', '[]', '')
 ON CONFLICT(repo, number) DO UPDATE SET
   triaged_at=excluded.triaged_at,
   triaged_by=excluded.triaged_by,
@@ -1949,13 +2295,13 @@ ON CONFLICT(repo, number) DO UPDATE SET
   baseline_is_customer=excluded.baseline_is_customer,
   baseline_open_prs_json=excluded.baseline_open_prs_json,
   baseline_merged_prs_json=excluded.baseline_merged_prs_json,
-  unverified_open_prs_json='[]',
   comment_watermark_utc=excluded.comment_watermark_utc,
   recent_comments_json=excluded.recent_comments_json,
   auto_baseline_json=excluded.auto_baseline_json,
   needs_retriage=0,
   retriage_reasons_json='[]',
-  retriage_details_json='[]'`,
+  retriage_details_json='[]',
+  retriage_updated_at=''`,
 		DefaultRepo, pc.Number, nowISO,
 		string(lbsJSON), ghSev, boolToInt(isCust),
 		string(openJSON), string(mergedJSON),
@@ -2118,14 +2464,23 @@ func isIssueKnownNonPending(q sqlExecQuerier, num int) (inIssues, inExcluded, in
 }
 
 func queryIssueLastTriageMod(q sqlExecQuerier, num int) string {
-	var ovrUpdated, triagedAt string
+	var ovrUpdated, triagedAt, retriageUpdated string
 	_ = q.QueryRow(`SELECT COALESCE((SELECT updated_at FROM issue_overrides WHERE repo = ? AND number = ?), '')`, DefaultRepo, num).Scan(&ovrUpdated)
-	_ = q.QueryRow(`SELECT COALESCE((SELECT triaged_at FROM issue_triage_state WHERE repo = ? AND number = ?), '')`, DefaultRepo, num).Scan(&triagedAt)
-	return model.MaxRFC3339(ovrUpdated, triagedAt)
+	_ = q.QueryRow(`SELECT COALESCE(triaged_at, ''), COALESCE(retriage_updated_at, '') FROM issue_triage_state WHERE repo = ? AND number = ?`, DefaultRepo, num).Scan(&triagedAt, &retriageUpdated)
+	return model.MaxRFC3339(ovrUpdated, triagedAt, retriageUpdated)
+}
+
+func queryIssueLastNoteMod(q sqlExecQuerier, num int) string {
+	var noteUpdated string
+	_ = q.QueryRow(`SELECT COALESCE((SELECT updated_at FROM issue_notes WHERE repo = ? AND number = ?), '')`, DefaultRepo, num).Scan(&noteUpdated)
+	return noteUpdated
 }
 
 func checkOverrideConflict(q sqlExecQuerier, num int, patch model.TriagePatchRequest, baseExportedAt string) (bool, string) {
 	curMod := queryIssueLastTriageMod(q, num)
+	if patch.Note != nil {
+		curMod = model.MaxRFC3339(curMod, queryIssueLastNoteMod(q, num))
+	}
 	if patch.IfUnmodifiedSince != "" && curMod != "" && model.CompareRFC3339(curMod, patch.IfUnmodifiedSince) > 0 {
 		return true, fmt.Sprintf("issue #%d was modified at %s (expected unmodified since %s)", num, curMod, patch.IfUnmodifiedSince)
 	}
@@ -2136,12 +2491,12 @@ func checkOverrideConflict(q sqlExecQuerier, num int, patch model.TriagePatchReq
 }
 
 func checkNoteConflict(q sqlExecQuerier, num int, patch model.NotePatchRequest, baseExportedAt string) (bool, string) {
-	curMod := queryIssueLastTriageMod(q, num)
+	curMod := queryIssueLastNoteMod(q, num)
 	if patch.IfUnmodifiedSince != "" && curMod != "" && model.CompareRFC3339(curMod, patch.IfUnmodifiedSince) > 0 {
-		return true, fmt.Sprintf("issue #%d was modified at %s (expected unmodified since %s)", num, curMod, patch.IfUnmodifiedSince)
+		return true, fmt.Sprintf("issue #%d note was modified at %s (expected unmodified since %s)", num, curMod, patch.IfUnmodifiedSince)
 	}
 	if patch.IfUnmodifiedSince == "" && baseExportedAt != "" && curMod != "" && model.CompareRFC3339(curMod, baseExportedAt) > 0 {
-		return true, fmt.Sprintf("issue #%d triage state was updated at %s after export %s", num, curMod, baseExportedAt)
+		return true, fmt.Sprintf("issue #%d note was updated at %s after export %s", num, curMod, baseExportedAt)
 	}
 	return false, ""
 }
@@ -3156,13 +3511,14 @@ SELECT
   i.labels_json, i.is_canonical, i.is_customer, i.gh_severity,
   i.auto_cat, i.auto_severity, i.auto_subsystem, i.auto_is_borderline, i.auto_force_keep, i.auto_note_zh, i.auto_note_en,
   o.cat, o.severity, o.subsystem, o.is_borderline_kept, COALESCE(o.force_keep, 0), COALESCE(o.has_force_keep_override, 0),
-  o.note_zh, o.note_en, COALESCE(o.has_note_override, 0),
+  nt.note_zh, nt.note_en, CASE WHEN nt.number IS NOT NULL THEN 1 ELSE 0 END, COALESCE(nt.updated_at, ''),
   CASE WHEN o.number IS NOT NULL AND (COALESCE(o.cat, '') != '' OR COALESCE(o.has_force_keep_override, 0) != 0 OR o.is_borderline_kept IS NOT NULL) THEN 1 ELSE 0 END,
   COALESCE(o.updated_at, ''),
-  COALESCE(ts.triaged_at, ''), COALESCE(ts.needs_retriage, 0),
+  COALESCE(ts.triaged_at, ''), COALESCE(ts.retriage_updated_at, ''), COALESCE(ts.needs_retriage, 0),
   COALESCE(ts.retriage_reasons_json, '[]'), COALESCE(ts.retriage_details_json, '[]')
 FROM issues i
 LEFT JOIN issue_overrides o ON i.repo = o.repo AND i.number = o.number
+LEFT JOIN issue_notes nt ON i.repo = nt.repo AND i.number = nt.number
 LEFT JOIN issue_triage_state ts ON i.repo = ts.repo AND i.number = ts.number
 WHERE i.repo = ?
 ORDER BY i.number DESC`, DefaultRepo)
@@ -3192,7 +3548,9 @@ ORDER BY i.number DESC`, DefaultRepo)
 			oForceKeep, oHasFK       int
 			oNZh, oNEn               sql.NullString
 			oHasNote, hasOvr         int
+			noteUpdatedAt            string
 			ovrUpdatedAt, triagedAt  string
+			retriageUpdatedAt        string
 			needsRetriage            int
 			reasonsJSON, detailsJSON string
 		)
@@ -3201,8 +3559,8 @@ ORDER BY i.number DESC`, DefaultRepo)
 			&lbsJSON, &isCan, &isCust, &r.GHSeverity,
 			&autoCat, &autoSev, &autoSub, &autoBdr, &autoFK, &autoNZh, &autoNEn,
 			&oCat, &oSev, &oSub, &oBdr, &oForceKeep, &oHasFK,
-			&oNZh, &oNEn, &oHasNote, &hasOvr,
-			&ovrUpdatedAt, &triagedAt, &needsRetriage, &reasonsJSON, &detailsJSON,
+			&oNZh, &oNEn, &oHasNote, &noteUpdatedAt, &hasOvr,
+			&ovrUpdatedAt, &triagedAt, &retriageUpdatedAt, &needsRetriage, &reasonsJSON, &detailsJSON,
 		); err != nil {
 			return model.Dataset{}, err
 		}
@@ -3284,7 +3642,7 @@ ORDER BY i.number DESC`, DefaultRepo)
 				effForceKeep = oForceKeep != 0
 			}
 			r.ForceKeep = effForceKeep
-			r.TriagedAt = model.MaxRFC3339(ovrUpdatedAt, triagedAt)
+			r.TriagedAt = model.MaxRFC3339(ovrUpdatedAt, triagedAt, retriageUpdatedAt, noteUpdatedAt)
 			if needsRetriage != 0 {
 				r.NeedsRetriage = true
 				_ = json.Unmarshal([]byte(reasonsJSON), &r.RetriageReasons)

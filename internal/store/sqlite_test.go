@@ -1324,7 +1324,7 @@ func TestRound2SpecialDBPathSyncRacesReconcileAndTypoDetection(t *testing.T) {
 				Subsystem:        "logical_rewrite",
 				IsBorderlineKept: true,
 				ForceKeep:        true,
-				PRs:              []model.LinkedPRRef{{Repo: "pingcap/tidb", Num: 78901, State: "OPEN"}},
+				PRs:              []model.LinkedPRRef{{Repo: "pingcap/tidb", Num: 78901, State: model.PRStateUnknown}},
 			},
 			{
 				Number:      78200,
@@ -1494,7 +1494,7 @@ func TestRound2SpecialDBPathSyncRacesReconcileAndTypoDetection(t *testing.T) {
 	// 3. Batch validation with BaseExportedAt != "" and SkipConflicts=true:
 	//    - Closed/removed pending #78104 IS skipped as a conflict (via removed_pending_nums)
 	//    - Genuine typo #88888888 in new_issues or exclude_issues FAILS with ErrIssueNotFound!
-	cfl78104, err := st.ValidateBatchDecisionsWithOptions(model.BatchTriageDecisions{
+	_, cfl78104, err := st.PlanBatchDecisionsWithOptions(model.BatchTriageDecisions{
 		BaseExportedAt: planStarted,
 		NewIssues: map[string]model.TriagePatchRequest{
 			"78104": {Cat: "EASY", Severity: "MINOR", Subsystem: "statistics"},
@@ -1503,7 +1503,7 @@ func TestRound2SpecialDBPathSyncRacesReconcileAndTypoDetection(t *testing.T) {
 	if err != nil || len(cfl78104) != 1 {
 		t.Fatalf("expected closed pending #78104 to be skipped via removed_pending_nums, got cfl=%+v err=%v", cfl78104, err)
 	}
-	if _, err := st.ValidateBatchDecisionsWithOptions(model.BatchTriageDecisions{
+	if _, _, err := st.PlanBatchDecisionsWithOptions(model.BatchTriageDecisions{
 		BaseExportedAt: planStarted,
 		NewIssues: map[string]model.TriagePatchRequest{
 			"88888888": {Cat: "EASY", Severity: "MINOR", Subsystem: "statistics"},
@@ -1511,26 +1511,37 @@ func TestRound2SpecialDBPathSyncRacesReconcileAndTypoDetection(t *testing.T) {
 	}, BatchApplyOptions{SkipConflicts: true}); !errors.Is(err, ErrIssueNotFound) {
 		t.Fatalf("expected typo #88888888 in new_issues to fail with ErrIssueNotFound even when BaseExportedAt is set, got %v", err)
 	}
-	if _, err := st.ValidateBatchDecisionsWithOptions(model.BatchTriageDecisions{
+	if _, _, err := st.PlanBatchDecisionsWithOptions(model.BatchTriageDecisions{
 		BaseExportedAt: planStarted,
 		ExcludeIssues:  map[string]string{"88888888": "typo"},
 	}, BatchApplyOptions{SkipConflicts: true}); !errors.Is(err, ErrIssueNotFound) {
 		t.Fatalf("expected typo #88888888 in exclude_issues to fail with ErrIssueNotFound even when BaseExportedAt is set, got %v", err)
 	}
 
-	// 4. NewTemplateOverridePatch omits booleans (preserving IsBorderlineKept & ForceKeep),
+	// 4. JSON override omitting booleans preserves IsBorderlineKept & ForceKeep,
 	//    ApplyIssueOverride enforces IfUnmodifiedSince (ErrOverrideConflict),
-	//    and ReconcileNewlySyncedPRBaselines fixes merged initial PR across override + auto_baseline!
+	//    and UpsertPRStatuses suppresses pre-ack merge on unverified UNKNOWN PR #78901!
 	r78001 := recMap[78001]
-	tplPatch := model.NewTemplateOverridePatch("HARD", "CRITICAL", "logical_rewrite", r78001.TriagedAt, &model.LocalizedNote{
-		ZhCN: "模板覆盖保留边界与强留标记",
-		En:   "Template override preserves borderline and force_keep flags",
+	var tplPatch model.TriagePatchRequest
+	rawTplJSON, _ := json.Marshal(map[string]any{
+		"cat":                 "HARD",
+		"severity":            "CRITICAL",
+		"subsystem":           "logical_rewrite",
+		"if_unmodified_since": r78001.TriagedAt,
+		"note": map[string]string{
+			"zh-CN": "模板覆盖保留边界与强留标记",
+			"en":    "Template override preserves borderline and force_keep flags",
+		},
 	})
+	if err := json.Unmarshal(rawTplJSON, &tplPatch); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := st.ApplyIssueOverride(78001, tplPatch); err != nil {
 		t.Fatalf("ApplyIssueOverride(78001) failed: %v", err)
 	}
 	// Stale IfUnmodifiedSince must fail with ErrOverrideConflict
-	stalePatch := model.NewTemplateOverridePatch("EASY", "MINOR", "statistics", "2020-01-01T00:00:00.000000000Z", nil)
+	var stalePatch model.TriagePatchRequest
+	_ = json.Unmarshal([]byte(`{"cat":"EASY","severity":"MINOR","subsystem":"statistics","if_unmodified_since":"2020-01-01T00:00:00.000000000Z"}`), &stalePatch)
 	if _, err := st.ApplyIssueOverride(78001, stalePatch); !errors.Is(err, ErrOverrideConflict) {
 		t.Fatalf("expected ErrOverrideConflict on stale IfUnmodifiedSince, got %v", err)
 	}
@@ -2098,5 +2109,284 @@ func TestExplicitFactModelUnknownManualPRSyncWatermarkAndReopen(t *testing.T) {
 		Note:              &model.LocalizedNote{ZhCN: "最新水位线正常入库", En: "Fresh watermark resolves cleanly"},
 	}); err != nil {
 		t.Fatalf("expected fresh SyncWatermark to succeed, got %v", err)
+	}
+}
+
+func TestRound3StoreConvergenceInvariants(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "round3.db")
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Seed active issue #97001 with verified OPEN PR #97901 and #97002 with UNKNOWN manual link #97902
+	if err := st.IngestSyncedDataset(model.Dataset{
+		SyncMeta: model.SyncMeta{SchemaVersion: 2, SnapshotUTC: "2026-11-12T10:00:00Z"},
+		Records: []model.IssueRecord{
+			{
+				Number:      97001,
+				Title:       "planner: verified OPEN PR merges before calibration",
+				Author:      "alice",
+				Created:     "2026-11-12",
+				CreatedAt:   "2026-11-12T09:00:00Z",
+				UpdatedAt:   "2026-11-12T10:00:00Z",
+				Labels:      []string{"sig/planner", "type/bug"},
+				IsCanonical: true,
+				Cat:         "MEDIUM",
+				Severity:    "MAJOR",
+				Subsystem:   "logical_rewrite",
+				PRs: []model.LinkedPRRef{{
+					Repo:      "pingcap/tidb",
+					Num:       97901,
+					Label:     "#97901",
+					URL:       "https://github.com/pingcap/tidb/pull/97901",
+					State:     "OPEN",
+					UpdatedAt: "2026-11-12T10:00:00Z",
+				}},
+			},
+			{
+				Number:      97002,
+				Title:       "planner: issue with pre-cached PR status and lagging link",
+				Author:      "bob",
+				Created:     "2026-11-12",
+				CreatedAt:   "2026-11-12T09:00:00Z",
+				UpdatedAt:   "2026-11-12T10:00:00Z",
+				Labels:      []string{"sig/planner", "type/bug"},
+				IsCanonical: true,
+				Cat:         "EASY",
+				Severity:    "MODERATE",
+				Subsystem:   "statistics",
+			},
+		},
+	}, []model.PendingCandidate{{
+		Number:    97101,
+		Title:     "planner: pending candidate with open PR",
+		Author:    "carol",
+		CreatedAt: "2026-11-12T10:00:00Z",
+		UpdatedAt: "2026-11-12T10:00:00Z",
+		Labels:    []string{"sig/planner", "type/bug"},
+		PRs:       []model.LinkedPRRef{{Repo: "pingcap/tidb", Num: 97910, State: "OPEN", UpdatedAt: "2026-11-12T10:00:00Z"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Finding #1: Human calibrates #97001 while local cache still says PR #97901 is OPEN,
+	//    even though #97901 actually merged on GitHub 5 minutes BEFORE human calibration (MergedAt < nowISO).
+	//    Next PR sync delivering MERGED MUST still trigger fix_pr_merged_still_open!
+	mergedBeforeCalib := time.Now().UTC().Add(-5 * time.Minute).Format(time.RFC3339)
+	if _, err := st.ApplyIssueOverride(97001, model.TriagePatchRequest{
+		Cat:       "HARD",
+		Severity:  "CRITICAL",
+		Subsystem: "logical_rewrite",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dsBeforeSync, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var preTriggerWatermark string
+	for _, r := range dsBeforeSync.Records {
+		if r.Number == 97001 {
+			preTriggerWatermark = r.TriagedAt
+		}
+	}
+	if preTriggerWatermark == "" {
+		t.Fatalf("expected non-empty TriagedAt after override")
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	if err := st.UpsertPRStatuses([]model.PRStatus{{
+		Repo:         "pingcap/tidb",
+		Num:          97901,
+		Title:        "planner: fix 97001",
+		State:        "MERGED",
+		UpdatedAt:    mergedBeforeCalib,
+		MergedAt:     mergedBeforeCalib,
+		TrackSources: []string{"issue_linked"},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	dsAfterMerge, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var postTriggerWatermark string
+	foundMergeTrigger := false
+	for _, r := range dsAfterMerge.Records {
+		if r.Number == 97001 {
+			postTriggerWatermark = r.TriagedAt
+			for _, reason := range r.RetriageReasons {
+				if reason == "fix_pr_merged_still_open" {
+					foundMergeTrigger = true
+				}
+			}
+		}
+	}
+	if !foundMergeTrigger {
+		t.Fatalf("expected verified OPEN -> MERGED to fire fix_pr_merged_still_open even when MergedAt (%s) < calibration timestamp", mergedBeforeCalib)
+	}
+
+	// 2. Finding #8a & #8c: Background retriage trigger bumped retriage_updated_at,
+	//    so stale preTriggerWatermark MUST be rejected on AcknowledgeIssueRetriageWithGuard & ResetIssueOverrideWithGuard!
+	if postTriggerWatermark <= preTriggerWatermark {
+		t.Fatalf("expected retriage_updated_at to advance TriagedAt (%q <= %q)", postTriggerWatermark, preTriggerWatermark)
+	}
+	if _, err := st.AcknowledgeIssueRetriageWithGuard(97001, "maint", preTriggerWatermark); !errors.Is(err, ErrOverrideConflict) {
+		t.Fatalf("expected stale AcknowledgeIssueRetriageWithGuard to fail with ErrOverrideConflict, got %v", err)
+	}
+	if _, err := st.ResetIssueOverrideWithGuard(97001, preTriggerWatermark); !errors.Is(err, ErrOverrideConflict) {
+		t.Fatalf("expected stale ResetIssueOverrideWithGuard to fail with ErrOverrideConflict, got %v", err)
+	}
+
+	// 3. Finding #9: Orthogonal `issue_notes`:
+	//    - Backfill bilingual notes via Notes
+	//    - Single-locale update preserves the other locale
+	//    - Notes update does NOT cause false conflict on AcknowledgeIssueRetriageWithGuard(postTriggerWatermark)
+	//    - ResetIssueOverride deletes classification override (HARD -> MEDIUM) while PRESERVING bilingual notes!
+	time.Sleep(2 * time.Millisecond)
+	if _, err := st.ApplyBatchTriageDecisions(model.BatchTriageDecisions{
+		Notes: map[string]model.NotePatchRequest{
+			"97001": {
+				ZhCN: "初始中文根因：谓词下推遗漏空值拒绝检查导致结果集错误",
+				En:   "Initial English note: predicate pushdown misses null-rejecting check causing wrong result",
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Single-locale zh-CN update preserves English note
+	if _, err := st.ApplyBatchTriageDecisions(model.BatchTriageDecisions{
+		Notes: map[string]model.NotePatchRequest{
+			"97001": {
+				ZhCN: "更新后中文根因：`pushDownPredicate` 遗漏空值拒绝检查导致外连接结果错误",
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Acknowledge retriage using postTriggerWatermark (taken BEFORE the note updates!) -> MUST SUCCEED (zero false conflict)!
+	if _, err := st.AcknowledgeIssueRetriageWithGuard(97001, "maint", postTriggerWatermark); err != nil {
+		t.Fatalf("expected note-only updates NOT to conflict with AcknowledgeIssueRetriageWithGuard, got %v", err)
+	}
+	// Reset classification override -> reverts Cat from HARD back to auto MEDIUM, while keeping bilingual notes!
+	if _, err := st.ResetIssueOverride(97001); err != nil {
+		t.Fatal(err)
+	}
+	dsAfterReset, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range dsAfterReset.Records {
+		if r.Number == 97001 {
+			if r.Cat != "MEDIUM" || r.ManualOverride {
+				t.Fatalf("expected ResetIssueOverride to revert Cat to MEDIUM and ManualOverride=false, got Cat=%s ManualOverride=%v", r.Cat, r.ManualOverride)
+			}
+			if r.Note == nil || !strings.Contains(r.Note.ZhCN, "pushDownPredicate") || !strings.Contains(r.Note.En, "Initial English note") {
+				t.Fatalf("expected ResetIssueOverride and single-locale note patch to preserve both locales, got %+v", r.Note)
+			}
+		}
+	}
+
+	// 4. Gap #1: UpsertPRStatuses preserves TrackSources union ("manual_cli") on subset upsert,
+	//    and hydrates UNKNOWN issue_pr_links even when pull_requests already has the fresh snapshot!
+	if err := st.UpsertPRStatuses([]model.PRStatus{{
+		Repo:         "pingcap/tidb",
+		Num:          97902,
+		Title:        "planner: manual tracked PR",
+		State:        "OPEN",
+		UpdatedAt:    "2026-11-12T12:00:00Z",
+		TrackSources: []string{"manual_cli"},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	// Attach manual PR link #97902 while offline (inserts or links against #97002), then simulate UNKNOWN link + subset upsert
+	if _, err := st.ApplyBatchTriageDecisions(model.BatchTriageDecisions{
+		ManualPRLinks: map[string][]string{"97002": {"97902"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = st.db.Exec(`UPDATE issue_pr_links SET state = 'UNKNOWN', updated_at = '' WHERE issue_num = 97002 AND pr_num = 97902`)
+	// Upsert older/same timestamp with subset TrackSources ["issue_linked"]
+	if err := st.UpsertPRStatuses([]model.PRStatus{{
+		Repo:         "pingcap/tidb",
+		Num:          97902,
+		Title:        "planner: manual tracked PR",
+		State:        "OPEN",
+		UpdatedAt:    "2026-11-12T11:00:00Z",
+		TrackSources: []string{"issue_linked"},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	openTargets, err := st.ListOpenPRTargets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawManualCLI := false
+	for _, tgt := range openTargets {
+		if tgt.Number == 97902 {
+			for _, src := range tgt.TrackSources {
+				if src == "manual_cli" {
+					sawManualCLI = true
+				}
+			}
+		}
+	}
+	if !sawManualCLI {
+		t.Fatalf("expected manual_cli TrackSource preserved across subset UpsertPRStatuses, got %+v", openTargets)
+	}
+	var linkState string
+	if err := st.db.QueryRow(`SELECT state FROM issue_pr_links WHERE issue_num = 97002 AND pr_num = 97902`).Scan(&linkState); err != nil || linkState != "OPEN" {
+		t.Fatalf("expected lagging UNKNOWN issue_pr_link hydrated to OPEN even when pull_requests skipped stale write, got %q err=%v", linkState, err)
+	}
+
+	// 5. Finding #4 & Gap #2: PersistEnrichedPendingCandidates advances SyncWatermark when PR UpdatedAt/State changes
+	pBefore, err := st.ListPendingCandidates()
+	if err != nil || len(pBefore) != 1 {
+		t.Fatalf("expected 1 pending candidate #97101, got %+v err=%v", pBefore, err)
+	}
+	wmBefore := pBefore[0].SyncWatermark
+	updatedCand := pBefore[0]
+	updatedCand.PRs[0].UpdatedAt = "2026-11-12T12:30:00Z" // new commit pushed to OPEN PR
+	survived, err := st.PersistEnrichedPendingCandidates([]model.PendingCandidate{updatedCand})
+	if err != nil || len(survived) != 1 || survived[0].SyncWatermark <= wmBefore {
+		t.Fatalf("expected PersistEnrichedPendingCandidates to advance SyncWatermark on new PR commit (%+v vs %q), err=%v", survived, wmBefore, err)
+	}
+
+	// 6. Finding #6 & #12: RejectDBTargetCollision blocks file: URI & -wal collisions; OpenSnapshotForDryRun leaves live DB untouched
+	fileURI := "file:" + dbPath + "?cache=shared"
+	if err := RejectDBTargetCollision(dbPath, fileURI); err == nil {
+		t.Fatalf("expected RejectDBTargetCollision to reject dest colliding with file: URI activeDBPath")
+	}
+	if err := RejectDBTargetCollision(fileURI, dbPath); err == nil {
+		t.Fatalf("expected RejectDBTargetCollision to reject file: URI destPath colliding with live DB")
+	}
+	if err := RejectDBTargetCollision(dbPath+"-wal", fileURI); err == nil {
+		t.Fatalf("expected RejectDBTargetCollision to reject -wal companion file of live DB")
+	}
+	snapStore, cleanupSnap, err := OpenSnapshotForDryRun(fileURI, "", nil)
+	if err != nil {
+		t.Fatalf("OpenSnapshotForDryRun(%s) failed: %v", fileURI, err)
+	}
+	// Mutate inside snapshot store and verify live store does NOT see it!
+	if _, err := snapStore.ApplyIssueOverride(97002, model.TriagePatchRequest{
+		Cat:       "HARD",
+		Severity:  "CRITICAL",
+		Subsystem: "logical_rewrite",
+	}); err != nil {
+		cleanupSnap()
+		t.Fatal(err)
+	}
+	cleanupSnap()
+	dsLive, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range dsLive.Records {
+		if r.Number == 97002 && (r.Cat != "EASY" || r.ManualOverride) {
+			t.Fatalf("expected live DB #97002 to remain EASY without override after mutating OpenSnapshotForDryRun copy, got %+v", r)
+		}
 	}
 }

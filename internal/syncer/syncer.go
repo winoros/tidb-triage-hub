@@ -101,11 +101,25 @@ func (sy *Syncer) ExecuteSyncPRs(ctx context.Context, prSpec string, minQuota in
 		if err != nil {
 			return prstatus.FetchStats{}, fmt.Errorf("%w: invalid pr spec: %v", ErrInvalidSyncInput, err)
 		}
+		for i := range targets {
+			targets[i].TrackSources = []string{"manual_cli"}
+		}
 		mq := minQuota
 		if mq < 0 {
 			mq = 20
 		}
-		return sy.SyncSpecificPRs(ctx, targets, mq)
+		stats, err := sy.SyncSpecificPRs(ctx, targets, mq)
+		if err != nil {
+			return prstatus.FetchStats{}, err
+		}
+		missingPRs, err := sy.store.HasPRStatuses(targets)
+		if err != nil {
+			return prstatus.FetchStats{}, err
+		}
+		if len(missingPRs) > 0 {
+			return prstatus.FetchStats{}, fmt.Errorf("%w: %s", ErrMissingGitHubPR, strings.Join(missingPRs, ", "))
+		}
+		return stats, nil
 	}
 	mq := minQuota
 	if mq < 0 {
@@ -484,6 +498,9 @@ func (sy *Syncer) ApplyTriageDecisionsWithOptions(ctx context.Context, dec model
 		if len(preTargets) > 0 {
 			if minQuota > 0 && !quotaChecked {
 				if _, qErr := ghgql.CheckQuota(ctx, sy.runner, minQuota); qErr != nil {
+					if err := ctx.Err(); err != nil {
+						return TriageApplyResult{}, err
+					}
 					prSyncWarn = fmt.Sprintf("triage decisions saved, but pre-flight quota check for %d newly linked PR(s) failed: %v", len(preTargets), qErr)
 				} else {
 					quotaChecked = true
@@ -492,6 +509,9 @@ func (sy *Syncer) ApplyTriageDecisionsWithOptions(ctx context.Context, dec model
 			if prSyncWarn == "" {
 				stats, sErr := sy.syncSpecificPRs(ctx, preTargets)
 				if sErr != nil {
+					if err := ctx.Err(); err != nil {
+						return TriageApplyResult{}, err
+					}
 					prSyncWarn = fmt.Sprintf("triage decisions saved, but syncing %d newly linked PR(s) failed: %v", len(preTargets), sErr)
 				} else {
 					mergePRFetchStats(&combinedStats, stats)
@@ -501,6 +521,9 @@ func (sy *Syncer) ApplyTriageDecisionsWithOptions(ctx context.Context, dec model
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return TriageApplyResult{}, err
+	}
 	bRes, err := sy.store.ApplyBatchTriageDecisionsWithOptions(dec, applyOpts)
 	if err != nil {
 		return TriageApplyResult{}, err

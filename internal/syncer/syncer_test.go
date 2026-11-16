@@ -144,3 +144,112 @@ func TestBuildPendingBundleDegradedEnrichmentGuardAndRetriageLivePRSync(t *testi
 		t.Fatalf("expected context.Canceled on cancelled ctx, got %v", err)
 	}
 }
+
+type stubTargetedSyncRunner struct {
+	cancelOnPRFetch func()
+}
+
+func (r *stubTargetedSyncRunner) Query(_ context.Context, gql string, _ map[string]string) ([]byte, error) {
+	if strings.Contains(gql, "...PRStatusFields") {
+		if r.cancelOnPRFetch != nil {
+			r.cancelOnPRFetch()
+		}
+		repoMap := map[string]any{}
+		if strings.Contains(gql, "number: 98001") {
+			repoMap["p98001"] = map[string]any{
+				"number":      98001,
+				"title":       "planner: manual cli tracked PR",
+				"url":         "https://github.com/pingcap/tidb/pull/98001",
+				"state":       "OPEN",
+				"isDraft":     false,
+				"mergeable":   "MERGEABLE",
+				"createdAt":   "2026-11-16T01:00:00Z",
+				"updatedAt":   "2026-11-16T02:00:00Z",
+				"baseRefName": "master",
+				"author":      map[string]any{"login": "alice"},
+			}
+		}
+		if strings.Contains(gql, "number: 98999") {
+			repoMap["p98999"] = nil // nonexistent GitHub PR
+		}
+		return json.Marshal(map[string]any{
+			"data": map[string]any{
+				"rateLimit":  map[string]any{"limit": 5000, "cost": 1, "remaining": 4990, "resetAt": "2026-11-16T12:00:00Z"},
+				"repository": repoMap,
+			},
+		})
+	}
+	return json.Marshal(map[string]any{
+		"data": map[string]any{
+			"rateLimit": map[string]any{"limit": 5000, "cost": 0, "remaining": 4990, "resetAt": "2026-11-16T12:00:00Z"},
+		},
+	})
+}
+
+func TestExecuteSyncPRsManualSourceMissingPRAndPreCommitCancel(t *testing.T) {
+	tmp := t.TempDir()
+	st, err := store.Open(filepath.Join(tmp, "sync_targeted.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.IngestSyncedDataset(model.Dataset{
+		SyncMeta: model.SyncMeta{SchemaVersion: 2, SnapshotUTC: "2026-11-16T00:00:00Z"},
+		Records: []model.IssueRecord{{
+			Number:      98100,
+			Title:       "planner: test cancel before SQLite commit",
+			Author:      "alice",
+			Created:     "2026-11-16",
+			CreatedAt:   "2026-11-16T00:00:00Z",
+			UpdatedAt:   "2026-11-16T00:00:00Z",
+			Labels:      []string{"sig/planner", "type/bug"},
+			IsCanonical: true,
+			Cat:         "EASY",
+			Severity:    "MINOR",
+			Subsystem:   "statistics",
+		}},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	sy := NewWithRunner(st, &stubTargetedSyncRunner{})
+
+	// 1. Finding #5: ExecuteSyncPRs stamps "manual_cli" so ListOpenPRTargets retains #98001
+	if _, err := sy.ExecuteSyncPRs(context.Background(), "98001", 0); err != nil {
+		t.Fatalf("ExecuteSyncPRs(98001) failed: %v", err)
+	}
+	targets, err := st.ListOpenPRTargets()
+	if err != nil || len(targets) != 1 || targets[0].Number != 98001 {
+		t.Fatalf("expected #98001 retained in ListOpenPRTargets via manual_cli TrackSource, got %+v err=%v", targets, err)
+	}
+
+	// 2. Finding #5: Nonexistent PR #98999 returns ErrMissingGitHubPR instead of silent success
+	if _, err := sy.ExecuteSyncPRs(context.Background(), "98999", 0); !errors.Is(err, ErrMissingGitHubPR) {
+		t.Fatalf("expected ErrMissingGitHubPR for nonexistent PR #98999, got %v", err)
+	}
+
+	// 3. Finding #7: Cancelling ctx during pre-write PR fetch aborts BEFORE committing batch triage to SQLite!
+	ctx, cancel := context.WithCancel(context.Background())
+	syCancel := NewWithRunner(st, &stubTargetedSyncRunner{cancelOnPRFetch: cancel})
+	_, err = syCancel.ApplyTriageDecisionsWithOptions(ctx, model.BatchTriageDecisions{
+		Overrides: map[string]model.TriagePatchRequest{
+			"98100": {
+				Cat:       "HARD",
+				Severity:  "CRITICAL",
+				Subsystem: "logical_rewrite",
+			},
+		},
+		ManualPRLinks: map[string][]string{"98100": {"98002"}},
+	}, store.BatchApplyOptions{}, true, 0)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled when cancelled before SQLite commit, got %v", err)
+	}
+	dsAfter, err := st.BuildDataset(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dsAfter.Records[0].Cat != "EASY" || dsAfter.Records[0].ManualOverride {
+		t.Fatalf("expected cancelled ApplyTriageDecisions NOT to commit override to SQLite, got %+v", dsAfter.Records[0])
+	}
+}
