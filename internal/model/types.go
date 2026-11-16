@@ -597,20 +597,6 @@ func (r TriagePatchRequest) HasForceKeepField() bool {
 	return !r.unmarshaled || r.hasForceKeep
 }
 
-// NewTemplateOverridePatch constructs a template TriagePatchRequest whose JSON serialization
-// omits `is_borderline_kept` and `force_keep` unless explicitly added by the user, preventing
-// note-backfill or re-triage templates from unintentionally pinning manual boolean overrides.
-func NewTemplateOverridePatch(cat, severity, subsystem, ifUnmodifiedSince string, note *LocalizedNote) TriagePatchRequest {
-	return TriagePatchRequest{
-		Cat:               cat,
-		Severity:          severity,
-		Subsystem:         subsystem,
-		Note:              note,
-		IfUnmodifiedSince: ifUnmodifiedSince,
-		unmarshaled:       true,
-	}
-}
-
 // RFC3339NanoFixed formats UTC timestamps with fixed 9-digit nanoseconds so both Go
 // chronological comparison and SQLite lexicographic `ORDER BY` remain strictly monotonic.
 const RFC3339NanoFixed = "2006-01-02T15:04:05.000000000Z"

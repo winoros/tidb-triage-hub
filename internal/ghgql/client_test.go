@@ -261,6 +261,10 @@ func TestSafeRedirectDeterministicGraphQLUTF8AndQuotaEmptyGuard(t *testing.T) {
 	if err := SafeRedirectPolicy(upgradeDiffPort, []*http.Request{origHTTPPort}); err == nil || !strings.Contains(err.Error(), "cross-port") {
 		t.Fatalf("expected HTTP:8787 -> HTTPS:8443 cross-port redirect to be blocked, got %v", err)
 	}
+	upgradeSameCustomPort, _ := http.NewRequest(http.MethodGet, "https://hub.internal:8787/api/status", nil)
+	if err := SafeRedirectPolicy(upgradeSameCustomPort, []*http.Request{origHTTPPort}); err == nil || !strings.Contains(err.Error(), "cross-port") {
+		t.Fatalf("expected non-standard HTTP:8787 -> HTTPS:8787 redirect to be blocked, got %v", err)
+	}
 
 	// 2. Deterministic HTTP 200 GraphQL error fails fast (1 attempt), while secondary rate limit retries
 	var calls atomic.Int32

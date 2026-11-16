@@ -173,20 +173,22 @@ func ValidateAndPrepareDecisions(
 		return nil
 	}
 
-	seenNew := make(map[int]string)
+	seenNewRaw := make(map[int]string)
+	activeNew := make(map[int]string)
 	skippedNewTodoNums := make(map[int]bool)
 	for k, patch := range dec.NewIssues {
 		num, err := normalizeIssueKey(k)
 		if err != nil {
 			return out, nil, err
 		}
-		if prevKey, dup := seenNew[num]; dup {
+		if prevKey, dup := seenNewRaw[num]; dup {
 			return out, nil, fmt.Errorf("duplicate issue #%d in `new_issues` (%q and %q)", num, prevKey, k)
 		}
-		seenNew[num] = k
+		seenNewRaw[num] = k
 		if _, isExcluded := excludedByNum[num]; isExcluded {
 			// Auto-resolve untouched pending template entry when moved to `exclude_issues`
 			if patch.Note == nil || patch.Note.IsEmpty() || isTodoNote(patch.Note) {
+				skippedNewTodoNums[num] = true
 				continue
 			}
 			return out, nil, fmt.Errorf("issue #%d appears in both `new_issues` (with completed note) and `exclude_issues`; keep only one", num)
@@ -198,6 +200,7 @@ func ValidateAndPrepareDecisions(
 			}
 			return out, nil, fmt.Errorf("issue #%d: `note` still contains `TODO:` placeholder (complete the note or pass --skip-todo)", num)
 		}
+		activeNew[num] = k
 
 		if rawIf := strings.TrimSpace(patch.IfUnmodifiedSince); rawIf != "" {
 			norm, ok := model.NormalizeRFC3339NanoFixed(rawIf)
@@ -219,25 +222,30 @@ func ValidateAndPrepareDecisions(
 		out.NewIssues[strconv.Itoa(num)] = patch
 	}
 
-	seenOvr := make(map[int]string)
+	seenOvrRaw := make(map[int]string)
+	activeOvr := make(map[int]string)
 	for k, patch := range dec.Overrides {
 		num, err := normalizeIssueKey(k)
 		if err != nil {
 			return out, nil, err
 		}
-		if prevKey, dup := seenOvr[num]; dup {
+		if prevKey, dup := seenOvrRaw[num]; dup {
 			return out, nil, fmt.Errorf("duplicate issue #%d in `overrides` (%q and %q)", num, prevKey, k)
 		}
-		seenOvr[num] = k
+		seenOvrRaw[num] = k
+		if isTodoNote(patch.Note) {
+			if opts.SkipTodo {
+				continue
+			}
+			return out, nil, fmt.Errorf("override #%d: `note` still contains `TODO:` placeholder (complete the note or pass --skip-todo)", num)
+		}
 		if _, isExcluded := excludedByNum[num]; isExcluded {
 			return out, nil, fmt.Errorf("issue #%d appears in both `overrides` and `exclude_issues`; remove one", num)
 		}
-		if _, inNew := seenNew[num]; inNew {
+		if _, inNew := activeNew[num]; inNew {
 			return out, nil, fmt.Errorf("issue #%d appears in both `new_issues` and `overrides`; keep only one", num)
 		}
-		if isTodoNote(patch.Note) {
-			return out, nil, fmt.Errorf("override #%d: `note` still contains `TODO:` placeholder", num)
-		}
+		activeOvr[num] = k
 		if rawIf := strings.TrimSpace(patch.IfUnmodifiedSince); rawIf != "" {
 			norm, ok := model.NormalizeRFC3339NanoFixed(rawIf)
 			if !ok {
@@ -259,25 +267,17 @@ func ValidateAndPrepareDecisions(
 		out.Overrides[strconv.Itoa(num)] = patch
 	}
 
-	seenNotes := make(map[int]string)
+	seenNotesRaw := make(map[int]string)
+	activeNotes := make(map[int]string)
 	for k, np := range dec.Notes {
 		num, err := normalizeIssueKey(k)
 		if err != nil {
 			return out, nil, err
 		}
-		if prevKey, dup := seenNotes[num]; dup {
+		if prevKey, dup := seenNotesRaw[num]; dup {
 			return out, nil, fmt.Errorf("duplicate issue #%d in `notes` (%q and %q)", num, prevKey, k)
 		}
-		seenNotes[num] = k
-		if _, isExcluded := excludedByNum[num]; isExcluded {
-			return out, nil, fmt.Errorf("issue #%d appears in both `notes` and `exclude_issues`; remove one", num)
-		}
-		if _, inNew := seenNew[num]; inNew {
-			return out, nil, fmt.Errorf("issue #%d appears in both `new_issues` and `notes`; keep only one", num)
-		}
-		if _, inOvr := seenOvr[num]; inOvr {
-			return out, nil, fmt.Errorf("issue #%d appears in both `overrides` and `notes`; keep only one", num)
-		}
+		seenNotesRaw[num] = k
 		noteObj := np.LocalizedNote()
 		if isTodoNote(noteObj) {
 			if opts.SkipTodo {
@@ -285,6 +285,16 @@ func ValidateAndPrepareDecisions(
 			}
 			return out, nil, fmt.Errorf("issue #%d: `notes` entry still contains `TODO:` placeholder (complete the note or pass --skip-todo)", num)
 		}
+		if _, isExcluded := excludedByNum[num]; isExcluded {
+			return out, nil, fmt.Errorf("issue #%d appears in both `notes` and `exclude_issues`; remove one", num)
+		}
+		if _, inNew := activeNew[num]; inNew {
+			return out, nil, fmt.Errorf("issue #%d appears in both `new_issues` and `notes`; keep only one", num)
+		}
+		if _, inOvr := activeOvr[num]; inOvr {
+			return out, nil, fmt.Errorf("issue #%d appears in both `overrides` and `notes`; keep only one", num)
+		}
+		activeNotes[num] = k
 		if rawIf := strings.TrimSpace(np.IfUnmodifiedSince); rawIf != "" {
 			norm, ok := model.NormalizeRFC3339NanoFixed(rawIf)
 			if !ok {
@@ -343,13 +353,13 @@ func ValidateAndPrepareDecisions(
 		if _, isExcluded := excludedByNum[num]; isExcluded {
 			return out, nil, fmt.Errorf("issue #%d appears in both `ack_retriage` and `exclude_issues`", num)
 		}
-		if _, inNew := seenNew[num]; inNew {
+		if _, inNew := activeNew[num]; inNew {
 			return out, nil, fmt.Errorf("issue #%d appears in both `new_issues` and `ack_retriage`", num)
 		}
-		if _, inOvr := seenOvr[num]; inOvr {
+		if _, inOvr := activeOvr[num]; inOvr {
 			return out, nil, fmt.Errorf("issue #%d appears in both `overrides` and `ack_retriage`; `overrides` already resets the re-triage baseline", num)
 		}
-		if _, inNotes := seenNotes[num]; inNotes {
+		if _, inNotes := activeNotes[num]; inNotes {
 			return out, nil, fmt.Errorf("issue #%d appears in both `notes` and `ack_retriage`; use `overrides` to update note while acknowledging re-triage", num)
 		}
 		seenAck[num] = true

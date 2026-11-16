@@ -75,8 +75,9 @@ func cleanSubstantiveComment(body string) string {
 	return strings.TrimSpace(strings.Join(kept, " "))
 }
 
-// ExtractMainlinePRKeySets returns sorted slices of mainline OPEN/DRAFT/UNKNOWN PR keys
-// (non-merged linked PRs known at baseline time) and mainline MERGED PR keys.
+// ExtractMainlinePRKeySets returns sorted slices of verified mainline OPEN/DRAFT PR keys
+// and mainline MERGED PR keys. Unverified UNKNOWN PRs are intentionally excluded from openKeys
+// so that only genuinely verified OPEN -> MERGED transitions bypass pre-ack merge suppression.
 func ExtractMainlinePRKeySets(prs []model.LinkedPRRef) (openKeys []string, mergedKeys []string) {
 	openSet := make(map[string]bool)
 	mergedSet := make(map[string]bool)
@@ -86,7 +87,7 @@ func ExtractMainlinePRKeySets(prs []model.LinkedPRRef) (openKeys []string, merge
 		}
 		k := model.PRKey(p.Repo, p.Num)
 		switch p.State {
-		case "OPEN", "DRAFT", model.PRStateUnknown:
+		case "OPEN", "DRAFT":
 			openSet[k] = true
 		case "MERGED":
 			mergedSet[k] = true
@@ -103,22 +104,20 @@ func ExtractMainlinePRKeySets(prs []model.LinkedPRRef) (openKeys []string, merge
 	return openKeys, mergedKeys
 }
 
-func wasPRAlreadyMergedAtBaseline(p model.LinkedPRRef, wasLinkedInOpenBaseline bool, fallbackTriagedAt string) bool {
+func wasUnknownPRAlreadyMergedAtAck(p model.LinkedPRRef, fallbackTriagedAt string) bool {
 	ackAt := strings.TrimSpace(p.AckAt)
-	if !wasLinkedInOpenBaseline && ackAt == "" {
+	if ackAt == "" {
 		return false
 	}
-	if strings.TrimSpace(p.MergedAt) == "" {
+	mergedAt := strings.TrimSpace(p.MergedAt)
+	if mergedAt == "" {
 		return false
 	}
 	baseAt := ackAt
 	if baseAt == "" {
 		baseAt = strings.TrimSpace(fallbackTriagedAt)
 	}
-	if baseAt == "" {
-		return false
-	}
-	return model.CompareRFC3339(p.MergedAt, baseAt) <= 0
+	return model.CompareRFC3339(mergedAt, baseAt) <= 0
 }
 
 // EvaluateRetriage compares an issue's live state against its last acknowledged baseline.
@@ -158,7 +157,7 @@ func EvaluateRetriage(in RetriageEvalInput) ([]string, []model.RetriageTrigger) 
 			newOpenLabels = append(newOpenLabels, p.Label)
 		}
 		if p.State == "MERGED" && !baseMerged[k] {
-			if !wasPRAlreadyMergedAtBaseline(p, baseOpen[k], in.TriagedAt) {
+			if baseOpen[k] || !wasUnknownPRAlreadyMergedAtAck(p, in.TriagedAt) {
 				newMergedLabels = append(newMergedLabels, p.Label)
 			}
 		}

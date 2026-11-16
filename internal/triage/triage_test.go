@@ -604,8 +604,8 @@ func TestFetchPendingPRDetailsNullDataCacheFreshnessAndSkipTodoCompanions(t *tes
 	if err != nil {
 		t.Fatalf("expected EnrichAndAnalyzePending not to call GraphQL when cache is fresh, got %v", err)
 	}
-	if enriched[0].PRs[0].State != "CLOSED" {
-		t.Fatalf("expected EnrichAndAnalyzePending to sync PRs[0].State=CLOSED from fresher PRDetails, got %s", enriched[0].PRs[0].State)
+	if len(enriched[0].PRs) != 2 || enriched[0].PRs[0].Num != 74911 || enriched[0].PRs[0].State != "OPEN" || enriched[0].PRs[1].Num != 74910 || enriched[0].PRs[1].State != "CLOSED" {
+		t.Fatalf("expected EnrichAndAnalyzePending to sync PR #74910=CLOSED and re-sort OPEN first, got %+v", enriched[0].PRs)
 	}
 	if enriched[0].SuggestedTriage == nil || enriched[0].SuggestedTriage.Subsystem != "cbo_cost_join_reorder" {
 		t.Fatalf("expected SuggestedTriage subsystem=cbo_cost_join_reorder (ignoring closed statistics PR), got %+v", enriched[0].SuggestedTriage)
@@ -639,11 +639,20 @@ func TestFetchPendingPRDetailsNullDataCacheFreshnessAndSkipTodoCompanions(t *tes
 				IfUnmodifiedSince: "2026-11-12T10:00:00Z",
 			},
 		},
+		Overrides: map[string]model.TriagePatchRequest{
+			"74250": {
+				Cat:       "EASY",
+				Severity:  "MINOR",
+				Subsystem: "statistics",
+				Note:      &model.LocalizedNote{ZhCN: "TODO: 待填覆盖备注", En: "TODO: fill override note"},
+			},
+		},
 		ManualPRLinks: map[string][]string{
 			"74100": {"75001"},
 			"74101": {"75002"},
 		},
-		AckRetriage: model.FlexIntList{74300},
+		// #74100 was skipped in new_issues due to SkipTodo, so referencing #74100 in ack_retriage must NOT false-conflict
+		AckRetriage: model.FlexIntList{74300, 74100},
 	}
 	cleaned, _, err := ValidateAndPrepareDecisions(todoDec, ValidateOptions{SkipTodo: true})
 	if err != nil {
@@ -658,8 +667,11 @@ func TestFetchPendingPRDetailsNullDataCacheFreshnessAndSkipTodoCompanions(t *tes
 	if len(cleaned.Notes) != 1 || cleaned.Notes["74201"].IfUnmodifiedSince != "2026-11-12T10:00:00.000000000Z" {
 		t.Fatalf("expected only completed note #74201 with normalized IfUnmodifiedSince, got %+v", cleaned.Notes)
 	}
-	if len(cleaned.AckRetriage) != 1 || cleaned.AckRetriage[0] != 74300 {
-		t.Fatalf("expected ack_retriage [74300] preserved, got %v", cleaned.AckRetriage)
+	if len(cleaned.Overrides) != 0 {
+		t.Fatalf("expected TODO override #74250 skipped by SkipTodo, got %+v", cleaned.Overrides)
+	}
+	if len(cleaned.AckRetriage) != 2 || cleaned.AckRetriage[0] != 74300 || cleaned.AckRetriage[1] != 74100 {
+		t.Fatalf("expected ack_retriage [74300, 74100] preserved, got %v", cleaned.AckRetriage)
 	}
 
 	// 4. Strict mutual exclusion: overrides (even with Note == nil) + exclude_issues MUST fail
@@ -692,14 +704,15 @@ func TestFetchPendingPRDetailsNullDataCacheFreshnessAndSkipTodoCompanions(t *tes
 		t.Fatalf("expected overrides + notes to fail, got %v", err)
 	}
 
-	// 5. EvaluateRetriage pre-baseline vs post-baseline merge detection for UNKNOWN manual PR links
+	// 5. EvaluateRetriage: UNKNOWN PRs are excluded from openKeys (pre-ack merge suppressed, post-ack merge fires),
+	//    while verified OPEN PRs in openKeys ALWAYS fire fix_pr_merged_still_open even if MergedAt <= AckAt!
 	openKeys, mergedKeys := ExtractMainlinePRKeySets([]model.LinkedPRRef{
 		{Repo: "pingcap/tidb", Num: 80001, State: model.PRStateUnknown},
 	})
-	if len(openKeys) != 1 || openKeys[0] != "pingcap/tidb#80001" || len(mergedKeys) != 0 {
-		t.Fatalf("expected UNKNOWN PR to be recorded in openKeys baseline, got open=%v merged=%v", openKeys, mergedKeys)
+	if len(openKeys) != 0 || len(mergedKeys) != 0 {
+		t.Fatalf("expected UNKNOWN PR excluded from verified openKeys/mergedKeys, got open=%v merged=%v", openKeys, mergedKeys)
 	}
-	// Merged BEFORE AckAt (even if UpdatedAt was bumped later by a post-merge comment) -> must NOT trigger fix_pr_merged_still_open
+	// UNKNOWN PR merged BEFORE AckAt -> must NOT trigger fix_pr_merged_still_open
 	preMergedReasons, _ := EvaluateRetriage(RetriageEvalInput{
 		CurrentCat:         "MEDIUM",
 		CurrentSeverity:    "MAJOR",
@@ -716,7 +729,27 @@ func TestFetchPendingPRDetailsNullDataCacheFreshnessAndSkipTodoCompanions(t *tes
 		}},
 	})
 	if len(preMergedReasons) != 0 {
-		t.Fatalf("expected pre-baseline merged manual PR not to trigger retriage, got %v", preMergedReasons)
+		t.Fatalf("expected pre-baseline merged UNKNOWN PR not to trigger retriage, got %v", preMergedReasons)
+	}
+	// Verified OPEN PR (in BaselineOpenPRKeys) that merged at 09:00Z before a 09:30Z human calibration
+	// (while cached as OPEN) MUST still trigger fix_pr_merged_still_open once sync-prs discovers MERGED!
+	verifiedOpenReasons, _ := EvaluateRetriage(RetriageEvalInput{
+		CurrentCat:         "MEDIUM",
+		CurrentSeverity:    "MAJOR",
+		BaselineOpenPRKeys: []string{"pingcap/tidb#80002"},
+		TriagedAt:          "2026-11-15T09:30:00Z",
+		CurrentPRs: []model.LinkedPRRef{{
+			Repo:      "pingcap/tidb",
+			Num:       80002,
+			Label:     "#80002",
+			State:     "MERGED",
+			MergedAt:  "2026-11-15T09:00:00Z",
+			UpdatedAt: "2026-11-15T09:00:00Z",
+			AckAt:     "2026-11-15T09:30:00Z",
+		}},
+	})
+	if len(verifiedOpenReasons) != 1 || verifiedOpenReasons[0] != model.RetriageFixPRMergedOpen {
+		t.Fatalf("expected verified OPEN -> MERGED PR to trigger fix_pr_merged_still_open even when MergedAt <= AckAt, got %v", verifiedOpenReasons)
 	}
 	// Merged AFTER AckAt -> MUST trigger fix_pr_merged_still_open
 	postMergedReasons, _ := EvaluateRetriage(RetriageEvalInput{

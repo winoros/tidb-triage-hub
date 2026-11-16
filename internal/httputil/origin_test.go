@@ -2,6 +2,7 @@ package httputil
 
 import (
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -135,5 +136,46 @@ func TestParseBaseURLAndJoinEndpoint(t *testing.T) {
 		if _, err := ParseBaseURL(bad); err == nil {
 			t.Fatalf("expected ParseBaseURL(%q) to fail", bad)
 		}
+	}
+}
+
+func TestLastForwardedHopTrustedProxyAddrAndReadBoundedBody(t *testing.T) {
+	// Multi-line header: client spoofed first line, reverse proxy appended last line
+	if got := LastForwardedHop([]string{"https", "http"}); got != "http" {
+		t.Fatalf("expected last header line hop 'http', got %q", got)
+	}
+	if got := LastForwardedHop([]string{"evil.example.com", "edge.internal, hub.example.com"}); got != "hub.example.com" {
+		t.Fatalf("expected 'hub.example.com', got %q", got)
+	}
+	if got := LastForwardedHop([]string{"https", "http,"}); got != "" {
+		t.Fatalf("expected malformed trailing comma to fail closed (''), got %q", got)
+	}
+
+	if !IsTrustedProxyPeerAddr("127.0.0.1:54321", nil) ||
+		!IsTrustedProxyPeerAddr("[::1]:54321", nil) ||
+		!IsTrustedProxyPeerAddr("10.24.0.5:41234", nil) ||
+		!IsTrustedProxyPeerAddr("[fd00::1234]:8080", nil) {
+		t.Fatal("expected loopback and private proxy peers trusted by default")
+	}
+	if IsTrustedProxyPeerAddr("203.0.113.9:54321", nil) {
+		t.Fatal("expected public IP peer NOT trusted by default")
+	}
+	custom, err := ParseCIDRList("203.0.113.0/24, 198.51.100.7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsTrustedProxyPeerAddr("203.0.113.9:54321", custom) || !IsTrustedProxyPeerAddr("198.51.100.7:1234", custom) {
+		t.Fatal("expected custom CIDR/IP to match")
+	}
+	if IsTrustedProxyPeerAddr("10.0.0.1:54321", custom) {
+		t.Fatal("expected non-listed private IP rejected when custom CIDRs are set")
+	}
+
+	okBytes, err := ReadBoundedBody(strings.NewReader("hello"), 5)
+	if err != nil || string(okBytes) != "hello" {
+		t.Fatalf("expected exact 5-byte read to succeed, got %q err=%v", okBytes, err)
+	}
+	if _, err := ReadBoundedBody(strings.NewReader("hello!"), 5); err == nil {
+		t.Fatal("expected 6-byte body over 5-byte limit to return error")
 	}
 }

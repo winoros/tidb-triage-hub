@@ -2,6 +2,7 @@ package httputil
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"net/url"
@@ -228,4 +229,90 @@ func JoinEndpoint(base *url.URL, subpath string, query url.Values) string {
 		cp.RawQuery = query.Encode()
 	}
 	return cp.String()
+}
+
+// LastForwardedHop returns the rightmost comma-separated hop from the LAST header line in vals.
+// If vals is empty or the rightmost element of the last header line is blank, it fails closed ("").
+func LastForwardedHop(vals []string) string {
+	if len(vals) == 0 {
+		return ""
+	}
+	lastLine := vals[len(vals)-1]
+	parts := strings.Split(lastLine, ",")
+	return strings.TrimSpace(parts[len(parts)-1])
+}
+
+// ParseCIDRList parses a comma-separated list of IPv4/IPv6 CIDR prefixes or single IP literals.
+func ParseCIDRList(csv string) ([] netip.Prefix, error) {
+	csv = strings.TrimSpace(csv)
+	if csv == "" {
+		return nil, nil
+	}
+	var out []netip.Prefix
+	for _, raw := range strings.Split(csv, ",") {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		if strings.Contains(s, "/") {
+			p, err := netip.ParsePrefix(s)
+			if err != nil {
+				return nil, fmt.Errorf("invalid trusted proxy CIDR %q: %w", s, err)
+			}
+			out = append(out, p.Masked())
+		} else {
+			a, err := netip.ParseAddr(s)
+			if err != nil {
+				return nil, fmt.Errorf("invalid trusted proxy IP %q: %w", s, err)
+			}
+			a = a.Unmap()
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+		}
+	}
+	return out, nil
+}
+
+// IsTrustedProxyPeerAddr reports whether remoteAddr belongs to `allowedPrefixes` (when non-empty),
+// or to loopback / RFC1918 / RFC4193 private address space by default when `allowedPrefixes` is empty.
+func IsTrustedProxyPeerAddr(remoteAddr string, allowedPrefixes []netip.Prefix) bool {
+	s := strings.TrimSpace(remoteAddr)
+	if s == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		s = h
+	}
+	if idx := strings.IndexByte(s, '%'); idx >= 0 {
+		s = s[:idx]
+	}
+	addr, err := netip.ParseAddr(strings.Trim(s, "[]"))
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	if len(allowedPrefixes) > 0 {
+		for _, p := range allowedPrefixes {
+			if p.Contains(addr) {
+				return true
+			}
+		}
+		return false
+	}
+	return addr.IsLoopback() || addr.IsPrivate()
+}
+
+// ReadBoundedBody reads all bytes from r up to maxBytes, returning an explicit error if r exceeds maxBytes
+// instead of silently truncating the payload.
+func ReadBoundedBody(r io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("invalid maxBytes %d", maxBytes)
+	}
+	b, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > maxBytes {
+		return nil, fmt.Errorf("response body exceeds maximum allowed size (%d bytes)", maxBytes)
+	}
+	return b, nil
 }

@@ -96,12 +96,13 @@ func SafeRedirectPolicy(req *http.Request, via []*http.Request) error {
 		if (origScheme == "https" || prevScheme == "https") && reqScheme != "https" {
 			return &RedirectBlockedError{msg: fmt.Sprintf("refusing insecure HTTPS -> %s redirect to %s", req.URL.Scheme, req.URL.Redacted())}
 		}
+		origHost, ok1 := httputil.ExtractCanonicalHostname(orig.URL.Host)
+		reqHost, ok2 := httputil.ExtractCanonicalHostname(req.URL.Host)
+		origDefaultHTTP := orig.URL.Port() == "" || orig.URL.Port() == "80"
+		reqDefaultHTTPS := req.URL.Port() == "" || req.URL.Port() == "443"
 		sameAuthUpgrade := origScheme == "http" && reqScheme == "https" &&
-			httputil.NormalizeOriginHost(orig.URL.Host, "http") != "" &&
-			httputil.NormalizeOriginHost(orig.URL.Host, "http") == httputil.NormalizeOriginHost(req.URL.Host, "https")
+			ok1 && ok2 && origHost == reqHost && origDefaultHTTP && reqDefaultHTTPS
 		if !httputil.SameOrigin(orig.URL, req.URL) && !sameAuthUpgrade {
-			origHost, ok1 := httputil.ExtractCanonicalHostname(orig.URL.Host)
-			reqHost, ok2 := httputil.ExtractCanonicalHostname(req.URL.Host)
 			if !ok1 || !ok2 || origHost != reqHost {
 				return &RedirectBlockedError{msg: fmt.Sprintf("refusing cross-host redirect from %s to %s", orig.URL.Host, req.URL.Host)}
 			}
@@ -208,11 +209,15 @@ func (r *HTTPRunner) Query(ctx context.Context, gql string, vars map[string]stri
 				return nil, lastErr
 			}
 		} else {
-			limit := int64(32 << 20)
-			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				limit = 64 << 10
+			var (
+				raw     []byte
+				readErr error
+			)
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				raw, readErr = httputil.ReadBoundedBody(resp.Body, 32<<20)
+			} else {
+				raw, readErr = io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			}
-			raw, readErr := io.ReadAll(io.LimitReader(resp.Body, limit))
 			_ = resp.Body.Close()
 			if readErr != nil {
 				lastErr = fmt.Errorf("read graphql response: %w", readErr)

@@ -470,17 +470,25 @@ func SyncPRRefsWithDetails(
 			if d.UpdatedAt != "" {
 				syncedPRs[j].UpdatedAt = d.UpdatedAt
 			}
-			if d.MergedAt != "" {
-				syncedPRs[j].MergedAt = d.MergedAt
+			if syncedPRs[j].State == "MERGED" {
+				if d.MergedAt != "" {
+					syncedPRs[j].MergedAt = d.MergedAt
+				}
+			} else {
+				syncedPRs[j].MergedAt = ""
+			}
+			if syncedPRs[j].State == "CLOSED" {
+				syncedPRs[j].AckAt = ""
 			}
 			if d.Title != "" {
 				syncedPRs[j].Title = d.Title
 			}
 			syncedPRs[j].IsCherryPick = d.IsCherryPick
-		} else if syncedPRs[j].MergedAt == "" && d.MergedAt != "" {
+		} else if syncedPRs[j].State == "MERGED" && syncedPRs[j].MergedAt == "" && d.MergedAt != "" {
 			syncedPRs[j].MergedAt = d.MergedAt
 		}
 	}
+	issuesync.SortLinkedPRRefs(syncedPRs)
 	var dets []model.PendingPRDetail
 	for _, pr := range FilterRelevantKernelPRs(syncedPRs) {
 		if d, ok := detailMap[model.PRKey(pr.Repo, pr.Num)]; ok {
