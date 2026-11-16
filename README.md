@@ -9,7 +9,7 @@ Standalone pure-Go workbench (`Go` + `modernc.org/sqlite` + zero-dependency bili
 - `internal/issuesync/` — Pure-Go Dual-Stream sync engine (`>800`-hit time-window bisection, 7-repo PR reverse index, Tier-1/Tier-2 optimizer-affinity discovery & label-delta re-admission)
 - `internal/triage/` — Embedded triage rubric + few-shot examples, PR non-test file enrichment, clue extraction, heuristic pre-suggestions, 6-trigger dynamic re-triage evaluator & bilingual note validator
 - `internal/prstatus/` — Batched GitHub GraphQL fetcher + 9-stage `pingcap/tidb` PR blocker classifier
-- `internal/store/` — Incremental SQLite store (`issues`, `issue_overrides`, 3-tier `issue_pr_links`, `issue_triage_state`, `archived_issues`, `pending_candidates`, `excluded_issues`, `pull_requests`)
+- `internal/store/` — Incremental SQLite store (`issues`, `issue_overrides`, orthogonal `issue_notes`, 3-tier `issue_pr_links`, `issue_triage_state`, `archived_issues`, `pending_candidates`, `excluded_issues`, `pull_requests`)
 - `internal/syncer/` — Pure-Go issue + PR sync orchestrator (zero Python or staging files)
 - `internal/server/` — HTTP routes & single-point `resolveSession` RBAC hook
 - `web/` — Self-contained bilingual (`zh-CN` / `en`) frontend (`index.html`, `i18n/`) with 3-tab Inbox (`Pending | Re-triage | Excluded`)
@@ -64,7 +64,9 @@ SQLite runs in `WAL` mode (`busy_timeout=15000`), so CLI commands safely run con
 ```bash
 # Machine A (Web Dashboard + SQLite + GitHub Sync):
 # Anonymous visitors see Read-Only mode; maintainers click "Unlock RW" in browser; Machine B uses Bearer token.
-# Add --trust-proxy (or TRIAGE_HUB_TRUST_PROXY=1) when serving behind a TLS/reverse proxy (reads rightmost X-Forwarded-* hop).
+# Add --trust-proxy (or TRIAGE_HUB_TRUST_PROXY=1) when serving behind a TLS/reverse proxy:
+# reads the rightmost X-Forwarded-* hop ONLY from loopback / RFC1918 / RFC4193 private peer IPs by default
+# (override peer allowlist via --trusted-proxy-cidrs / TRIAGE_HUB_TRUSTED_PROXY_CIDRS).
 GITHUB_TOKEN=ghp_xxx \
 TRIAGE_HUB_TOKEN=your-strong-secret \
 ./bin/triage-hub serve \

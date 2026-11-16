@@ -14,6 +14,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
@@ -37,11 +38,12 @@ import (
 const sessionCookieName = "triage_hub_session"
 
 type Options struct {
-	WebDir     string
-	ReadOnly   bool
-	AuthToken  string
-	DBDisplay  string
-	TrustProxy bool
+	WebDir            string
+	ReadOnly          bool
+	AuthToken         string
+	DBDisplay         string
+	TrustProxy        bool
+	TrustedProxyCIDRs string
 }
 
 type cachedIndexAssets struct {
@@ -53,28 +55,39 @@ type cachedIndexAssets struct {
 }
 
 type Server struct {
-	store         *store.Store
-	syncer        *syncer.Syncer
-	opts          Options
-	hasAuthToken  bool
-	authTokenHash [32]byte
-	sessionDigest string
-	indexCacheMu  sync.RWMutex
-	indexCache    *cachedIndexAssets
-	mux           *http.ServeMux
+	store            *store.Store
+	syncer           *syncer.Syncer
+	opts             Options
+	trustedProxyNets []netip.Prefix
+	hasAuthToken     bool
+	authTokenHash    [32]byte
+	sessionDigest    string
+	indexCacheMu     sync.RWMutex
+	indexCache       *cachedIndexAssets
+	mux              *http.ServeMux
 }
 
 func New(st *store.Store, sy *syncer.Syncer, opts Options) *Server {
 	if sy == nil && st != nil {
 		sy = syncer.New(st)
 	}
+	var proxyNets []netip.Prefix
+	if strings.TrimSpace(opts.TrustedProxyCIDRs) != "" {
+		parsed, err := httputil.ParseCIDRList(opts.TrustedProxyCIDRs)
+		if err != nil {
+			log.Printf("[warn] invalid TrustedProxyCIDRs %q: %v", opts.TrustedProxyCIDRs, err)
+		} else {
+			proxyNets = parsed
+		}
+	}
 	tok := strings.TrimSpace(opts.AuthToken)
 	s := &Server{
-		store:        st,
-		syncer:       sy,
-		opts:         opts,
-		hasAuthToken: tok != "",
-		mux:          http.NewServeMux(),
+		store:            st,
+		syncer:           sy,
+		opts:             opts,
+		trustedProxyNets: proxyNets,
+		hasAuthToken:     tok != "",
+		mux:              http.NewServeMux(),
 	}
 	if tok != "" {
 		s.authTokenHash = sha256.Sum256([]byte(tok))
@@ -127,20 +140,6 @@ func sessionCookieDigest(secret string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func lastHeaderHop(val string) string {
-	for {
-		idx := strings.LastIndexByte(val, ',')
-		if idx < 0 {
-			return strings.TrimSpace(val)
-		}
-		tail := strings.TrimSpace(val[idx+1:])
-		if tail != "" {
-			return tail
-		}
-		val = val[:idx]
-	}
-}
-
 func (s *Server) verifySecretToken(candidate string) bool {
 	if !s.hasAuthToken {
 		return true
@@ -149,8 +148,11 @@ func (s *Server) verifySecretToken(candidate string) bool {
 	return subtle.ConstantTimeCompare(got[:], s.authTokenHash[:]) == 1
 }
 
-func (s *Server) isTrustedProxyPeer(_ *http.Request) bool {
-	return s.opts.TrustProxy
+func (s *Server) isTrustedProxyPeer(r *http.Request) bool {
+	if !s.opts.TrustProxy || r == nil {
+		return false
+	}
+	return httputil.IsTrustedProxyPeerAddr(r.RemoteAddr, s.trustedProxyNets)
 }
 
 func (s *Server) effectiveRequestScheme(r *http.Request) string {
@@ -158,7 +160,7 @@ func (s *Server) effectiveRequestScheme(r *http.Request) string {
 		return "https"
 	}
 	if s.isTrustedProxyPeer(r) {
-		xfp := lastHeaderHop(r.Header.Get("X-Forwarded-Proto"))
+		xfp := httputil.LastForwardedHop(r.Header.Values("X-Forwarded-Proto"))
 		if strings.EqualFold(xfp, "https") {
 			return "https"
 		}
@@ -516,7 +518,7 @@ func (s *Server) handleBootstrapJS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
+	setAuthVaryNoStoreHeaders(w)
 	_, _ = w.Write([]byte(bootJS))
 }
 
@@ -565,6 +567,9 @@ func (s *Server) handleSessionLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.guardSameSiteRead(w, r) {
+		return
+	}
 	if s.hasInvalidAuthHeader(r) {
 		writeErr(w, http.StatusUnauthorized, fmt.Errorf("unauthorized: invalid bearer token"))
 		return
@@ -752,13 +757,16 @@ func (s *Server) handleGetBackupDB(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/vnd.sqlite3")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="tidb_triage_%s.db"`, time.Now().UTC().Format("20060102T150405Z")))
-	w.Header().Set("Cache-Control", "no-store")
+	setAuthVaryNoStoreHeaders(w)
 	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, f)
 }
 
 func (s *Server) handleGetDatasetJSON(w http.ResponseWriter, r *http.Request) {
+	if !s.guardSameSiteRead(w, r) {
+		return
+	}
 	if s.hasInvalidAuthHeader(r) {
 		writeErr(w, http.StatusUnauthorized, fmt.Errorf("unauthorized: invalid bearer token"))
 		return
@@ -776,7 +784,7 @@ func (s *Server) handleGetDatasetJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
+	setAuthVaryNoStoreHeaders(w)
 	_, _ = w.Write(b)
 }
 
@@ -830,7 +838,7 @@ func (s *Server) isSameOriginHeader(r *http.Request, origin string) bool {
 		return true
 	}
 	if s.isTrustedProxyPeer(r) {
-		xfh := httputil.NormalizeOriginHost(lastHeaderHop(r.Header.Get("X-Forwarded-Host")), reqScheme)
+		xfh := httputil.NormalizeOriginHost(httputil.LastForwardedHop(r.Header.Values("X-Forwarded-Host")), reqScheme)
 		if xfh != "" && originHost == xfh {
 			return true
 		}
@@ -894,7 +902,9 @@ func (s *Server) guardMutation(w http.ResponseWriter, r *http.Request) bool {
 			writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: application/json Content-Type required"))
 			return false
 		}
-	} else if r.ContentLength < 0 && r.Body != nil {
+		return true
+	}
+	if r.ContentLength < 0 && r.Body != nil {
 		var probe [1]byte
 		n, err := r.Body.Read(probe[:])
 		if n > 0 || (err != nil && !errors.Is(err, io.EOF)) {
@@ -902,6 +912,13 @@ func (s *Server) guardMutation(w http.ResponseWriter, r *http.Request) bool {
 			return false
 		}
 		r.Body = http.NoBody
+	}
+	// Empty-body mutations without `Content-Type: application/json` must carry the custom `X-Triage-CSRF: 1`
+	// header (sent by both Web UI `apiFetch` and remote CLI `doJSON`) so cross-site empty `<form>` / `sendBeacon`
+	// simple requests can never bypass CSRF protection even if a proxy strips `Origin` and `Sec-Fetch-Site`.
+	if strings.TrimSpace(r.Header.Get("X-Triage-CSRF")) != "1" {
+		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: X-Triage-CSRF header or application/json Content-Type required"))
+		return false
 	}
 	return true
 }
@@ -958,6 +975,10 @@ func (s *Server) handlePatchIssueTriage(w http.ResponseWriter, r *http.Request) 
 	var prSyncWarn string
 	if preTargets, tErr := s.store.ListIssueMissingPRTargets(num); tErr == nil && len(preTargets) > 0 {
 		prSyncWarn, _ = s.syncTargetsBestEffort(r.Context(), preTargets)
+		if cErr := r.Context().Err(); cErr != nil {
+			writeContextAbortErr(w, cErr)
+			return
+		}
 	}
 	missingTargets, err := s.store.ApplyIssueOverride(num, req)
 	if err != nil {
@@ -1014,15 +1035,34 @@ func (s *Server) handleDeleteIssueTriage(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid issue number"))
 		return
 	}
+	var body struct {
+		IfUnmodifiedSince string `json:"if_unmodified_since"`
+	}
+	if err := decodeOptionalJSON(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	ifUnmod := strings.TrimSpace(body.IfUnmodifiedSince)
+	if ifUnmod == "" {
+		ifUnmod = strings.TrimSpace(r.URL.Query().Get("if_unmodified_since"))
+	}
+
 	var prSyncWarn string
 	if preTargets, tErr := s.store.ListIssueMissingPRTargets(num); tErr == nil && len(preTargets) > 0 {
 		prSyncWarn, _ = s.syncTargetsBestEffort(r.Context(), preTargets)
+		if cErr := r.Context().Err(); cErr != nil {
+			writeContextAbortErr(w, cErr)
+			return
+		}
 	}
-	missingTargets, err := s.store.ResetIssueOverride(num)
+	missingTargets, err := s.store.ResetIssueOverrideWithGuard(num, ifUnmod)
 	if err != nil {
-		if errors.Is(err, store.ErrIssueNotFound) {
+		switch {
+		case errors.Is(err, store.ErrOverrideConflict):
+			writeErr(w, http.StatusConflict, err)
+		case errors.Is(err, store.ErrIssueNotFound):
 			writeErr(w, http.StatusNotFound, err)
-		} else {
+		default:
 			writeErr(w, http.StatusBadRequest, err)
 		}
 		return
@@ -1071,10 +1111,21 @@ func (s *Server) handleAckIssueRetriage(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid issue number"))
 		return
 	}
-	if _, err := s.store.AcknowledgeBatchRetriage([]int{num}, sess.Viewer.Login); err != nil {
-		if errors.Is(err, store.ErrIssueNotFound) {
+	var body struct {
+		IfUnmodifiedSince string `json:"if_unmodified_since"`
+	}
+	if err := decodeOptionalJSON(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	rec, err := s.store.AcknowledgeIssueRetriageWithGuard(num, sess.Viewer.Login, body.IfUnmodifiedSince)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrOverrideConflict):
+			writeErr(w, http.StatusConflict, err)
+		case errors.Is(err, store.ErrIssueNotFound):
 			writeErr(w, http.StatusNotFound, err)
-		} else {
+		default:
 			writeErr(w, http.StatusBadRequest, err)
 		}
 		return
@@ -1083,13 +1134,6 @@ func (s *Server) handleAckIssueRetriage(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
-	}
-	var rec model.IssueRecord
-	for _, r0 := range ds.Records {
-		if r0.Number == num {
-			rec = r0
-			break
-		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"record":  rec,
@@ -1106,7 +1150,9 @@ func (s *Server) handleAckBatchRetriage(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req struct {
-		Numbers model.FlexIntList `json:"numbers"`
+		Numbers        model.FlexIntList `json:"numbers"`
+		BaseExportedAt string            `json:"base_exported_at"`
+		Watermarks     map[string]string `json:"watermarks"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -1116,11 +1162,14 @@ func (s *Server) handleAckBatchRetriage(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("numbers list cannot be empty"))
 		return
 	}
-	acked, err := s.store.AcknowledgeBatchRetriage([]int(req.Numbers), sess.Viewer.Login)
+	acked, err := s.store.AcknowledgeBatchRetriageWithGuard([]int(req.Numbers), sess.Viewer.Login, req.BaseExportedAt, req.Watermarks)
 	if err != nil {
-		if errors.Is(err, store.ErrIssueNotFound) {
+		switch {
+		case errors.Is(err, store.ErrOverrideConflict):
+			writeErr(w, http.StatusConflict, err)
+		case errors.Is(err, store.ErrIssueNotFound):
 			writeErr(w, http.StatusNotFound, err)
-		} else {
+		default:
 			writeErr(w, http.StatusBadRequest, err)
 		}
 		return
@@ -1149,16 +1198,20 @@ func (s *Server) handleExcludeIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Reason string `json:"reason"`
+		Reason            string `json:"reason"`
+		IfUnmodifiedSince string `json:"if_unmodified_since"`
 	}
 	if err := decodeOptionalJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.store.ExcludeExistingIssue(num, req.Reason, false); err != nil {
-		if errors.Is(err, store.ErrIssueNotFound) {
+	if err := s.store.ExcludeExistingIssueWithGuard(num, req.Reason, false, req.IfUnmodifiedSince); err != nil {
+		switch {
+		case errors.Is(err, store.ErrOverrideConflict):
+			writeErr(w, http.StatusConflict, err)
+		case errors.Is(err, store.ErrIssueNotFound):
 			writeErr(w, http.StatusNotFound, err)
-		} else {
+		default:
 			writeErr(w, http.StatusBadRequest, err)
 		}
 		return
@@ -1253,6 +1306,10 @@ func (s *Server) handleResolvePending(w http.ResponseWriter, r *http.Request) {
 	if strings.EqualFold(strings.TrimSpace(req.Action), "accept") {
 		if preTargets, tErr := s.store.ListPendingMissingPRTargets(num); tErr == nil && len(preTargets) > 0 {
 			prSyncWarn, _ = s.syncTargetsBestEffort(r.Context(), preTargets)
+			if cErr := r.Context().Err(); cErr != nil {
+				writeContextAbortErr(w, cErr)
+				return
+			}
 		}
 	}
 	missingTargets, err := s.store.ResolvePendingCandidateWithTargets(num, req)
@@ -1445,8 +1502,22 @@ func (s *Server) handleSyncIssues(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func setAuthVaryNoStoreHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Vary", "Cookie, Authorization")
+}
+
+func writeContextAbortErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		writeErr(w, http.StatusGatewayTimeout, err)
+		return
+	}
+	writeErr(w, http.StatusRequestTimeout, err)
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	setAuthVaryNoStoreHeaders(w)
 	w.WriteHeader(code)
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)

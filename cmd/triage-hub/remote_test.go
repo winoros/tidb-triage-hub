@@ -265,13 +265,16 @@ func TestMachineBToMachineASplitDeploymentEndToEnd(t *testing.T) {
 		},
 	})
 
-	// 7a. Remote --dry-run previews 2 skipped_conflicts cleanly
+	// 7a. Remote --dry-run previews 2 skipped_conflicts cleanly and reports post-conflict planned counts (#14(1))
 	var dryOut, dryErr bytes.Buffer
 	if err := executeTriage([]string{"--stdin", "--dry-run"}, bytes.NewReader(decisionsJSON), &dryOut, &dryErr); err != nil {
 		t.Fatalf("remote triage --dry-run failed: %v", err)
 	}
 	if !strings.Contains(dryOut.String(), `"skipped_conflicts"`) || !strings.Contains(dryErr.String(), "[conflict-skipped]") {
 		t.Fatalf("expected conflict preview in dry-run, stdout=%s stderr=%s", dryOut.String(), dryErr.String())
+	}
+	if !strings.Contains(dryOut.String(), `"new_issues_count": 1`) || !strings.Contains(dryOut.String(), `"overrides_count": 0`) {
+		t.Fatalf("expected dry-run counts to reflect post-conflict planned decisions (new=1, overrides=0), got: %s", dryOut.String())
 	}
 
 	// 7b. Live remote `triage` commits #72102 + syncs manual PR #74500, preserves Web UI #72001 & #72101, and auto-backups to backupDBOnB!

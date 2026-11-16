@@ -1730,7 +1730,9 @@
   var activePrStage = "ALL";
   var editingIssueNum = null;
   var editingTriagedAt = "";
+  var editingWasWritable = false;
   var editDrawerGen = 0;
+  var sessionEpoch = 0;
   var expandedCiKeys = {};
   var overviewCollapsed = false;
   var copyFeedbackTimer = null;
@@ -2864,10 +2866,25 @@
         delete r.retriage_reasons;
         delete r.retriage_details;
         delete r.triaged_at;
+        delete r.manual_override;
+        delete r.force_keep;
+        if (Array.isArray(r.prs)) {
+          r.prs.forEach(function(p) { delete p.ack_at; });
+        }
       });
     }
-    editingTriagedAt = "";
+    if (!editingWasWritable) {
+      editingTriagedAt = "";
+    }
     rebuildDerivedIndexes();
+    var dropEpoch = sessionEpoch;
+    fetch(appUrl("./api/dataset.json"), { cache: "no-store" })
+      .then(function(res) { return res.ok ? res.json() : null; })
+      .then(function(pubDs) {
+        if (!pubDs || dropEpoch !== sessionEpoch || CAN_TRIAGE) return;
+        setDatasetAndRender(pubDs, [], false);
+      })
+      .catch(function() {});
   }
 
   function switchView(nextView) {
@@ -3256,13 +3273,30 @@
     }
   }
 
+  function populateEditDrawerFormFromRecord(rec) {
+    var enums = window.REPORT_DATASET.enums;
+    populateSelectOptions(document.getElementById("edCat"), enums.categories, "report.enums.cat.");
+    populateSelectOptions(document.getElementById("edSev"), enums.severities, "report.enums.severity.");
+    populateSelectOptions(document.getElementById("edSub"), enums.subsystems, "report.enums.subsystem.");
+
+    document.getElementById("edCat").value = rec.cat;
+    document.getElementById("edSev").value = rec.severity;
+    document.getElementById("edSub").value = rec.subsystem;
+    document.getElementById("edBorderline").checked = Boolean(rec.is_borderline_kept);
+    document.getElementById("edForceKeep").checked = Boolean(rec.force_keep);
+    document.getElementById("edNoteZh").value = (rec.note && rec.note["zh-CN"]) || "";
+    document.getElementById("edNoteEn").value = (rec.note && rec.note.en) || "";
+  }
+
   function syncOpenEditDrawerSessionUI(resetExcludeDraft) {
     if (!editingIssueNum || document.getElementById("editDrawer").hidden) return;
     var rec = DATA.find(function(r) { return r.number === editingIssueNum; });
     if (!rec) return;
-    var canEdit = CAN_TRIAGE && DATA_HAS_WORKBENCH;
-    if (canEdit && !editingTriagedAt && rec.triaged_at) {
-      editingTriagedAt = rec.triaged_at;
+    var canEdit = Boolean(CAN_TRIAGE && DATA_HAS_WORKBENCH);
+    if (canEdit && !editingWasWritable) {
+      populateEditDrawerFormFromRecord(rec);
+      editingTriagedAt = rec.triaged_at || "";
+      editingWasWritable = true;
     }
     document.getElementById("editDrawerTitle").textContent = canEdit
       ? t("report.rw.drawer.title", { num: editingIssueNum })
@@ -3314,12 +3348,15 @@
     renderAll();
   }
 
-  function openEditDrawer(num) {
+  function openEditDrawer(num, preserveGen) {
     var rec = DATA.find(function(r) { return r.number === num; });
     if (!rec) return;
-    editingIssueNum = num;
-    editingTriagedAt = rec.triaged_at || "";
-    editDrawerGen += 1;
+    if (!preserveGen) {
+      editingIssueNum = num;
+      editingWasWritable = Boolean(CAN_TRIAGE && DATA_HAS_WORKBENCH);
+      editingTriagedAt = editingWasWritable ? (rec.triaged_at || "") : "";
+      editDrawerGen += 1;
+    }
 
     var issUrl = "https://github.com/pingcap/tidb/issues/" + rec.number;
     document.getElementById("drawerGhLink").setAttribute("href", issUrl);
@@ -3346,27 +3383,17 @@
       (lblChips ? '<div><div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:4px;">' + esc(t("report.rw.drawer.metaLabels")) + '</div><div class="tag-row" style="margin-top:0;">' + lblChips + '</div></div>' : '') +
       prsDisp;
 
-    var enums = window.REPORT_DATASET.enums;
-    populateSelectOptions(document.getElementById("edCat"), enums.categories, "report.enums.cat.");
-    populateSelectOptions(document.getElementById("edSev"), enums.severities, "report.enums.severity.");
-    populateSelectOptions(document.getElementById("edSub"), enums.subsystems, "report.enums.subsystem.");
-
-    document.getElementById("edCat").value = rec.cat;
-    document.getElementById("edSev").value = rec.severity;
-    document.getElementById("edSub").value = rec.subsystem;
-    document.getElementById("edBorderline").checked = Boolean(rec.is_borderline_kept);
-    document.getElementById("edForceKeep").checked = Boolean(rec.force_keep);
-    document.getElementById("edNoteZh").value = (rec.note && rec.note["zh-CN"]) || "";
-    document.getElementById("edNoteEn").value = (rec.note && rec.note.en) || "";
+    populateEditDrawerFormFromRecord(rec);
 
     document.getElementById("editDrawer").hidden = false;
-    syncOpenEditDrawerSessionUI(true);
+    syncOpenEditDrawerSessionUI(!preserveGen);
     syncBodyDrawerLock();
   }
 
   function closeEditDrawer() {
     editingIssueNum = null;
     editingTriagedAt = "";
+    editingWasWritable = false;
     editDrawerGen += 1;
     document.getElementById("editDrawer").hidden = true;
     syncBodyDrawerLock();
@@ -3403,6 +3430,7 @@
 
   function apiFetch(subpath, opts) {
     var reqOpts = opts ? Object.assign({}, opts) : {};
+    if (!reqOpts.cache) reqOpts.cache = "no-store";
     var method = String(reqOpts.method || "GET").toUpperCase();
     if (method !== "GET" && method !== "HEAD") {
       reqOpts.headers = Object.assign({ "X-Triage-CSRF": "1" }, reqOpts.headers || {});
@@ -3418,6 +3446,7 @@
           var isAuthFailure = res.status === 401 ||
             (res.status === 403 && (!IS_AUTHENTICATED || errMsg.indexOf("permission required") !== -1));
           if (isAuthFailure && AUTH_REQUIRED && String(subpath || "").indexOf("api/session/") === -1) {
+            sessionEpoch += 1;
             stripWorkbenchFromDataset();
             applySessionState({
               viewer: { login: "viewer", role: "viewer" },
@@ -3455,12 +3484,14 @@
     };
     var btn = document.getElementById("saveOverrideBtn");
     if (btn.disabled) return;
+    var reqEpoch = sessionEpoch;
     btn.disabled = true;
     apiFetch("./api/issues/" + num + "/triage", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     }).then(function(resp) {
+      if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
       if (resp.dataset) {
         setDatasetAndRender(resp.dataset, undefined, true);
       } else {
@@ -3478,6 +3509,7 @@
         showToast(t("report.rw.toastSaved", { num: num }), "success");
       }
     }).catch(function(err) {
+      if (reqEpoch !== sessionEpoch) return;
       showToast(err.message, "error");
     }).finally(function() {
       btn.disabled = false;
@@ -3491,10 +3523,16 @@
       if (!CAN_TRIAGE || !DATA_HAS_WORKBENCH || !editingIssueNum) return;
       var num = editingIssueNum;
       var myGen = editDrawerGen;
+      var reqEpoch = sessionEpoch;
       var btn = this;
+      var delPath = "./api/issues/" + num + "/triage";
+      if (editingTriagedAt) {
+        delPath += "?if_unmodified_since=" + encodeURIComponent(editingTriagedAt);
+      }
       btn.disabled = true;
-      apiFetch("./api/issues/" + num + "/triage", { method: "DELETE" })
+      apiFetch(delPath, { method: "DELETE" })
         .then(function(resp) {
+          if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
           if (resp.dataset) {
             setDatasetAndRender(resp.dataset, undefined, true);
           } else {
@@ -3512,6 +3550,7 @@
             showToast(t("report.rw.toastReset", { num: num }), "success");
           }
         }).catch(function(err) {
+          if (reqEpoch !== sessionEpoch) return;
           showToast(err.message, "error");
         }).finally(function() {
           btn.disabled = false;
@@ -3523,20 +3562,22 @@
       if (!CAN_TRIAGE || !DATA_HAS_WORKBENCH || !ackBtn || !editingIssueNum) return;
       var num = editingIssueNum;
       var myGen = editDrawerGen;
+      var reqEpoch = sessionEpoch;
       ackBtn.disabled = true;
       apiFetch("./api/issues/" + num + "/retriage/ack", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{}"
+        body: JSON.stringify({ if_unmodified_since: editingTriagedAt })
       })
         .then(function(resp) {
+          if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
           setDatasetAndRender(resp.dataset, undefined, true);
           if (editDrawerGen === myGen && editingIssueNum === num) {
             closeEditDrawer();
           }
           showToast(t("report.rw.toastRetriageAcked", { num: num }), "success");
         }).catch(function(err) {
-          showToast(err.message, "error");
+          if (reqEpoch === sessionEpoch) showToast(err.message, "error");
           ackBtn.disabled = false;
         });
     });
@@ -3545,14 +3586,16 @@
       if (!CAN_TRIAGE || !DATA_HAS_WORKBENCH || !editingIssueNum) return;
       var num = editingIssueNum;
       var myGen = editDrawerGen;
+      var reqEpoch = sessionEpoch;
       var reason = document.getElementById("edExcludeReason").value.trim();
       var btn = this;
       btn.disabled = true;
       apiFetch("./api/issues/" + num + "/exclude", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason: reason })
+        body: JSON.stringify({ reason: reason, if_unmodified_since: editingTriagedAt })
       }).then(function(resp) {
+        if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
         EXCLUDED_ITEMS = null;
         setDatasetAndRender(resp.dataset, resp.pending_candidates, true);
         if (editDrawerGen === myGen && editingIssueNum === num) {
@@ -3560,7 +3603,7 @@
         }
         showToast(t("report.rw.toastIssueExcluded", { num: num }), "success");
       }).catch(function(err) {
-        showToast(err.message, "error");
+        if (reqEpoch === sessionEpoch) showToast(err.message, "error");
       }).finally(function() {
         btn.disabled = false;
       });
@@ -3620,20 +3663,25 @@
     }
 
     function ensureExcludedLoaded() {
-      if (Array.isArray(EXCLUDED_ITEMS) || excludedLoading) return;
+      if (!CAN_TRIAGE || Array.isArray(EXCLUDED_ITEMS) || excludedLoading) return;
+      var reqEpoch = sessionEpoch;
       excludedLoading = true;
       excludedLoadError = "";
       apiFetch("./api/excluded").then(function(resp) {
+        if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
         EXCLUDED_ITEMS = resp.excluded_issues || [];
         SCOPE_COUNTS.excluded = EXCLUDED_ITEMS.length;
       }).catch(function(err) {
+        if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
         excludedLoadError = (err && err.message) || "Failed to load excluded issues";
         showToast(excludedLoadError, "error");
         EXCLUDED_ITEMS = null;
       }).finally(function() {
-        excludedLoading = false;
+        if (reqEpoch === sessionEpoch) {
+          excludedLoading = false;
+        }
         updateInboxTabsHeader();
-        if (activeInboxTab === "excluded" && !document.getElementById("inboxDrawer").hidden) {
+        if (CAN_TRIAGE && activeInboxTab === "excluded" && !document.getElementById("inboxDrawer").hidden) {
           renderExcludedListInto(document.getElementById("inboxExList"));
         }
       });
@@ -3861,22 +3909,28 @@
     });
 
     document.getElementById("inboxBody").addEventListener("click", function(e) {
+      var reqEpoch = sessionEpoch;
       if (e.target.closest("#inboxKeepAllBtn")) {
         var keepAllBtn = e.target.closest("#inboxKeepAllBtn");
         var nums = RETRIAGE_LIST.map(function(r) { return r.number; });
         if (!nums.length) return;
+        var wms = {};
+        RETRIAGE_LIST.forEach(function(r) {
+          if (r.triaged_at) wms[String(r.number)] = r.triaged_at;
+        });
         keepAllBtn.disabled = true;
         apiFetch("./api/retriage/ack-batch", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ numbers: nums })
+          body: JSON.stringify({ numbers: nums, watermarks: wms })
         }).then(function(resp) {
-          setDatasetAndRender(resp.dataset);
+          if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
+          setDatasetAndRender(resp.dataset, undefined, true);
           renderInboxDrawer();
           var ackCnt = Array.isArray(resp.acknowledged) ? resp.acknowledged.length : (resp.acknowledged || nums.length);
           showToast(t("report.rw.toastRetriageBatchAcked", { count: ackCnt }), "success");
         }).catch(function(err) {
-          showToast(err.message, "error");
+          if (reqEpoch === sessionEpoch) showToast(err.message, "error");
           keepAllBtn.disabled = false;
         });
         return;
@@ -3892,18 +3946,21 @@
         }
         if (e.target.closest(".r-keep-btn")) {
           var rKeepBtn = e.target.closest(".r-keep-btn");
+          var rRec = DATA.find(function(x) { return x.number === rNum; });
+          var rWatermark = (rRec && rRec.triaged_at) ? rRec.triaged_at : "";
           rKeepBtn.disabled = true;
           apiFetch("./api/issues/" + rNum + "/retriage/ack", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: "{}"
+            body: JSON.stringify({ if_unmodified_since: rWatermark })
           })
             .then(function(resp) {
-              setDatasetAndRender(resp.dataset);
+              if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
+              setDatasetAndRender(resp.dataset, undefined, true);
               renderInboxDrawer();
               showToast(t("report.rw.toastRetriageAcked", { num: rNum }), "success");
             }).catch(function(err) {
-              showToast(err.message, "error");
+              if (reqEpoch === sessionEpoch) showToast(err.message, "error");
               rKeepBtn.disabled = false;
             });
           return;
@@ -3917,12 +3974,13 @@
         xBtn.disabled = true;
         apiFetch("./api/excluded/" + xNum, { method: "DELETE" })
           .then(function(resp) {
+            if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
             EXCLUDED_ITEMS = resp.excluded_issues || [];
-            setDatasetAndRender(resp.dataset);
+            setDatasetAndRender(resp.dataset, undefined, true);
             renderInboxDrawer();
             showToast(t("report.rw.toastExcludedRestored", { num: xNum }), "success");
           }).catch(function(err) {
-            showToast(err.message, "error");
+            if (reqEpoch === sessionEpoch) showToast(err.message, "error");
             xBtn.disabled = false;
           });
         return;
@@ -3954,6 +4012,7 @@
             }
           })
         }).then(function(resp) {
+          if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
           delete pendingDrafts[String(num)];
           EXCLUDED_ITEMS = null;
           setDatasetAndRender(resp.dataset, resp.pending_candidates, true);
@@ -3964,7 +4023,7 @@
             showToast(t("report.rw.toastPendingResolved", { num: num }), "success");
           }
         }).catch(function(err) {
-          showToast(err.message, "error");
+          if (reqEpoch === sessionEpoch) showToast(err.message, "error");
           btn.disabled = false;
         });
       } else if (e.target.closest(".p-exclude-btn")) {
@@ -3979,13 +4038,14 @@
             if_unmodified_since: pendWatermark
           })
         }).then(function(resp) {
+          if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
           delete pendingDrafts[String(num)];
           EXCLUDED_ITEMS = null;
           setDatasetAndRender(resp.dataset, resp.pending_candidates, true);
           renderInboxDrawer();
           showToast(t("report.rw.toastPendingResolved", { num: num }), "success");
         }).catch(function(err) {
-          showToast(err.message, "error");
+          if (reqEpoch === sessionEpoch) showToast(err.message, "error");
           exBtn.disabled = false;
         });
       }
@@ -3999,6 +4059,7 @@
         var btn = this;
         var lbl = document.getElementById(lblId);
         if (btn.disabled) return;
+        var reqEpoch = sessionEpoch;
         btn.disabled = true;
         lbl.setAttribute("data-i18n", "report.rw.syncing");
         lbl.textContent = t("report.rw.syncing");
@@ -4007,14 +4068,16 @@
           headers: { "Content-Type": "application/json" },
           body: "{}"
         }).then(function(resp) {
+          if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
           if (invalidateExcluded) EXCLUDED_ITEMS = null;
-          if (resp.dataset) setDatasetAndRender(resp.dataset, resp.pending_candidates);
+          if (resp.dataset) setDatasetAndRender(resp.dataset, resp.pending_candidates, true);
           var inboxDrawer = document.getElementById("inboxDrawer");
           if (inboxDrawer && !inboxDrawer.hidden) {
             renderInboxDrawer();
           }
           onSuccess(resp);
         }).catch(function(err) {
+          if (reqEpoch !== sessionEpoch) return;
           showToast(err.message, "error");
         }).finally(function() {
           btn.disabled = false;
@@ -4065,6 +4128,8 @@
       if (!stateResp || !stateResp.session || !stateResp.session.permissions || !stateResp.session.permissions.can_triage || !stateResp.dataset) {
         throw new Error("Session cookie was not retained by browser (check HTTPS or --trust-proxy configuration).");
       }
+      sessionEpoch += 1;
+      excludedLoading = false;
       EXCLUDED_ITEMS = null;
       setDatasetAndRender(stateResp.dataset, stateResp.pending_candidates || [], true);
       applySessionState(stateResp.session);
@@ -4098,9 +4163,11 @@
       headers: { "Content-Type": "application/json" },
       body: "{}"
     }).then(function(nextSess) {
-      stripWorkbenchFromDataset();
+      sessionEpoch += 1;
+      excludedLoading = false;
       closeEditDrawer();
       closeInboxDrawer();
+      stripWorkbenchFromDataset();
       applySessionState(nextSess);
     }).catch(function(err) {
       showToast(err.message, "error");
@@ -4156,6 +4223,7 @@
     if (!document.getElementById("inboxDrawer").hidden) renderInboxDrawer();
     if (editingIssueNum) {
       var savedTriagedAt = editingTriagedAt;
+      var savedWasWritable = editingWasWritable;
       var edDraft = {
         cat: document.getElementById("edCat").value,
         sev: document.getElementById("edSev").value,
@@ -4167,8 +4235,9 @@
         exOpen: document.getElementById("editExcludeZone").open,
         exReason: document.getElementById("edExcludeReason").value
       };
-      openEditDrawer(editingIssueNum);
+      openEditDrawer(editingIssueNum, true);
       editingTriagedAt = savedTriagedAt;
+      editingWasWritable = savedWasWritable;
       document.getElementById("edCat").value = edDraft.cat;
       document.getElementById("edSev").value = edDraft.sev;
       document.getElementById("edSub").value = edDraft.sub;

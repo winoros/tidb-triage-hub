@@ -22,6 +22,7 @@ import (
 	"github.com/winoros/tidb-triage-hub/internal/ghgql"
 	"github.com/winoros/tidb-triage-hub/internal/httputil"
 	"github.com/winoros/tidb-triage-hub/internal/model"
+	"github.com/winoros/tidb-triage-hub/internal/store"
 	"github.com/winoros/tidb-triage-hub/internal/syncer"
 )
 
@@ -175,11 +176,11 @@ func (rc *remoteClient) doJSON(ctx context.Context, method, subpath string, quer
 	}
 	defer resp.Body.Close()
 
-	rawResp, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-	if err != nil {
-		return fmt.Errorf("read response from %s: %w", endpoint, err)
-	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		rawResp, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		if err != nil {
+			return fmt.Errorf("read error response from %s: %w", endpoint, err)
+		}
 		var errPayload struct {
 			Error string `json:"error"`
 		}
@@ -189,6 +190,10 @@ func (rc *remoteClient) doJSON(ctx context.Context, method, subpath string, quer
 		return fmt.Errorf("remote HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(rawResp)))
 	}
 
+	rawResp, err := httputil.ReadBoundedBody(resp.Body, 32<<20)
+	if err != nil {
+		return fmt.Errorf("read response from %s: %w", endpoint, err)
+	}
 	if dst != nil {
 		if err := json.Unmarshal(rawResp, dst); err != nil {
 			return fmt.Errorf("decode response JSON from %s: %w", endpoint, err)
@@ -295,52 +300,6 @@ func (rc *remoteClient) postTriageDecisions(ctx context.Context, req syncer.Batc
 	return out, nil
 }
 
-func rejectActiveDBOverwrite(destPath, activeDBPath string) error {
-	activeDBPath = strings.TrimSpace(activeDBPath)
-	if activeDBPath == "" {
-		return nil
-	}
-	// Only guard when activeDBPath (or its WAL/SHM sidecar) actually exists on disk.
-	activeExists := false
-	for _, p := range []string{activeDBPath, activeDBPath + "-wal", activeDBPath + "-shm"} {
-		if _, err := os.Stat(p); err == nil {
-			activeExists = true
-			break
-		}
-	}
-	if !activeExists {
-		return nil
-	}
-
-	destAbs, err := filepath.Abs(destPath)
-	if err != nil {
-		return err
-	}
-	destParentInfo, destParentErr := os.Stat(filepath.Dir(destAbs))
-	destInfo, destStatErr := os.Stat(destAbs)
-
-	for _, protected := range []string{activeDBPath, activeDBPath + "-wal", activeDBPath + "-shm"} {
-		protAbs, pErr := filepath.Abs(protected)
-		if pErr != nil {
-			continue
-		}
-		if filepath.Clean(destAbs) == filepath.Clean(protAbs) {
-			return fmt.Errorf("refusing to overwrite local SQLite database file %q with remote backup (choose a separate --out / --backup-path)", protected)
-		}
-		if destStatErr == nil {
-			if protInfo, err := os.Stat(protAbs); err == nil && os.SameFile(destInfo, protInfo) {
-				return fmt.Errorf("refusing to overwrite local SQLite database file %q with remote backup (choose a separate --out / --backup-path)", protected)
-			}
-		}
-		if destParentErr == nil && filepath.Base(destAbs) == filepath.Base(protAbs) {
-			if protParentInfo, err := os.Stat(filepath.Dir(protAbs)); err == nil && os.SameFile(destParentInfo, protParentInfo) {
-				return fmt.Errorf("refusing to overwrite local SQLite database file %q with remote backup (choose a separate --out / --backup-path)", protected)
-			}
-		}
-	}
-	return nil
-}
-
 func (rc *remoteClient) downloadBackup(ctx context.Context, destPath, activeDBPath string) (int64, error) {
 	reqCtx, cancel := rc.ensureContextDeadline(ctx)
 	defer cancel()
@@ -353,8 +312,8 @@ func (rc *remoteClient) downloadBackup(ctx context.Context, destPath, activeDBPa
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return 0, err
 	}
-	if err := rejectActiveDBOverwrite(destPath, activeDBPath); err != nil {
-		return 0, err
+	if err := store.RejectDBTargetCollision(destPath, activeDBPath); err != nil {
+		return 0, fmt.Errorf("refusing to overwrite local SQLite database with remote backup: %w", err)
 	}
 
 	endpoint := httputil.JoinEndpoint(rc.parsedBase, "/api/admin/backup.db", nil)

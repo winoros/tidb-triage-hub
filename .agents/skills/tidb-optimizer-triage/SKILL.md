@@ -103,8 +103,8 @@ Use this workflow whenever syncing GitHub issues/PRs or performing AI-assisted t
 
 ```bash
 # Backfill bilingual root-cause notes for top 10 highest-priority unnoted real bugs (filterable with `--cat HARD|MEDIUM|EASY`)
-# Emits `decisions_template.notes` (`{"zh-CN": "...", "en": "...", "if_unmodified_since": "..."}`), which updates ONLY notes
-# without altering classification or clearing `needs_retriage` baselines.
+# Emits `decisions_template.notes` (`{"zh-CN": "...", "en": "...", "if_unmodified_since": "..."}`), stored orthogonally in `issue_notes`
+# (single-locale updates preserve the other locale; `Reset Override` preserves backfilled notes; does NOT alter classification or clear `needs_retriage`).
 ./bin/triage-hub pending --backfill-notes 10 --cat HARD
 
 # Re-inspect specific existing issues with live PR file stats

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/winoros/tidb-triage-hub/internal/httputil"
 	"github.com/winoros/tidb-triage-hub/internal/issuesync"
 	"github.com/winoros/tidb-triage-hub/internal/jsonutil"
 	"github.com/winoros/tidb-triage-hub/internal/model"
@@ -138,35 +138,11 @@ func openStoreAndSyncerWithFallback(dbPath, seedPath string, fallbackJSON []byte
 
 func openStoreAndSyncerMaybeDryRun(dbPath, seedPath string, fallbackJSON []byte, dryRun bool) (*store.Store, *syncer.Syncer, func(), error) {
 	if dryRun {
-		if strings.TrimSpace(dbPath) != "" {
-			if _, err := os.Stat(dbPath); err == nil {
-				st, err := store.Open(dbPath)
-				if err != nil {
-					return nil, nil, nil, fmt.Errorf("open sqlite db for dry-run: %w", err)
-				}
-				return st, syncer.New(st), func() { _ = st.Close() }, nil
-			} else if !os.IsNotExist(err) {
-				return nil, nil, nil, fmt.Errorf("stat sqlite db %s: %w", dbPath, err)
-			}
-		}
-		tmpFile, err := os.CreateTemp("", "triage-hub-dryrun-*.db")
+		st, cleanup, err := store.OpenSnapshotForDryRun(dbPath, seedPath, fallbackJSON)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("create temp sqlite db for dry-run: %w", err)
-		}
-		tmpPath := tmpFile.Name()
-		_ = tmpFile.Close()
-		st, sy, err := openStoreAndSyncerWithFallback(tmpPath, seedPath, fallbackJSON)
-		if err != nil {
-			_ = os.Remove(tmpPath)
 			return nil, nil, nil, err
 		}
-		cleanup := func() {
-			_ = st.Close()
-			_ = os.Remove(tmpPath)
-			_ = os.Remove(tmpPath + "-wal")
-			_ = os.Remove(tmpPath + "-shm")
-		}
-		return st, sy, cleanup, nil
+		return st, syncer.New(st), cleanup, nil
 	}
 	st, sy, err := openStoreAndSyncerWithFallback(dbPath, seedPath, fallbackJSON)
 	if err != nil {
@@ -195,7 +171,8 @@ func newServeFlagSet() *flag.FlagSet {
 	fs.String("seed-json", "seed/initial_dataset.json", "Initial seed dataset JSON (falls back to embedded seed if absent)")
 	fs.String("scripts-dir", "", "Deprecated (no-op): sync is now pure Go")
 	fs.String("auth-token", strings.TrimSpace(os.Getenv("TRIAGE_HUB_TOKEN")), "Shared maintainer token required for RW mutations & remote CLI (env: TRIAGE_HUB_TOKEN)")
-	fs.Bool("trust-proxy", envBoolDefault("TRIAGE_HUB_TRUST_PROXY", false), "Trust rightmost X-Forwarded-Proto / X-Forwarded-Host hop from reverse proxies (env: TRIAGE_HUB_TRUST_PROXY)")
+	fs.Bool("trust-proxy", envBoolDefault("TRIAGE_HUB_TRUST_PROXY", false), "Trust rightmost X-Forwarded-Proto / X-Forwarded-Host hop from loopback/private reverse proxies (env: TRIAGE_HUB_TRUST_PROXY)")
+	fs.String("trusted-proxy-cidrs", envOrDefault("TRIAGE_HUB_TRUSTED_PROXY_CIDRS", ""), "Optional comma-separated proxy CIDRs/IPs trusted when --trust-proxy is set (env: TRIAGE_HUB_TRUSTED_PROXY_CIDRS)")
 	fs.Bool("readonly", false, "Serve dashboard in read-only mode (disable all triage edits & sync mutations)")
 	fs.Bool("sync-prs-once", false, "Fetch and classify all open PR statuses once and exit")
 	fs.Bool("sync-issues-once", false, "Run dual-stream incremental issue + PR sync once and exit")
@@ -280,6 +257,12 @@ func executeServe(args []string, stdout io.Writer) error {
 	portFlag := getStr("port")
 	authToken := strings.TrimSpace(getStr("auth-token"))
 	trustProxy := getBool("trust-proxy")
+	trustedProxyCIDRs := strings.TrimSpace(getStr("trusted-proxy-cidrs"))
+	if trustedProxyCIDRs != "" {
+		if _, err := httputil.ParseCIDRList(trustedProxyCIDRs); err != nil {
+			return fmt.Errorf("--trusted-proxy-cidrs: %w", err)
+		}
+	}
 	readOnly := getBool("readonly")
 	syncPRsOnce := getBool("sync-prs-once")
 	syncIssuesOnce := getBool("sync-issues-once")
@@ -340,11 +323,12 @@ func executeServe(args []string, stdout io.Writer) error {
 	}
 
 	srv := server.New(st, sy, server.Options{
-		WebDir:     webDir,
-		ReadOnly:   readOnly,
-		AuthToken:  authToken,
-		DBDisplay:  dbPath,
-		TrustProxy: trustProxy,
+		WebDir:            webDir,
+		ReadOnly:          readOnly,
+		AuthToken:         authToken,
+		DBDisplay:         dbPath,
+		TrustProxy:        trustProxy,
+		TrustedProxyCIDRs: trustedProxyCIDRs,
 	})
 	httpSrv := &http.Server{
 		Addr:              listenAddr,
@@ -352,7 +336,6 @@ func executeServe(args []string, stdout io.Writer) error {
 		ReadHeaderTimeout: 15 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		BaseContext:       func(net.Listener) context.Context { return sigCtx },
 	}
 
 	errCh := make(chan error, 1)
@@ -756,12 +739,7 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 	if err != nil {
 		return fmt.Errorf("triage validation failed: %w", err)
 	}
-	if len(cleaned.NewIssues) == 0 &&
-		len(cleaned.ExcludeIssues) == 0 &&
-		len(cleaned.Overrides) == 0 &&
-		len(cleaned.Notes) == 0 &&
-		len(cleaned.AckRetriage) == 0 &&
-		len(cleaned.ManualPRLinks) == 0 {
+	if !syncer.HasActionableDecisions(cleaned) {
 		return fmt.Errorf("no actionable entries remaining after validation (check if all entries were skipped by --skip-todo)")
 	}
 
@@ -820,13 +798,14 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 	applyOpts := store.BatchApplyOptions{SkipConflicts: effectiveSkipConflicts}
 	if *dryRun {
 		dbChecked := false
+		planned := cleaned
 		var dryConflicts []model.TriageConflict
 		dbExists := false
-		if strings.TrimSpace(*dbPath) != "" {
-			if _, statErr := os.Stat(*dbPath); statErr == nil {
+		if resolvedDB := store.ResolveLocalDBPath(*dbPath); resolvedDB != "" {
+			if _, statErr := os.Stat(resolvedDB); statErr == nil {
 				dbExists = true
 			} else if !os.IsNotExist(statErr) {
-				return fmt.Errorf("stat sqlite db %s: %w", *dbPath, statErr)
+				return fmt.Errorf("stat sqlite db %s: %w", resolvedDB, statErr)
 			}
 		}
 		explicitSeedPath := ""
@@ -838,31 +817,18 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 			if openErr != nil {
 				return fmt.Errorf("open dataset for dry-run check: %w", openErr)
 			}
-			cfl, valErr := st.ValidateBatchDecisionsWithOptions(cleaned, applyOpts)
+			pl, cfl, valErr := st.PlanBatchDecisionsWithOptions(cleaned, applyOpts)
 			cleanup()
 			if valErr != nil {
 				return fmt.Errorf("triage database validation failed: %w", valErr)
 			}
+			planned = pl
 			dryConflicts = cfl
 			dbChecked = true
 		}
-		out := map[string]any{
-			"dry_run":             true,
-			"db_validated":        dbChecked,
-			"new_issues_count":    len(cleaned.NewIssues),
-			"exclude_count":       len(cleaned.ExcludeIssues),
-			"overrides_count":     len(cleaned.Overrides),
-			"notes_count":         len(cleaned.Notes),
-			"ack_retriage_count":  len(cleaned.AckRetriage),
-			"manual_pr_links":     len(cleaned.ManualPRLinks),
-			"validation_warnings": warnings,
-			"prepared_decisions":  cleaned,
-		}
-		if len(dryConflicts) > 0 {
-			out["skipped_conflicts"] = dryConflicts
-			for _, c := range dryConflicts {
-				fmt.Fprintf(stderr, "[conflict-skipped] issue #%d (%s): %s\n", c.Issue, c.Action, c.Message)
-			}
+		out := syncer.FormatDryRunBatchResult(planned, dbChecked, warnings, dryConflicts)
+		for _, c := range dryConflicts {
+			fmt.Fprintf(stderr, "[conflict-skipped] issue #%d (%s): %s\n", c.Issue, c.Action, c.Message)
 		}
 		writePrettyJSONTo(stdout, out)
 		return nil
@@ -945,7 +911,11 @@ func executeBackup(args []string, stdout io.Writer) error {
 		return nil
 	}
 
-	if _, err := os.Stat(*dbPath); err != nil {
+	if resolvedLocal := store.ResolveLocalDBPath(*dbPath); resolvedLocal != "" {
+		if _, err := os.Stat(resolvedLocal); err != nil {
+			return fmt.Errorf("stat source sqlite db %s: %w", resolvedLocal, err)
+		}
+	} else if _, err := os.Stat(*dbPath); err != nil {
 		return fmt.Errorf("stat source sqlite db %s: %w", *dbPath, err)
 	}
 	if dest == "" {
