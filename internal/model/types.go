@@ -209,6 +209,8 @@ type Permissions struct {
 }
 
 type SessionInfo struct {
+	GitHubLogin   bool        `json:"github_login,omitempty"`
+	TokenLogin    bool        `json:"token_login"`
 	Viewer        Viewer      `json:"viewer"`
 	Permissions   Permissions `json:"permissions"`
 	AuthRequired  bool        `json:"auth_required,omitempty"`

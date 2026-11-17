@@ -136,7 +136,7 @@ func setupTestServer(t *testing.T, readOnly bool) *Server {
 	}
 
 	sy := syncer.New(st)
-	return New(st, sy, Options{WebDir: webDir, ReadOnly: readOnly})
+	return New(st, sy, Options{WebDir: webDir, ReadOnly: readOnly, AuthToken: "fixture-maintainer-token"})
 }
 
 func TestStandaloneRoutesAndRBACGuard(t *testing.T) {
@@ -145,7 +145,7 @@ func TestStandaloneRoutesAndRBACGuard(t *testing.T) {
 	// 1. Root index served directly at / with inlined i18n + dataset bundle
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusOK ||
 		!strings.Contains(rec.Body.String(), "<title>Hub</title>") ||
 		!strings.Contains(rec.Body.String(), "/* zh-CN.js */") ||
@@ -156,7 +156,7 @@ func TestStandaloneRoutesAndRBACGuard(t *testing.T) {
 	// 2. Legacy bookmark redirects to / preserving query string
 	req = httptest.NewRequest(http.MethodGet, "/reports/tidb-optimizer-issues/?view=prs&lang=zh", nil)
 	rec = httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/?view=prs&lang=zh" {
 		t.Fatalf("expected 302 to /?view=prs&lang=zh, got code=%d loc=%q", rec.Code, rec.Header().Get("Location"))
 	}
@@ -164,7 +164,7 @@ func TestStandaloneRoutesAndRBACGuard(t *testing.T) {
 	// 3. /bootstrap.js includes session permissions & dataset
 	req = httptest.NewRequest(http.MethodGet, "/bootstrap.js", nil)
 	rec = httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"can_triage":true`) {
 		t.Fatalf("GET /bootstrap.js unexpected: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -174,7 +174,7 @@ func TestStandaloneRoutesAndRBACGuard(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPatch, "/api/issues/72001/triage", bytes.NewBufferString(patchBody))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"dataset":`) {
 		t.Fatalf("RW PATCH failed: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -182,7 +182,7 @@ func TestStandaloneRoutesAndRBACGuard(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/api/issues/72001/retriage/ack", bytes.NewBufferString(`{}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST retriage/ack failed: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -190,7 +190,7 @@ func TestStandaloneRoutesAndRBACGuard(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/api/retriage/ack-batch", bytes.NewBufferString(`{"numbers":[72001]}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST retriage/ack-batch failed: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -199,7 +199,7 @@ func TestStandaloneRoutesAndRBACGuard(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/api/issues/72001/exclude", bytes.NewBufferString(`{"reason":"canonical"}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 when excluding canonical issue #72001, got %d", rec.Code)
 	}
@@ -207,14 +207,14 @@ func TestStandaloneRoutesAndRBACGuard(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/api/issues/72002/exclude", bytes.NewBufferString(`{"reason":"UI issue"}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 when excluding supplemental issue #72002, got %d: %s", rec.Code, rec.Body.String())
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/excluded", nil)
 	rec = httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "72002") {
 		t.Fatalf("GET /api/excluded failed: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -222,7 +222,7 @@ func TestStandaloneRoutesAndRBACGuard(t *testing.T) {
 	req = httptest.NewRequest(http.MethodDelete, "/api/excluded/72002", nil)
 	req.Header.Set("X-Triage-CSRF", "1")
 	rec = httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("DELETE /api/excluded/72002 failed: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -246,7 +246,7 @@ func TestStandaloneRoutesAndRBACGuard(t *testing.T) {
 	} {
 		r := httptest.NewRequest(tc.method, tc.path, bytes.NewBufferString(`{}`))
 		w := httptest.NewRecorder()
-		roSrv.Handler().ServeHTTP(w, r)
+		serveTestRequest(roSrv, w, r)
 		if w.Code != http.StatusForbidden {
 			t.Fatalf("expected 403 for %s %s in readonly mode, got %d", tc.method, tc.path, w.Code)
 		}
@@ -266,7 +266,7 @@ func TestRealWebAssetsBundleRender(t *testing.T) {
 	srv := New(st, syncer.New(st), Options{WebDir: "../../web", ReadOnly: false})
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(srv, rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET / with real web dir failed: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -294,7 +294,7 @@ func TestCSRFOriginAndContentTypeGuard(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Sec-Fetch-Site", "cross-site")
 	rec := httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for Sec-Fetch-Site=cross-site, got %d", rec.Code)
 	}
@@ -305,7 +305,7 @@ func TestCSRFOriginAndContentTypeGuard(t *testing.T) {
 		r.Header.Set("Content-Type", "application/json")
 		r.Header.Set("Origin", badOrigin)
 		w := httptest.NewRecorder()
-		rwSrv.Handler().ServeHTTP(w, r)
+		serveTestRequest(rwSrv, w, r)
 		if w.Code != http.StatusForbidden {
 			t.Fatalf("expected 403 for Origin=%q, got %d", badOrigin, w.Code)
 		}
@@ -315,7 +315,7 @@ func TestCSRFOriginAndContentTypeGuard(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/api/issues/72001/retriage/ack", bytes.NewBufferString(`a=1`))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec = httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for form-urlencoded POST, got %d", rec.Code)
 	}
@@ -326,7 +326,7 @@ func TestCSRFOriginAndContentTypeGuard(t *testing.T) {
 	req.Header.Set("Origin", "http://127.0.0.1:8090")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	rec = httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for same-origin JSON POST, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -335,7 +335,7 @@ func TestCSRFOriginAndContentTypeGuard(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/api/issues/72001/retriage/ack", bytes.NewBufferString(`a=1`))
 	req.ContentLength = -1
 	rec = httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for chunked POST without application/json Content-Type, got %d", rec.Code)
 	}
@@ -344,7 +344,7 @@ func TestCSRFOriginAndContentTypeGuard(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/api/issues/72001/exclude", bytes.NewBufferString(`{"reason":`))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for malformed JSON on /exclude, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -364,14 +364,14 @@ func TestBootstrapJSHtmlCommentAndScriptBreakoutEscaping(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPatch, "/api/issues/72001/triage", bytes.NewBufferString(payload))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(rwSrv, rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PATCH triage failed: %d %s", rec.Code, rec.Body.String())
 	}
 
 	reqIdx := httptest.NewRequest(http.MethodGet, "/", nil)
 	recIdx := httptest.NewRecorder()
-	rwSrv.Handler().ServeHTTP(recIdx, reqIdx)
+	serveTestRequest(rwSrv, recIdx, reqIdx)
 	if recIdx.Code != http.StatusOK {
 		t.Fatalf("GET / failed: %d", recIdx.Code)
 	}
@@ -439,7 +439,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	// 1. Anonymous GET / renders embedded index.html in viewer mode (can_triage:false, pending:[])
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
+	serveTestRequest(srv, rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 on GET / with embedded assets, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -460,7 +460,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	// Embedded i18n static fallback works too
 	reqI18n := httptest.NewRequest(http.MethodGet, "/i18n/zh-CN.js", nil)
 	recI18n := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(recI18n, reqI18n)
+	serveTestRequest(srv, recI18n, reqI18n)
 	if recI18n.Code != http.StatusOK || !strings.Contains(recI18n.Body.String(), "unlockBtn") {
 		t.Fatalf("expected embedded /i18n/zh-CN.js 200 OK, got %d", recI18n.Code)
 	}
@@ -488,7 +488,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 			r.Header.Set("Content-Type", "application/json")
 		}
 		w := httptest.NewRecorder()
-		srv.Handler().ServeHTTP(w, r)
+		serveTestRequest(srv, w, r)
 		if w.Code != http.StatusForbidden {
 			t.Fatalf("expected 403 for unauthenticated %s %s, got %d", tc.method, tc.path, w.Code)
 		}
@@ -498,7 +498,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	badLogin := httptest.NewRequest(http.MethodPost, "/api/session/login", bytes.NewBufferString(`{"token":"wrong"}`))
 	badLogin.Header.Set("Content-Type", "application/json")
 	badRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(badRec, badLogin)
+	serveTestRequest(srv, badRec, badLogin)
 	if badRec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for invalid login token, got %d", badRec.Code)
 	}
@@ -506,20 +506,20 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	// Anonymous GET /api/status redacts db_path & pending_numbers; anonymous check_gh=1 returns 401; bad Bearer returns 401
 	anonStatReq := httptest.NewRequest(http.MethodGet, "/api/status", nil)
 	anonStatRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(anonStatRec, anonStatReq)
+	serveTestRequest(srv, anonStatRec, anonStatReq)
 	if anonStatRec.Code != http.StatusOK || !strings.Contains(anonStatRec.Body.String(), `"db_path":"redacted"`) || strings.Contains(anonStatRec.Body.String(), "72100") {
 		t.Fatalf("expected redacted anonymous /api/status, got code=%d body=%s", anonStatRec.Code, anonStatRec.Body.String())
 	}
 	anonGHReq := httptest.NewRequest(http.MethodGet, "/api/status?check_gh=1", nil)
 	anonGHRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(anonGHRec, anonGHReq)
+	serveTestRequest(srv, anonGHRec, anonGHReq)
 	if anonGHRec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for anonymous /api/status?check_gh=1 when token auth enabled, got %d", anonGHRec.Code)
 	}
 	badBearerStatReq := httptest.NewRequest(http.MethodGet, "/api/status", nil)
 	badBearerStatReq.Header.Set("Authorization", "Bearer wrong-token")
 	badBearerStatRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(badBearerStatRec, badBearerStatReq)
+	serveTestRequest(srv, badBearerStatRec, badBearerStatReq)
 	if badBearerStatRec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for invalid Bearer token on /api/status, got %d", badBearerStatRec.Code)
 	}
@@ -530,7 +530,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	extLogin.Header.Set("Content-Type", "application/json")
 	extLogin.Header.Set("X-Forwarded-Proto", "https")
 	extLoginRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(extLoginRec, extLogin)
+	serveTestRequest(srv, extLoginRec, extLogin)
 	if extLoginRec.Code != http.StatusOK || extLoginRec.Result().Cookies()[0].Secure {
 		t.Fatalf("expected untrusted peer X-Forwarded-Proto to be ignored (Secure=false), got %+v", extLoginRec.Result().Cookies())
 	}
@@ -541,7 +541,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	loopLogin.Header.Set("Content-Type", "application/json")
 	loopLogin.Header.Set("X-Forwarded-Proto", "https")
 	loopRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(loopRec, loopLogin)
+	serveTestRequest(srv, loopRec, loopLogin)
 	if loopRec.Code != http.StatusOK || loopRec.Result().Cookies()[0].Secure {
 		t.Fatalf("expected loopback peer without TrustProxy=true to ignore X-Forwarded-Proto (Secure=false), got %+v", loopRec.Result().Cookies())
 	}
@@ -557,7 +557,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	spoofProtoLogin.Header.Set("Content-Type", "application/json")
 	spoofProtoLogin.Header.Set("X-Forwarded-Proto", "https, http")
 	spoofProtoRec := httptest.NewRecorder()
-	proxySrv.Handler().ServeHTTP(spoofProtoRec, spoofProtoLogin)
+	serveTestRequest(proxySrv, spoofProtoRec, spoofProtoLogin)
 	if spoofProtoRec.Code != http.StatusOK || spoofProtoRec.Result().Cookies()[0].Secure {
 		t.Fatalf("expected rightmost hop 'http' in 'https, http' to set Secure=false, got %+v", spoofProtoRec.Result().Cookies())
 	}
@@ -567,7 +567,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	okLogin.Header.Set("Content-Type", "application/json")
 	okLogin.Header.Set("X-Forwarded-Proto", "http, https")
 	okRec := httptest.NewRecorder()
-	proxySrv.Handler().ServeHTTP(okRec, okLogin)
+	serveTestRequest(proxySrv, okRec, okLogin)
 	if okRec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for valid login token, got %d: %s", okRec.Code, okRec.Body.String())
 	}
@@ -584,7 +584,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	spoofPatch.Header.Set("X-Forwarded-Host", "evil.example")
 	spoofPatch.AddCookie(cookies[0])
 	spoofRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(spoofRec, spoofPatch)
+	serveTestRequest(srv, spoofRec, spoofPatch)
 	if spoofRec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 when untrusted peer spoofs X-Forwarded-Host, got %d", spoofRec.Code)
 	}
@@ -598,7 +598,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	leftmostSpoofPatch.Header.Set("X-Forwarded-Host", "evil.example, hub.example.com")
 	leftmostSpoofPatch.AddCookie(cookies[0])
 	leftmostSpoofRec := httptest.NewRecorder()
-	proxySrv.Handler().ServeHTTP(leftmostSpoofRec, leftmostSpoofPatch)
+	serveTestRequest(proxySrv, leftmostSpoofRec, leftmostSpoofPatch)
 	if leftmostSpoofRec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 when leftmost X-Forwarded-Host is spoofed, got %d", leftmostSpoofRec.Code)
 	}
@@ -611,7 +611,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	patchReq.Header.Set("X-Forwarded-Host", "spoofed.example, hub.example.com")
 	patchReq.AddCookie(cookies[0])
 	patchRec := httptest.NewRecorder()
-	proxySrv.Handler().ServeHTTP(patchRec, patchReq)
+	serveTestRequest(proxySrv, patchRec, patchReq)
 	if patchRec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for cookie-authenticated PATCH via rightmost X-Forwarded-Host, got %d: %s", patchRec.Code, patchRec.Body.String())
 	}
@@ -620,7 +620,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	pendReq := httptest.NewRequest(http.MethodGet, "/api/triage/pending?compact=1&enrich_prs=0", nil)
 	pendReq.Header.Set("Authorization", "Bearer secret-maint-token")
 	pendRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(pendRec, pendReq)
+	serveTestRequest(srv, pendRec, pendReq)
 	if pendRec.Code != http.StatusOK || !strings.Contains(pendRec.Body.String(), `"pending_count":1`) {
 		t.Fatalf("expected 200 with pending_count=1 for Bearer request, got %d: %s", pendRec.Code, pendRec.Body.String())
 	}
@@ -628,7 +628,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	bakReq := httptest.NewRequest(http.MethodGet, "/api/admin/backup.db", nil)
 	bakReq.Header.Set("Authorization", "Bearer secret-maint-token")
 	bakRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(bakRec, bakReq)
+	serveTestRequest(srv, bakRec, bakReq)
 	if bakRec.Code != http.StatusOK || !bytes.HasPrefix(bakRec.Body.Bytes(), []byte("SQLite format 3")) {
 		t.Fatalf("expected valid SQLite header from /api/admin/backup.db, got code=%d len=%d", bakRec.Code, bakRec.Body.Len())
 	}
@@ -637,7 +637,7 @@ func TestTokenAuthCookieBearerAndEmbeddedWebAssets(t *testing.T) {
 	logoutReq := httptest.NewRequest(http.MethodPost, "/api/session/logout", bytes.NewBufferString(`{}`))
 	logoutReq.Header.Set("Content-Type", "application/json")
 	logoutRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(logoutRec, logoutReq)
+	serveTestRequest(srv, logoutRec, logoutReq)
 	if logoutRec.Code != http.StatusOK || !strings.Contains(logoutRec.Body.String(), `"can_triage":false`) {
 		t.Fatalf("expected logged-out session, got %d: %s", logoutRec.Code, logoutRec.Body.String())
 	}
@@ -685,7 +685,7 @@ func TestRound2OriginDowngradeBasicAuthCoexistenceAndConflictCodes(t *testing.T)
 	// 1. GET /api/status?require_auth=1 returns 401 without token
 	reqStat := httptest.NewRequest(http.MethodGet, "/api/status?require_auth=1", nil)
 	recStat := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(recStat, reqStat)
+	serveTestRequest(srv, recStat, reqStat)
 	if recStat.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for unauthenticated /api/status?require_auth=1, got %d", recStat.Code)
 	}
@@ -694,7 +694,7 @@ func TestRound2OriginDowngradeBasicAuthCoexistenceAndConflictCodes(t *testing.T)
 	roSrv := New(st, syncer.New(st), Options{ReadOnly: true})
 	roStatReq := httptest.NewRequest(http.MethodGet, "/api/status?check_gh=1", nil)
 	roStatRec := httptest.NewRecorder()
-	roSrv.Handler().ServeHTTP(roStatRec, roStatReq)
+	serveTestRequest(roSrv, roStatRec, roStatReq)
 	if roStatRec.Code != http.StatusOK || !strings.Contains(roStatRec.Body.String(), `"gh_check_error"`) {
 		t.Fatalf("expected 200 with gh_check_error on readonly check_gh=1, got %d: %s", roStatRec.Code, roStatRec.Body.String())
 	}
@@ -706,7 +706,7 @@ func TestRound2OriginDowngradeBasicAuthCoexistenceAndConflictCodes(t *testing.T)
 	loginReq.Header.Set("Origin", "https://hub.example.com")
 	loginReq.Header.Set("X-Forwarded-Proto", "https")
 	loginRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(loginRec, loginReq)
+	serveTestRequest(srv, loginRec, loginReq)
 	if loginRec.Code != http.StatusOK {
 		t.Fatalf("login failed: %d", loginRec.Code)
 	}
@@ -720,7 +720,7 @@ func TestRound2OriginDowngradeBasicAuthCoexistenceAndConflictCodes(t *testing.T)
 	downReq.Header.Set("Origin", "http://hub.example.com")
 	downReq.AddCookie(cookie)
 	downRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(downRec, downReq)
+	serveTestRequest(srv, downRec, downReq)
 	if downRec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 on http->https Origin downgrade, got %d", downRec.Code)
 	}
@@ -737,7 +737,7 @@ func TestRound2OriginDowngradeBasicAuthCoexistenceAndConflictCodes(t *testing.T)
 	basicPatch.Header.Set("Origin", "https://hub.example.com:443")
 	basicPatch.AddCookie(cookie)
 	basicRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(basicRec, basicPatch)
+	serveTestRequest(srv, basicRec, basicPatch)
 	if basicRec.Code != http.StatusOK {
 		t.Fatalf("expected 200 with Basic Auth + session cookie + :443 Origin, got %d: %s", basicRec.Code, basicRec.Body.String())
 	}
@@ -750,7 +750,7 @@ func TestRound2OriginDowngradeBasicAuthCoexistenceAndConflictCodes(t *testing.T)
 	conflictPatch.Header.Set("Content-Type", "application/json")
 	conflictPatch.Header.Set("Authorization", "Bearer maint-tok")
 	conflictRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(conflictRec, conflictPatch)
+	serveTestRequest(srv, conflictRec, conflictPatch)
 	if conflictRec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict on stale if_unmodified_since PATCH, got %d: %s", conflictRec.Code, conflictRec.Body.String())
 	}
@@ -761,7 +761,7 @@ func TestRound2OriginDowngradeBasicAuthCoexistenceAndConflictCodes(t *testing.T)
 	notFoundPatch.Header.Set("Content-Type", "application/json")
 	notFoundPatch.Header.Set("Authorization", "Bearer maint-tok")
 	notFoundRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(notFoundRec, notFoundPatch)
+	serveTestRequest(srv, notFoundRec, notFoundPatch)
 	if notFoundRec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 Not Found on unknown issue PATCH, got %d: %s", notFoundRec.Code, notFoundRec.Body.String())
 	}
@@ -784,7 +784,7 @@ func TestRound2OriginDowngradeBasicAuthCoexistenceAndConflictCodes(t *testing.T)
 	batchConflictReq.Header.Set("Content-Type", "application/json")
 	batchConflictReq.Header.Set("Authorization", "Bearer maint-tok")
 	batchConflictRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(batchConflictRec, batchConflictReq)
+	serveTestRequest(srv, batchConflictRec, batchConflictReq)
 	if batchConflictRec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict on strict batch conflict, got %d: %s", batchConflictRec.Code, batchConflictRec.Body.String())
 	}
@@ -841,7 +841,7 @@ func TestBackupTimeoutHeaderAndExplicitPRRefresh(t *testing.T) {
 	patchReq.Header.Set("Content-Type", "application/json")
 	patchReq.Header.Set("Authorization", "Bearer maint-tok")
 	patchRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(patchRec, patchReq)
+	serveTestRequest(srv, patchRec, patchReq)
 	if patchRec.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK on PATCH, got %d: %s", patchRec.Code, patchRec.Body.String())
 	}
@@ -863,7 +863,7 @@ func TestBackupTimeoutHeaderAndExplicitPRRefresh(t *testing.T) {
 	bakReq.Header.Set("Authorization", "Bearer maint-tok")
 	bakReq.Header.Set("X-Triage-Timeout-Ms", "600000")
 	bakRec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(bakRec, bakReq)
+	serveTestRequest(srv, bakRec, bakReq)
 	if bakRec.Code != http.StatusOK || bakRec.Body.Len() < 100 {
 		t.Fatalf("expected 200 OK SQLite snapshot with X-Triage-Timeout-Ms=600000, got code=%d len=%d", bakRec.Code, bakRec.Body.Len())
 	}
@@ -924,7 +924,7 @@ func TestProxyTrustRightmostHopSameSiteReadHTTP2DeleteAndPendingConflict(t *test
 	loginUntrusted.Header.Set("Content-Type", "application/json")
 	loginUntrusted.Header.Set("X-Forwarded-Proto", "https")
 	recUntrusted := httptest.NewRecorder()
-	srvUntrusted.Handler().ServeHTTP(recUntrusted, loginUntrusted)
+	serveTestRequest(srvUntrusted, recUntrusted, loginUntrusted)
 	if recUntrusted.Code != http.StatusOK || len(recUntrusted.Result().Cookies()) != 1 || recUntrusted.Result().Cookies()[0].Secure {
 		t.Fatalf("expected Secure=false when TrustProxy=false, got code=%d cookies=%+v", recUntrusted.Code, recUntrusted.Result().Cookies())
 	}
@@ -936,7 +936,7 @@ func TestProxyTrustRightmostHopSameSiteReadHTTP2DeleteAndPendingConflict(t *test
 	pubSpoof.Header.Set("Content-Type", "application/json")
 	pubSpoof.Header.Set("X-Forwarded-Proto", "https")
 	recPubSpoof := httptest.NewRecorder()
-	srvTrusted.Handler().ServeHTTP(recPubSpoof, pubSpoof)
+	serveTestRequest(srvTrusted, recPubSpoof, pubSpoof)
 	if recPubSpoof.Code != http.StatusOK || recPubSpoof.Result().Cookies()[0].Secure {
 		t.Fatalf("expected public RemoteAddr X-Forwarded-Proto ignored even when TrustProxy=true, got %+v", recPubSpoof.Result().Cookies())
 	}
@@ -948,7 +948,7 @@ func TestProxyTrustRightmostHopSameSiteReadHTTP2DeleteAndPendingConflict(t *test
 	multiLineSpoof.Header.Add("X-Forwarded-Proto", "https")
 	multiLineSpoof.Header.Add("X-Forwarded-Proto", "http")
 	recMultiSpoof := httptest.NewRecorder()
-	srvTrusted.Handler().ServeHTTP(recMultiSpoof, multiLineSpoof)
+	serveTestRequest(srvTrusted, recMultiSpoof, multiLineSpoof)
 	if recMultiSpoof.Code != http.StatusOK || recMultiSpoof.Result().Cookies()[0].Secure {
 		t.Fatalf("expected last header line X-Forwarded-Proto=http to win over first line https, got %+v", recMultiSpoof.Result().Cookies())
 	}
@@ -962,7 +962,7 @@ func TestProxyTrustRightmostHopSameSiteReadHTTP2DeleteAndPendingConflict(t *test
 	loginRightHTTPS.Header.Add("X-Forwarded-Host", "hub.example.com")
 	loginRightHTTPS.Header.Set("Origin", "https://hub.example.com")
 	recRightHTTPS := httptest.NewRecorder()
-	srvTrusted.Handler().ServeHTTP(recRightHTTPS, loginRightHTTPS)
+	serveTestRequest(srvTrusted, recRightHTTPS, loginRightHTTPS)
 	if recRightHTTPS.Code != http.StatusOK || len(recRightHTTPS.Result().Cookies()) != 1 || !recRightHTTPS.Result().Cookies()[0].Secure {
 		t.Fatalf("expected Secure=true from rightmost multi-line X-Forwarded-Proto=https, got code=%d body=%s", recRightHTTPS.Code, recRightHTTPS.Body.String())
 	}
@@ -977,7 +977,7 @@ func TestProxyTrustRightmostHopSameSiteReadHTTP2DeleteAndPendingConflict(t *test
 	badSchemeMut.Header.Set("Origin", "http://hub.example.com")
 	badSchemeMut.AddCookie(maintCookie)
 	recBadScheme := httptest.NewRecorder()
-	srvTrusted.Handler().ServeHTTP(recBadScheme, badSchemeMut)
+	serveTestRequest(srvTrusted, recBadScheme, badSchemeMut)
 	if recBadScheme.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 on scheme-mismatched Origin, got %d", recBadScheme.Code)
 	}
@@ -988,7 +988,7 @@ func TestProxyTrustRightmostHopSameSiteReadHTTP2DeleteAndPendingConflict(t *test
 		csReq.AddCookie(maintCookie)
 		csReq.Header.Set("Sec-Fetch-Site", "cross-site")
 		csRec := httptest.NewRecorder()
-		srvUntrusted.Handler().ServeHTTP(csRec, csReq)
+		serveTestRequest(srvUntrusted, csRec, csReq)
 		if csRec.Code != http.StatusForbidden {
 			t.Fatalf("expected 403 on cross-site GET %s, got %d", ep, csRec.Code)
 		}
@@ -1003,7 +1003,7 @@ func TestProxyTrustRightmostHopSameSiteReadHTTP2DeleteAndPendingConflict(t *test
 	// 4. Anonymous GET /api/status?check_gh=0 omits pending_count/retriage_count while authenticated sees them
 	anonStatReq := httptest.NewRequest(http.MethodGet, "/api/status?check_gh=0", nil)
 	anonStatRec := httptest.NewRecorder()
-	srvUntrusted.Handler().ServeHTTP(anonStatRec, anonStatReq)
+	serveTestRequest(srvUntrusted, anonStatRec, anonStatReq)
 	if anonStatRec.Code != http.StatusOK || strings.Contains(anonStatRec.Body.String(), `"pending_count"`) {
 		t.Fatalf("expected anonymous /api/status to omit workbench counts, got code=%d body=%s", anonStatRec.Code, anonStatRec.Body.String())
 	}
@@ -1013,7 +1013,7 @@ func TestProxyTrustRightmostHopSameSiteReadHTTP2DeleteAndPendingConflict(t *test
 	emptyPostNoCSRF := httptest.NewRequest(http.MethodPost, "/api/session/logout", nil)
 	emptyPostNoCSRF.AddCookie(maintCookie)
 	emptyPostNoCSRFRec := httptest.NewRecorder()
-	srvUntrusted.Handler().ServeHTTP(emptyPostNoCSRFRec, emptyPostNoCSRF)
+	serveTestRequest(srvUntrusted, emptyPostNoCSRFRec, emptyPostNoCSRF)
 	if emptyPostNoCSRFRec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 on empty-body POST without X-Triage-CSRF or application/json, got %d", emptyPostNoCSRFRec.Code)
 	}
@@ -1024,7 +1024,7 @@ func TestProxyTrustRightmostHopSameSiteReadHTTP2DeleteAndPendingConflict(t *test
 	h2Del.Header.Set("X-Triage-CSRF", "1")
 	h2Del.AddCookie(maintCookie)
 	h2DelRec := httptest.NewRecorder()
-	srvUntrusted.Handler().ServeHTTP(h2DelRec, h2Del)
+	serveTestRequest(srvUntrusted, h2DelRec, h2Del)
 	if h2DelRec.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK on HTTP/2 empty DELETE (ContentLength=-1, X-Triage-CSRF=1), got %d: %s", h2DelRec.Code, h2DelRec.Body.String())
 	}
@@ -1034,7 +1034,7 @@ func TestProxyTrustRightmostHopSameSiteReadHTTP2DeleteAndPendingConflict(t *test
 	chunkedForm.Header.Del("Content-Type")
 	chunkedForm.AddCookie(maintCookie)
 	chunkedFormRec := httptest.NewRecorder()
-	srvUntrusted.Handler().ServeHTTP(chunkedFormRec, chunkedForm)
+	serveTestRequest(srvUntrusted, chunkedFormRec, chunkedForm)
 	if chunkedFormRec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 on chunked body without application/json Content-Type, got %d: %s", chunkedFormRec.Code, chunkedFormRec.Body.String())
 	}
@@ -1051,8 +1051,17 @@ func TestProxyTrustRightmostHopSameSiteReadHTTP2DeleteAndPendingConflict(t *test
 	stalePendReq.Header.Set("Content-Type", "application/json")
 	stalePendReq.AddCookie(maintCookie)
 	stalePendRec := httptest.NewRecorder()
-	srvUntrusted.Handler().ServeHTTP(stalePendRec, stalePendReq)
+	serveTestRequest(srvUntrusted, stalePendRec, stalePendReq)
 	if stalePendRec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict on stale pending if_unmodified_since, got %d: %s", stalePendRec.Code, stalePendRec.Body.String())
 	}
+}
+
+// Review and CSRF fixtures authenticate explicitly now that unconfigured servers deny writes.
+// Authentication-specific fixtures use their own tokens and receive no injected credential.
+func serveTestRequest(s *Server, w http.ResponseWriter, r *http.Request) {
+	if s.opts.AuthToken == "fixture-maintainer-token" {
+		r.Header.Set("Authorization", "Bearer fixture-maintainer-token")
+	}
+	s.Handler().ServeHTTP(w, r)
 }

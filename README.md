@@ -26,12 +26,52 @@ go test -count=1 ./...
 # Frontend request/session/draft concurrency tests (Node.js, no npm dependencies)
 node --test web/review_state.test.cjs
 
-# Start standalone RW workbench (default http://127.0.0.1:8787)
+# Start standalone viewer (default http://127.0.0.1:8787; writes require authentication)
 ./bin/triage-hub
 
 # Start in read-only viewer mode
 ./bin/triage-hub --readonly
 ```
+
+## GitHub sign-in and write permissions
+
+Register a [GitHub OAuth App](https://github.com/settings/developers) with the site's
+home URL and callback URL `https://YOUR_HOST/auth/github/callback`. Configure the
+server through its environment (keep the secret out of source control):
+
+```bash
+export TRIAGE_HUB_GITHUB_CLIENT_ID="your-client-id"
+export TRIAGE_HUB_GITHUB_CLIENT_SECRET="your-client-secret"
+export TRIAGE_HUB_GITHUB_CALLBACK_URL="https://YOUR_HOST/auth/github/callback"
+./bin/triage-hub serve --addr 127.0.0.1:8787 --trust-proxy
+```
+
+The header shows **Sign in with GitHub**. The owner (default GitHub user ID
+**7846227**, `winoros`) and the additional maintainers configured through
+`TRIAGE_HUB_GITHUB_MAINTAINER_IDS` (comma-separated numeric IDs) receive triage and
+sync permissions. `--github-maintainer-ids` overrides that environment variable;
+an empty list grants no additional access. All other accounts and anonymous
+visitors remain read-only. IDs are checked on the server for every protected
+request, independent of displayed login names. `--github-owner-id` changes the
+owner. `--readonly` disables writes for everyone, including all maintainers.
+Restart the server after changing the allowlist; existing browser sessions will
+need to sign in again.
+
+OAuth uses state and PKCE, requests no additional scopes, and fetches the authenticated
+identity from GitHub. GitHub access tokens are not stored. Browser sessions expire
+after 24 hours, are revoked on logout, and are lost on server restart. Sessions are
+in memory: run a single server instance (multiple replicas would need a shared
+session store). HTTPS is required except for localhost development.
+
+Without any authentication configuration, HTTP writes are disabled. With GitHub
+OAuth enabled, the old browser token login and its cookies are disabled.
+An optional `TRIAGE_HUB_TOKEN` still grants maintainer access to remote CLI/automation
+via Bearer authentication: keep it private to the owner and trusted owner-operated
+workers, or leave it unset for GitHub-only access. Local CLI commands and configured
+background sync jobs remain server-operator capabilities.
+
+For a token-only installation, `TRIAGE_HUB_TOKEN` retains the existing browser
+**Unlock RW** flow. Partial OAuth configuration causes startup to fail.
 
 ## CLI Sync & AI Triage Workflow
 

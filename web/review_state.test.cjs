@@ -745,3 +745,47 @@ for (const freshRevision of [null, 10, 20]) {
     assert.equal(ctx.workbenchRevision, freshRevision ?? 10);
   });
 }
+
+test('GitHub session expiry preserves login provider without navigating away from drafts', async () => {
+  let next;
+  const ctx = {
+    SESSION: { github_login: true, token_login: false },
+    workbenchRevision: 0, editingIssueNum: null, editDrawerGen: 0, sessionEpoch: 1,
+    AUTH_REQUIRED: true, IS_AUTHENTICATED: true,
+    fetch: async () => ({ ok: false, status: 403, text: async () => '{"error":"triage permission required"}' }),
+    appUrl: x => x, freezeSessionDrafts() {}, stripWorkbenchFromDataset() {},
+    applySessionState: value => { next = value; },
+    openAuthModal: () => assert.fail('must not discard drafts by redirecting automatically'),
+  };
+  vm.createContext(ctx);
+  vm.runInContext(sourceFunction('apiFetch'), ctx);
+  await assert.rejects(ctx.apiFetch('./api/triage/decisions', { method: 'POST' }));
+  assert.equal(next.github_login, true);
+  assert.equal(next.token_login, false);
+  assert.equal(next.authenticated, false);
+});
+
+test('GitHub sign-in and identity display follow session permissions', () => {
+  const elements = {};
+  for (const id of ['permBadge', 'rwBar', 'pendingInboxBtn', 'syncPrsBtn', 'syncIssuesBtn',
+    'authUnlockBtn', 'authLogoutBtn', 'githubSignInBtn', 'githubIdentity', 'pendingCntBadge']) {
+    elements[id] = { hidden: false, textContent: '', classList: { toggle() {} } };
+  }
+  const ctx = {
+    SESSION: { github_login: true, viewer: { login: 'someone' } },
+    CAN_TRIAGE: false, CAN_SYNC: false, AUTH_REQUIRED: true, IS_AUTHENTICATED: false,
+    PENDING: [], RETRIAGE_LIST: [], t: x => x,
+    document: { getElementById: id => elements[id] || null },
+  };
+  vm.createContext(ctx);
+  vm.runInContext(sourceFunction('applySessionChrome'), ctx);
+  ctx.applySessionChrome();
+  assert.equal(elements.githubSignInBtn.hidden, false);
+  assert.equal(elements.authUnlockBtn.hidden, true);
+  ctx.IS_AUTHENTICATED = true;
+  ctx.applySessionChrome();
+  assert.equal(elements.githubSignInBtn.hidden, true);
+  assert.equal(elements.githubIdentity.textContent, '@someone');
+  assert.equal(elements.authLogoutBtn.hidden, false);
+  assert.equal(elements.syncPrsBtn.hidden, true);
+});

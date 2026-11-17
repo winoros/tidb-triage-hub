@@ -37,6 +37,7 @@ import (
 const sessionCookieName = "triage_hub_session"
 
 type Options struct {
+	GitHub            GitHubOptions
 	WebDir            string
 	ReadOnly          bool
 	AuthToken         string
@@ -54,6 +55,7 @@ type cachedIndexAssets struct {
 }
 
 type Server struct {
+	github           *githubAuth
 	store            *store.Store
 	syncer           *syncer.Syncer
 	opts             Options
@@ -81,6 +83,7 @@ func New(st *store.Store, sy *syncer.Syncer, opts Options) *Server {
 	}
 	tok := strings.TrimSpace(opts.AuthToken)
 	s := &Server{
+		github:           newGitHubAuth(),
 		store:            st,
 		syncer:           sy,
 		opts:             opts,
@@ -128,7 +131,7 @@ func (s *Server) Handler() http.Handler {
 		start := time.Now()
 		s.mux.ServeHTTP(rec, r)
 		if r.URL.Path != "/healthz" {
-			log.Printf("%s %s -> %d (%s)", r.Method, r.URL.RequestURI(), rec.code, time.Since(start).Round(time.Millisecond))
+			log.Printf("%s %s -> %d (%s)", r.Method, r.URL.Path, rec.code, time.Since(start).Round(time.Millisecond))
 		}
 	})
 }
@@ -141,7 +144,7 @@ func sessionCookieDigest(secret string) string {
 
 func (s *Server) verifySecretToken(candidate string) bool {
 	if !s.hasAuthToken {
-		return true
+		return false
 	}
 	got := sha256.Sum256([]byte(strings.TrimSpace(candidate)))
 	return subtle.ConstantTimeCompare(got[:], s.authTokenHash[:]) == 1
@@ -189,12 +192,12 @@ func (s *Server) hasInvalidAuthHeader(r *http.Request) bool {
 
 func (s *Server) isRequestAuthenticated(r *http.Request) bool {
 	if !s.hasAuthToken {
-		return true
+		return false
 	}
 	if fields := strings.Fields(r.Header.Get("Authorization")); len(fields) > 0 && strings.EqualFold(fields[0], "Bearer") {
 		return len(fields) == 2 && s.verifySecretToken(fields[1])
 	}
-	if c, err := r.Cookie(sessionCookieName); err == nil {
+	if c, err := r.Cookie(sessionCookieName); err == nil && !s.opts.GitHub.Enabled() {
 		got := sha256.Sum256([]byte(strings.TrimSpace(c.Value)))
 		want := sha256.Sum256([]byte(s.sessionDigest))
 		if subtle.ConstantTimeCompare(got[:], want[:]) == 1 {
@@ -209,12 +212,6 @@ func (s *Server) sessionFor(authenticated bool) model.SessionInfo {
 		return model.SessionInfo{
 			Viewer:      model.Viewer{Login: "viewer", Role: "viewer"},
 			Permissions: model.Permissions{CanTriage: false, CanSync: false},
-		}
-	}
-	if !s.hasAuthToken {
-		return model.SessionInfo{
-			Viewer:      model.Viewer{Login: "local-maintainer", Role: "maintainer"},
-			Permissions: model.Permissions{CanTriage: true, CanSync: true},
 		}
 	}
 	if authenticated {
@@ -235,10 +232,15 @@ func (s *Server) sessionFor(authenticated bool) model.SessionInfo {
 
 // resolveSession resolves RBAC permissions from ReadOnly flag, Bearer token, or maintainer cookie.
 func (s *Server) resolveSession(r *http.Request) model.SessionInfo {
-	if s.opts.ReadOnly || !s.hasAuthToken {
-		return s.sessionFor(true)
+	if s.opts.GitHub.Enabled() {
+		if user, ok := s.githubSession(r); ok {
+			return s.githubSessionInfo(user)
+		}
 	}
-	return s.sessionFor(s.isRequestAuthenticated(r))
+	sess := s.sessionFor(s.isRequestAuthenticated(r))
+	sess.GitHubLogin = s.opts.GitHub.Enabled()
+	sess.TokenLogin = s.hasAuthToken && !s.opts.GitHub.Enabled() && !s.opts.ReadOnly
+	return sess
 }
 
 func (s *Server) requireTriageSession(w http.ResponseWriter, r *http.Request) (model.SessionInfo, bool) {
@@ -365,6 +367,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /assets/i18n/", s.serveI18nAsset("/assets/i18n/"))
 	s.mux.HandleFunc("GET /i18n/", s.serveI18nAsset("/i18n/"))
 	s.mux.HandleFunc("GET /bootstrap.js", s.handleBootstrapJS)
+
+	s.mux.HandleFunc("GET /auth/github", s.handleGitHubLogin)
+	s.mux.HandleFunc("GET /auth/github/callback", s.handleGitHubCallback)
 
 	// REST API
 	s.mux.HandleFunc("GET /api/session", s.handleGetSession)
@@ -536,6 +541,10 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSessionLogin(w http.ResponseWriter, r *http.Request) {
+	if s.opts.GitHub.Enabled() || !s.hasAuthToken {
+		writeErr(w, http.StatusForbidden, fmt.Errorf("token browser login is disabled"))
+		return
+	}
 	if !s.guardMutation(w, r) {
 		return
 	}
@@ -565,7 +574,16 @@ func (s *Server) handleSessionLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeSessionCookie(w, r, "", -1)
-	writeJSON(w, http.StatusOK, s.sessionFor(false))
+	if c, err := r.Cookie(githubCookie); err == nil {
+		s.github.mu.Lock()
+		delete(s.github.sessions, c.Value)
+		s.github.mu.Unlock()
+	}
+	s.githubCookie(w, githubCookie, "", -1)
+	sess := s.sessionFor(false)
+	sess.GitHubLogin = s.opts.GitHub.Enabled()
+	sess.TokenLogin = s.hasAuthToken && !s.opts.GitHub.Enabled() && !s.opts.ReadOnly
+	writeJSON(w, http.StatusOK, sess)
 }
 
 func (s *Server) handleGetStatus(w http.ResponseWriter, r *http.Request) {

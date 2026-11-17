@@ -57,7 +57,7 @@ func TestHTTPReviewVersionsProtectAllMutationAdapters(t *testing.T) {
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("X-Triage-CSRF", "1")
 			response := httptest.NewRecorder()
-			srv.Handler().ServeHTTP(response, req)
+			serveTestRequest(srv, response, req)
 			if response.Code != http.StatusConflict {
 				t.Fatalf("stale %s: HTTP %d %s", action, response.Code, response.Body.String())
 			}
@@ -83,7 +83,7 @@ func TestHTTPPendingAndRestoreKeepReviewedVersions(t *testing.T) {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Triage-CSRF", "1")
 		resp := httptest.NewRecorder()
-		srv.Handler().ServeHTTP(resp, req)
+		serveTestRequest(srv, resp, req)
 		return resp
 	}
 	resp := request(http.MethodPost, "/api/pending/73000/resolve", model.PendingResolveRequest{Action: "exclude", ExpectedVersion: old[0].Version})
@@ -117,7 +117,7 @@ func TestHTTPReviewSnapshotAndErrorContract(t *testing.T) {
 		req.Header.Set("X-Triage-CSRF", "1")
 		req.Header.Set("Content-Type", "application/json")
 		resp := httptest.NewRecorder()
-		srv.Handler().ServeHTTP(resp, req)
+		serveTestRequest(srv, resp, req)
 		return resp
 	}
 	resp := request(http.MethodGet, "/api/state", "")

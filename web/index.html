@@ -1122,6 +1122,8 @@
         <span class="hdr-divider"></span>
       </div>
 
+      <a class="btn" id="githubSignInBtn" href="./auth/github" hidden>Sign in with GitHub</a>
+      <span id="githubIdentity" hidden></span>
       <button type="button" class="btn" id="authUnlockBtn" hidden>
         <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 9.9-1"></path></svg>
         <span data-i18n="report.rw.unlockBtn">Unlock RW</span>
@@ -3250,7 +3252,14 @@
     if (pBtn) pBtn.hidden = !CAN_TRIAGE;
     if (syncPrsBtn) syncPrsBtn.hidden = !CAN_SYNC;
     if (syncIssuesBtn) syncIssuesBtn.hidden = !CAN_SYNC;
-    if (authUnlockBtn) authUnlockBtn.hidden = !(AUTH_REQUIRED && !IS_AUTHENTICATED);
+    var githubSignInBtn = document.getElementById("githubSignInBtn");
+    var githubIdentity = document.getElementById("githubIdentity");
+    if (githubSignInBtn) githubSignInBtn.hidden = !(SESSION.github_login && !IS_AUTHENTICATED);
+    if (githubIdentity) {
+      githubIdentity.hidden = !(SESSION.github_login && IS_AUTHENTICATED);
+      githubIdentity.textContent = SESSION.viewer ? "@" + SESSION.viewer.login : "";
+    }
+    if (authUnlockBtn) authUnlockBtn.hidden = !(AUTH_REQUIRED && !IS_AUTHENTICATED && !SESSION.github_login && SESSION.token_login !== false);
     if (authLogoutBtn) authLogoutBtn.hidden = !(AUTH_REQUIRED && IS_AUTHENTICATED);
     if (CAN_TRIAGE && pBtn) {
       document.getElementById("pendingCntBadge").textContent = actionCnt;
@@ -3485,6 +3494,10 @@
   });
 
   function openAuthModal() {
+    if (SESSION.github_login) {
+      window.location.assign("./auth/github");
+      return;
+    }
     var inp = document.getElementById("authTokenInput");
     if (!inp) return;
     inp.value = "";
@@ -3588,6 +3601,7 @@
   document.getElementById("editReviewLatestBtn").addEventListener("click", reviewLatestEdit);
 
   function apiFetch(subpath, opts) {
+    var authSettings = typeof SESSION === "object" ? SESSION : {};
     var requestEpoch = sessionEpoch;
     var requestEdit = { number: editingIssueNum, generation: editDrawerGen };
     var reqOpts = opts ? Object.assign({}, opts) : {};
@@ -3614,9 +3628,11 @@
               viewer: { login: "viewer", role: "viewer" },
               permissions: { can_triage: false, can_sync: false },
               auth_required: true,
+              github_login: Boolean(authSettings.github_login),
+              token_login: authSettings.token_login,
               authenticated: false
             });
-            openAuthModal();
+            if (!authSettings.github_login) openAuthModal();
           }
           var msg = errMsg || ("HTTP " + res.status + (res.statusText ? " " + res.statusText : ""));
           var err = new Error(msg);

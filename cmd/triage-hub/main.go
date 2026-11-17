@@ -170,6 +170,11 @@ func newServeFlagSet() *flag.FlagSet {
 	fs.String("seed-json", "seed/initial_dataset.json", "Initial seed dataset JSON (falls back to embedded seed if absent)")
 	fs.String("scripts-dir", "", "Deprecated (no-op): sync is now pure Go")
 	fs.String("auth-token", strings.TrimSpace(os.Getenv("TRIAGE_HUB_TOKEN")), "Shared maintainer token required for RW mutations & remote CLI (env: TRIAGE_HUB_TOKEN)")
+	fs.String("github-client-id", os.Getenv("TRIAGE_HUB_GITHUB_CLIENT_ID"), "GitHub OAuth app client ID")
+	fs.String("github-client-secret", os.Getenv("TRIAGE_HUB_GITHUB_CLIENT_SECRET"), "GitHub OAuth app client secret")
+	fs.String("github-callback-url", os.Getenv("TRIAGE_HUB_GITHUB_CALLBACK_URL"), "GitHub OAuth callback URL (https://host/auth/github/callback)")
+	fs.String("github-maintainer-ids", os.Getenv("TRIAGE_HUB_GITHUB_MAINTAINER_IDS"), "Comma-separated additional GitHub user IDs permitted to modify data")
+	fs.Int64("github-owner-id", 7846227, "GitHub user ID permitted to modify data (default: winoros)")
 	fs.Bool("trust-proxy", envBoolDefault("TRIAGE_HUB_TRUST_PROXY", false), "Trust rightmost X-Forwarded-Proto / X-Forwarded-Host hop from loopback/private reverse proxies (env: TRIAGE_HUB_TRUST_PROXY)")
 	fs.String("trusted-proxy-cidrs", envOrDefault("TRIAGE_HUB_TRUSTED_PROXY_CIDRS", ""), "Optional comma-separated proxy CIDRs/IPs trusted when --trust-proxy is set (env: TRIAGE_HUB_TRUSTED_PROXY_CIDRS)")
 	fs.Bool("readonly", false, "Serve dashboard in read-only mode (disable all triage edits & sync mutations)")
@@ -255,6 +260,20 @@ func executeServe(args []string, stdout io.Writer) error {
 	addr := getStr("addr")
 	portFlag := getStr("port")
 	authToken := strings.TrimSpace(getStr("auth-token"))
+	github := server.GitHubOptions{
+		ClientID:     strings.TrimSpace(getStr("github-client-id")),
+		ClientSecret: strings.TrimSpace(getStr("github-client-secret")),
+		CallbackURL:  strings.TrimSpace(getStr("github-callback-url")),
+		OwnerID:      fs.Lookup("github-owner-id").Value.(flag.Getter).Get().(int64),
+	}
+	maintainerIDs, err := server.ParseGitHubMaintainerIDs(getStr("github-maintainer-ids"))
+	if err != nil {
+		return fmt.Errorf("--github-maintainer-ids: %w", err)
+	}
+	github.MaintainerIDs = maintainerIDs
+	if err := github.Validate(); err != nil {
+		return err
+	}
 	trustProxy := getBool("trust-proxy")
 	trustedProxyCIDRs := strings.TrimSpace(getStr("trusted-proxy-cidrs"))
 	if trustedProxyCIDRs != "" {
@@ -308,8 +327,8 @@ func executeServe(args []string, stdout io.Writer) error {
 		listenAddr = "127.0.0.1:" + p
 	}
 
-	if !readOnly && authToken == "" && !isLoopbackListenAddr(listenAddr) {
-		log.Printf("[SECURITY WARNING] listening on non-loopback address %s WITHOUT --auth-token (TRIAGE_HUB_TOKEN) or --readonly; any network visitor will have full RW access!", listenAddr)
+	if !readOnly && authToken == "" && !github.Enabled() {
+		log.Printf("[auth] listening on %s without authentication configured; HTTP modifications are disabled", listenAddr)
 	}
 
 	sigCtx, stopSig := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -322,6 +341,7 @@ func executeServe(args []string, stdout io.Writer) error {
 	}
 
 	srv := server.New(st, sy, server.Options{
+		GitHub:            github,
 		WebDir:            webDir,
 		ReadOnly:          readOnly,
 		AuthToken:         authToken,
