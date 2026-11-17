@@ -38,18 +38,23 @@ Use this workflow whenever syncing GitHub issues/PRs or performing AI-assisted t
        ```
      - When an issue has no PR yet, inspect full comments (`gh issue view <num> --repo pingcap/tidb --comments`) and, if a local TiDB checkout is available (note: `tidb-triage-hub` does **not** contain TiDB source), inspect `pkg/planner/`, `pkg/statistics/`, `pkg/bindinfo/`, `pkg/util/ranger/`.
      - Grade `cat` (Difficulty) and `severity` independently using Section 2.4 and `triage_rubric.severity_guide` (low-confidence items pre-fill `"TODO: REVIEW"` in `decisions_template`).
-5. **Dry-run & apply decisions via stdin** (no temporary files needed; **always carry `base_exported_at`** from the `pending` bundle's `exported_at_utc` — plus per-item `if_unmodified_since` from `decisions_template.new_issues` (`sync_watermark`) or `retriage_candidates[].triaged_at` — so concurrent sync/Web UI updates are protected; note that `{new_issues, exclude_issues, overrides, notes, ack_retriage}` are strictly mutually exclusive per issue):
+5. **Dry-run & apply decisions via stdin** (no temporary files needed; **preserve `decisions_template.expected_versions` unchanged**, including entries for issues moved to `exclude_issues`, `ack_retriage`, `notes` or `manual_pr_links`. Per-item `expected_version` must match the exported entry. Versions bind decisions to the reviewed facts; never substitute a newly fetched version without re-reviewing. Old timestamp guards remain a compatibility fallback. `{new_issues, exclude_issues, overrides, notes, ack_retriage}` are strictly mutually exclusive per issue):
+   The versions below are illustrative; use the actual versions from your export.
    ```bash
    ./bin/triage-hub triage --stdin --dry-run <<'EOF'
    {
-     "base_exported_at": "2026-11-13T15:00:00.000000000Z",
+     "expected_versions": {
+       "73100": {"review": 7, "notes": 1},
+       "73101": {"review": 3, "notes": 1},
+       "73063": {"review": 12, "notes": 2}
+     },
      "new_issues": {
        "73100": {
          "cat": "EASY",
          "severity": "MAJOR",
          "subsystem": "plan_cache_spm_hint",
          "is_borderline_kept": false,
-         "if_unmodified_since": "2026-11-13T14:58:00.000000000Z",
+         "expected_version": {"review": 7, "notes": 1},
          "note": {
            "zh-CN": "`planCacheKey` 漏编码影响常量折叠的会话变量导致 Prepared Plan Cache 返回过期结果",
            "en": "`planCacheKey` omits session variable affecting constant folding, causing stale Prepared Plan Cache results"
@@ -65,7 +70,7 @@ Use this workflow whenever syncing GitHub issues/PRs or performing AI-assisted t
    }
    EOF
    ```
-   Once `--dry-run` passes with zero errors, re-run without `--dry-run` (add `--skip-todo` if submitting a partial batch). Note that applying `triage` defaults to `--sync-new-prs=true` (requires `>=20` GraphQL points via `--min-quota`; pass `--sync-new-prs=false` if offline or low on quota).
+   Once `--dry-run` passes with zero errors, re-run without `--dry-run` (apply checks versions again; a dry run does not reserve the snapshot) (add `--skip-todo` if submitting a partial batch). Submitting `triage` does not fetch GitHub. Refresh with `sync-prs` / `sync-issues` before exporting and reviewing; `--sync-new-prs` and the triage `--min-quota` option are deprecated no-ops. To add a template-external issue, export and review it first; never synthesize its expected version.
 
 ## 2. Hard Invariants & Boundary Rules
 
@@ -94,6 +99,8 @@ Use this workflow whenever syncing GitHub issues/PRs or performing AI-assisted t
    - `label_scope_changed`: If `sig/planner` was removed and the issue is non-optimizer, it is no longer canonical-protected and can go to `"exclude_issues"`; if `duplicate`/`wontfix` or `type/enhancement` was added, update `"overrides"`.
    - `substantive_new_comments`: If root cause, subsystem, or validity (`not a bug`) pivoted, submit `"overrides"`; if comments only confirm current diagnosis, `"ack_retriage"`.
    - If a PR is mentioned in comments without automatic Timeline linking, attach it via `"manual_pr_links": {"73100": ["pingcap/tidb#73200"]}`.
+   - Linking does not fetch GitHub. Run `sync-prs` before the next review; unresolved links are included even for filtered issues. If the lookup reports the PR unavailable, the relationship remains but automatic retries stop. Check the PR/access and retry with `sync-prs --pr <spec>`.
+   - `pending` reuses matching file evidence. On a read-only database it exports persisted evidence without fetching or inventing a new version; refresh on the writable owner before reviewing newer facts.
 6. **Bilingual Note Quality Gate**:
    - Formula: `[Origin tag if borderline] + <Component/Func> + <specific flaw> + <user-visible symptom>`.
    - Target `25–85` Chinese chars (`zh-CN`) and `50–170` English chars (`en`). Note: `--dry-run` hard-blocks unmatched backticks, missing Chinese in `zh-CN`, identical `zh-CN`/`en`, empty fields, or `TODO:`, while length outliers (`<12`/`>140` zh, `<25`/`>260` en) emit warnings unless `--strict-notes` is passed.
@@ -103,7 +110,7 @@ Use this workflow whenever syncing GitHub issues/PRs or performing AI-assisted t
 
 ```bash
 # Backfill bilingual root-cause notes for top 10 highest-priority unnoted real bugs (filterable with `--cat HARD|MEDIUM|EASY`)
-# Emits `decisions_template.notes` (`{"zh-CN": "...", "en": "...", "if_unmodified_since": "..."}`), stored orthogonally in `issue_notes`
+# Emits `decisions_template.notes` (`{"zh-CN": "...", "en": "...", "expected_version": {"review": 12, "notes": 2}}`), stored orthogonally in `issue_notes`
 # (single-locale updates preserve the other locale; `Reset Override` preserves backfilled notes; does NOT alter classification or clear `needs_retriage`).
 ./bin/triage-hub pending --backfill-notes 10 --cat HARD
 

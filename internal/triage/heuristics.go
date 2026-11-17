@@ -410,108 +410,64 @@ func FilterRelevantKernelPRs(prs []model.LinkedPRRef) []model.LinkedPRRef {
 	return out
 }
 
-func isCachedPRDetailFresh(prev model.PendingPRDetail, pr model.LinkedPRRef) bool {
-	if prev.State == "" || prev.State == model.PRStateUnknown {
-		return false
-	}
-	if pr.State == model.PRStateUnknown {
-		return true
-	}
-	if pr.UpdatedAt == "" {
-		return prev.State == pr.State
-	}
-	if prev.UpdatedAt == "" {
-		return false
-	}
-	cmp := model.CompareRFC3339(prev.UpdatedAt, pr.UpdatedAt)
-	if cmp < 0 {
-		return false
-	}
-	if cmp > 0 {
-		return true
-	}
-	return prev.State == pr.State
+// mergePRDetail uses the same observation and evidence policy as canonical storage.
+func mergePRDetail(pr model.LinkedPRRef, d model.PendingPRDetail) model.LinkedPRRef {
+	fact, _ := model.MergePRObservation(pr.Facts(), d.Facts(), false, false)
+	return pr.WithFacts(fact)
 }
 
-// SyncPRRefsWithDetails updates a slice of LinkedPRRefs monotonically using fetched PendingPRDetails
-// (propagating State, UpdatedAt, MergedAt, Title, and IsCherryPick when the detail is at least as fresh)
-// and returns the filtered relevant PRDetails slice for clue extraction and triage suggestions.
-func SyncPRRefsWithDetails(
-	prs []model.LinkedPRRef,
-	detailMap map[string]model.PendingPRDetail,
-) ([]model.LinkedPRRef, []model.PendingPRDetail) {
+func isCachedPRDetailFresh(d model.PendingPRDetail, pr model.LinkedPRRef) bool {
+	if d.State == "" || d.State == model.PRStateUnknown {
+		return false
+	}
+	return model.PRDetailFresh(d, mergePRDetail(pr, d))
+}
+
+// SyncPRRefsWithDetails projects accepted facts and returns only evidence that
+// matches them. Stale detail caches cannot supply clues after a failed fetch.
+func SyncPRRefsWithDetails(prs []model.LinkedPRRef, detailMap map[string]model.PendingPRDetail) ([]model.LinkedPRRef, []model.PendingPRDetail) {
 	if len(prs) == 0 {
 		return prs, nil
 	}
-	syncedPRs := make([]model.LinkedPRRef, len(prs))
-	copy(syncedPRs, prs)
-	if len(detailMap) == 0 {
-		return syncedPRs, nil
-	}
-	for j := range syncedPRs {
-		d, ok := detailMap[model.PRKey(syncedPRs[j].Repo, syncedPRs[j].Num)]
-		if !ok {
-			continue
-		}
-		canApply := false
-		switch {
-		case syncedPRs[j].State == "" || syncedPRs[j].State == model.PRStateUnknown:
-			canApply = d.State != "" && d.State != model.PRStateUnknown
-		case syncedPRs[j].UpdatedAt == "":
-			canApply = d.State != "" && d.State != model.PRStateUnknown
-		case d.UpdatedAt != "":
-			cmp := model.CompareRFC3339(d.UpdatedAt, syncedPRs[j].UpdatedAt)
-			canApply = cmp > 0 || (cmp == 0 && !(syncedPRs[j].State == "MERGED" && d.State != "MERGED"))
-		}
-		if canApply {
-			if d.State != "" && d.State != model.PRStateUnknown {
-				syncedPRs[j].State = d.State
-			}
-			if d.UpdatedAt != "" {
-				syncedPRs[j].UpdatedAt = d.UpdatedAt
-			}
-			if syncedPRs[j].State == "MERGED" {
-				if d.MergedAt != "" {
-					syncedPRs[j].MergedAt = d.MergedAt
-				}
-			} else {
-				syncedPRs[j].MergedAt = ""
-			}
-			if syncedPRs[j].State == "CLOSED" {
-				syncedPRs[j].AckAt = ""
-			}
-			if d.Title != "" {
-				syncedPRs[j].Title = d.Title
-			}
-			syncedPRs[j].IsCherryPick = d.IsCherryPick
-		} else if syncedPRs[j].State == "MERGED" && syncedPRs[j].MergedAt == "" && d.MergedAt != "" {
-			syncedPRs[j].MergedAt = d.MergedAt
-		}
-	}
-	issuesync.SortLinkedPRRefs(syncedPRs)
-	var dets []model.PendingPRDetail
-	for _, pr := range FilterRelevantKernelPRs(syncedPRs) {
+	synced := append([]model.LinkedPRRef(nil), prs...)
+	for i, pr := range synced {
 		if d, ok := detailMap[model.PRKey(pr.Repo, pr.Num)]; ok {
-			dets = append(dets, d)
+			synced[i] = mergePRDetail(pr, d)
 		}
 	}
-	return syncedPRs, dets
+	issuesync.SortLinkedPRRefs(synced)
+	var details []model.PendingPRDetail
+	for _, pr := range FilterRelevantKernelPRs(synced) {
+		if d, ok := detailMap[model.PRKey(pr.Repo, pr.Num)]; ok {
+			if evidence, matches := d.ForFacts(pr); matches {
+				details = append(details, evidence)
+			}
+		}
+	}
+	return synced, details
 }
 
 // CandidateNeedsPREnrichment reports whether any active/merged kernel mainline PR on `c`
-// lacks cached PRDetails or has changed state/updatedAt since it was last enriched.
+// lacks matching files or current prose for its accepted PR facts.
 func CandidateNeedsPREnrichment(c model.PendingCandidate) bool {
-	detailMap := make(map[string]model.PendingPRDetail, len(c.PRDetails))
-	for _, d := range c.PRDetails {
-		detailMap[model.PRKey(d.Repo, d.Num)] = d
+	return len(PRsNeedingEnrichment(c.PRs, c.PRDetails)) > 0
+}
+
+// PRsNeedingEnrichment requires both matching file identities and current prose.
+// File evidence remains usable while an outdated body waits for refresh.
+func PRsNeedingEnrichment(prs []model.LinkedPRRef, details []model.PendingPRDetail) []model.LinkedPRRef {
+	byKey := make(map[string]model.PendingPRDetail, len(details))
+	for _, d := range details {
+		byKey[model.PRKey(d.Repo, d.Num)] = d
 	}
-	for _, pr := range FilterRelevantKernelPRs(c.PRs) {
-		prev, ok := detailMap[model.PRKey(pr.Repo, pr.Num)]
-		if !ok || !isCachedPRDetailFresh(prev, pr) {
-			return true
+	var missing []model.LinkedPRRef
+	for _, pr := range FilterRelevantKernelPRs(prs) {
+		d, ok := byKey[model.PRKey(pr.Repo, pr.Num)]
+		if !ok || !isCachedPRDetailFresh(d, pr) {
+			missing = append(missing, pr)
 		}
 	}
-	return false
+	return missing
 }
 
 // EnrichAndAnalyzePending enriches pending candidates with PR file stats (when fetchPRFiles is true)

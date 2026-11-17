@@ -24,7 +24,6 @@ import (
 	"github.com/winoros/tidb-triage-hub/internal/server"
 	"github.com/winoros/tidb-triage-hub/internal/store"
 	"github.com/winoros/tidb-triage-hub/internal/syncer"
-	"github.com/winoros/tidb-triage-hub/internal/triage"
 	seedassets "github.com/winoros/tidb-triage-hub/seed"
 )
 
@@ -654,8 +653,8 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 	strictNotes := fs.Bool("strict-notes", false, "Fail on soft note length/borderline warnings")
 	skipConflicts := fs.Bool("skip-conflicts", false, "Skip items modified concurrently (e.g. via Web UI) instead of failing batch (defaults to true with --remote)")
 	dryRun := fs.Bool("dry-run", false, "Validate decisions JSON and preview actions without writing to SQLite")
-	syncNewPRs := fs.Bool("sync-new-prs", true, "Automatically fetch & classify open PRs linked to newly accepted issues")
-	minQuota := fs.Int("min-quota", 20, "Minimum GraphQL points required when --sync-new-prs triggers")
+	syncNewPRs := fs.Bool("sync-new-prs", false, "Deprecated: submissions do not fetch GitHub; refresh PRs before exporting decisions")
+	minQuota := fs.Int("min-quota", 20, "Deprecated: retained for command-line compatibility")
 	autoBackup := fs.Bool("auto-backup", envBoolDefault("TRIAGE_HUB_AUTO_BACKUP", true), "Automatically download a local SQLite backup after remote triage succeeds (env: TRIAGE_HUB_AUTO_BACKUP)")
 	backupPath := fs.String("backup-path", envOrDefault("TRIAGE_HUB_BACKUP_PATH", "data/remote_backup.db"), "Destination path for automatic post-triage remote SQLite backup")
 	timeout := fs.Duration("timeout", 2*time.Minute, "Command timeout")
@@ -731,39 +730,25 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 	}
 
 	// Local pre-flight syntax & rubric validation (fast-fail before network or SQLite)
-	cleaned, warnings, err := triage.ValidateAndPrepareDecisions(dec, triage.ValidateOptions{
-		SkipTodo:       *skipTodo,
-		AllowEmptyNote: *allowEmptyNote,
-		StrictNotes:    *strictNotes,
-	})
+	req := syncer.BatchTriageExecuteRequest{
+		Decisions: dec, SkipTodo: *skipTodo, AllowEmptyNote: *allowEmptyNote,
+		StrictNotes: *strictNotes, SkipConflicts: effectiveSkipConflicts,
+		DryRun: *dryRun, SyncNewPRs: syncNewPRs, MinQuota: minQuota,
+	}
+
+	prepared, err := syncer.PrepareBatchTriage(req)
 	if err != nil {
 		return fmt.Errorf("triage validation failed: %w", err)
 	}
-	if !syncer.HasActionableDecisions(cleaned) {
-		return fmt.Errorf("no actionable entries remaining after validation (check if all entries were skipped by --skip-todo)")
-	}
-
-	for _, w := range warnings {
+	for _, w := range prepared.SyntaxPreview().ValidationWarnings {
 		fmt.Fprintf(stderr, "[warn] issue #%d (%s): %s\n", w.Issue, w.Field, w.Message)
 	}
-
 	if rem.enabled() {
 		rc, err := newRemoteClient(*rem, *timeout)
 		if err != nil {
 			return err
 		}
-		syncFlag := *syncNewPRs
-		mqFlag := *minQuota
-		out, err := rc.postTriageDecisions(context.Background(), syncer.BatchTriageExecuteRequest{
-			Decisions:      cleaned,
-			SkipTodo:       false,
-			AllowEmptyNote: *allowEmptyNote,
-			StrictNotes:    *strictNotes,
-			SkipConflicts:  effectiveSkipConflicts,
-			DryRun:         *dryRun,
-			SyncNewPRs:     &syncFlag,
-			MinQuota:       &mqFlag,
-		})
+		out, err := rc.postTriageDecisions(context.Background(), req)
 		if err != nil {
 			return fmt.Errorf("apply remote triage decisions: %w", err)
 		}
@@ -795,11 +780,7 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	applyOpts := store.BatchApplyOptions{SkipConflicts: effectiveSkipConflicts}
 	if *dryRun {
-		dbChecked := false
-		planned := cleaned
-		var dryConflicts []model.TriageConflict
 		dbExists := false
 		if resolvedDB := store.ResolveLocalDBPath(*dbPath); resolvedDB != "" {
 			if _, statErr := os.Stat(resolvedDB); statErr == nil {
@@ -813,23 +794,27 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 			explicitSeedPath = strings.TrimSpace(*seedPath)
 		}
 		if dbExists || explicitSeedPath != "" {
-			st, _, cleanup, openErr := openStoreAndSyncerMaybeDryRun(*dbPath, explicitSeedPath, nil, true)
+			sp, fb := resolveSeedFallback(fs, *seedPath)
+			_, sy, cleanup, openErr := openStoreAndSyncerMaybeDryRun(*dbPath, sp, fb, true)
 			if openErr != nil {
 				return fmt.Errorf("open dataset for dry-run check: %w", openErr)
 			}
-			pl, cfl, valErr := st.PlanBatchDecisionsWithOptions(cleaned, applyOpts)
+			out, execErr := sy.ExecutePreparedBatchTriage(ctx, prepared)
 			cleanup()
-			if valErr != nil {
-				return fmt.Errorf("triage database validation failed: %w", valErr)
+			if execErr != nil {
+				return fmt.Errorf("triage database validation failed: %w", execErr)
 			}
-			planned = pl
-			dryConflicts = cfl
-			dbChecked = true
+			result := out.Preview
+
+			if len(result.SkippedConflicts) > 0 {
+				for _, c := range result.SkippedConflicts {
+					fmt.Fprintf(stderr, "[conflict-skipped] issue #%d (%s): %s\n", c.Issue, c.Action, c.Message)
+				}
+			}
+			writePrettyJSONTo(stdout, result)
+			return nil
 		}
-		out := syncer.FormatDryRunBatchResult(planned, dbChecked, warnings, dryConflicts)
-		for _, c := range dryConflicts {
-			fmt.Fprintf(stderr, "[conflict-skipped] issue #%d (%s): %s\n", c.Issue, c.Action, c.Message)
-		}
+		out := prepared.SyntaxPreview()
 		writePrettyJSONTo(stdout, out)
 		return nil
 	}
@@ -841,16 +826,14 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 	}
 	defer st.Close()
 
-	res, err := sy.ApplyTriageDecisionsWithOptions(ctx, cleaned, applyOpts, *syncNewPRs, *minQuota)
+	out, err := sy.ExecutePreparedBatchTriage(ctx, prepared)
 	if err != nil {
 		return fmt.Errorf("apply triage decisions: %w", err)
 	}
-	res.ValidationWarnings = warnings
+	res := out.Applied
+
 	for _, c := range res.SkippedConflicts {
 		fmt.Fprintf(stderr, "[conflict-skipped] issue #%d (%s): %s\n", c.Issue, c.Action, c.Message)
-	}
-	if res.PRSyncWarning != "" {
-		fmt.Fprintf(stderr, "[warn] %s\n", res.PRSyncWarning)
 	}
 	writePrettyJSONTo(stdout, res)
 	return nil

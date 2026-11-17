@@ -20,6 +20,8 @@ fragment PRStatusFields on PullRequest {
   title
   url
   baseRefName
+  headRefOid
+  baseRefOid
   state
   isDraft
   mergeable
@@ -27,7 +29,7 @@ fragment PRStatusFields on PullRequest {
   updatedAt
   mergedAt
   author { login }
-  labels(first: 30) { nodes { name } }
+  labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
   reviewRequests(first: 15) {
     nodes {
       requestedReviewer {
@@ -111,19 +113,24 @@ type gqlPRNode struct {
 	Title       string `json:"title"`
 	URL         string `json:"url"`
 	BaseRefName string `json:"baseRefName"`
+	HeadOID     string `json:"headRefOid"`
+	BaseOID     string `json:"baseRefOid"`
 	State       string `json:"state"`
 	IsDraft     bool   `json:"isDraft"`
 	Mergeable   string `json:"mergeable"`
 	CreatedAt   string `json:"createdAt"`
 	UpdatedAt   string `json:"updatedAt"`
 	MergedAt    string `json:"mergedAt"`
-	Author    *struct {
+	Author      *struct {
 		Login string `json:"login"`
 	} `json:"author"`
 	Labels struct {
 		Nodes []struct {
 			Name string `json:"name"`
 		} `json:"nodes"`
+		PageInfo *struct {
+			HasNextPage bool `json:"hasNextPage"`
+		} `json:"pageInfo"`
 	} `json:"labels"`
 	ReviewRequests struct {
 		Nodes []struct {
@@ -293,6 +300,7 @@ func toRawPRInput(repo string, sources []string, n gqlPRNode) RawPRInput {
 	}
 
 	return RawPRInput{
+		HeadOID: n.HeadOID, BaseOID: n.BaseOID,
 		Repo:               repo,
 		Number:             n.Number,
 		Title:              n.Title,
@@ -307,6 +315,7 @@ func toRawPRInput(repo string, sources []string, n gqlPRNode) RawPRInput {
 		MergedAt:           n.MergedAt,
 		LastCommitAt:       lastCommitAt,
 		Labels:             labels,
+		LabelsComplete:     n.Labels.PageInfo != nil && !n.Labels.PageInfo.HasNextPage,
 		RequestedReviewers: reqRevs,
 		OpinionatedReviews: opRevs,
 		RecentReviews:      recRevs,
@@ -365,15 +374,16 @@ func ParsePRSpecs(spec string, defaultRepo string) ([]PRTarget, error) {
 }
 
 type FetchStats struct {
-	GraphQLCalls       int    `json:"graphql_calls"`
-	GraphQLCost        int    `json:"graphql_cost"`
-	RateLimitLimit     int    `json:"rate_limit_limit,omitempty"`
-	RateLimitRemaining int    `json:"rate_limit_remaining,omitempty"`
-	RateLimitResetUTC8 string `json:"rate_limit_reset_utc8,omitempty"`
-	TotalFetched       int    `json:"total_fetched"`
-	OpenCount          int    `json:"open_count"`
-	ClosedCount        int    `json:"closed_count"`
-	DurationMs         int    `json:"duration_ms"`
+	UnavailablePRs     []PRTarget `json:"unavailable_prs,omitempty"`
+	GraphQLCalls       int        `json:"graphql_calls"`
+	GraphQLCost        int        `json:"graphql_cost"`
+	RateLimitLimit     int        `json:"rate_limit_limit,omitempty"`
+	RateLimitRemaining int        `json:"rate_limit_remaining,omitempty"`
+	RateLimitResetUTC8 string     `json:"rate_limit_reset_utc8,omitempty"`
+	TotalFetched       int        `json:"total_fetched"`
+	OpenCount          int        `json:"open_count"`
+	ClosedCount        int        `json:"closed_count"`
+	DurationMs         int        `json:"duration_ms"`
 }
 
 func FetchAndClassifyBatch(ctx context.Context, targets []PRTarget, batchSize int) ([]model.PRStatus, FetchStats, error) {
@@ -414,6 +424,7 @@ func FetchAndClassifyBatchWithRunner(
 		name  string
 		items []PRTarget
 	}
+	var unavailable []PRTarget
 	var jobs []batchJob
 	repos := make([]string, 0, len(byRepo))
 	for r := range byRepo {
@@ -544,8 +555,19 @@ func FetchAndClassifyBatchWithRunner(
 
 			localOut := make([]model.PRStatus, 0, len(jb.items))
 			for _, it := range jb.items {
-				node := resp.Data.Repository[fmt.Sprintf("p%d", it.Number)]
+				node, present := resp.Data.Repository[fmt.Sprintf("p%d", it.Number)]
+				if !present {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("graphql omitted requested PR %s#%d", jb.repo, it.Number)
+					}
+					mu.Unlock()
+					return
+				}
 				if node == nil {
+					mu.Lock()
+					unavailable = append(unavailable, it)
+					mu.Unlock()
 					continue
 				}
 				rawIn := toRawPRInput(jb.repo, srcByNum[it.Number], *node)
@@ -588,7 +610,14 @@ func FetchAndClassifyBatchWithRunner(
 	if rlRemaining < 0 {
 		rlRemaining = 0
 	}
+	sort.Slice(unavailable, func(i, j int) bool {
+		if unavailable[i].Repo != unavailable[j].Repo {
+			return unavailable[i].Repo < unavailable[j].Repo
+		}
+		return unavailable[i].Number < unavailable[j].Number
+	})
 	stats := FetchStats{
+		UnavailablePRs:     unavailable,
 		GraphQLCalls:       calls,
 		GraphQLCost:        totalCost,
 		RateLimitLimit:     rlLimit,

@@ -84,12 +84,34 @@ func ValidateAndPrepareDecisions(
 	dec model.BatchTriageDecisions,
 	opts ValidateOptions,
 ) (model.BatchTriageDecisions, []ValidationWarning, error) {
+	var protocolErr error
+	dec, protocolErr = model.NormalizeBatchReviewProtocol(dec)
+	if protocolErr != nil {
+		return dec, nil, protocolErr
+	}
 	out := model.BatchTriageDecisions{
 		NewIssues:     make(map[string]model.TriagePatchRequest),
 		ExcludeIssues: make(map[string]string),
 		Overrides:     make(map[string]model.TriagePatchRequest),
 		Notes:         make(map[string]model.NotePatchRequest),
 		ManualPRLinks: make(map[string][]string),
+	}
+	if dec.ExpectedVersions != nil {
+		out.ExpectedVersions = make(map[string]model.ReviewVersion, len(dec.ExpectedVersions))
+		for k, v := range dec.ExpectedVersions {
+			num, err := normalizeIssueKey(k)
+			if err != nil {
+				return out, nil, err
+			}
+			key := strconv.Itoa(num)
+			if _, exists := out.ExpectedVersions[key]; exists {
+				return out, nil, fmt.Errorf("duplicate issue #%d in expected_versions", num)
+			}
+			if v.Review <= 0 || v.Notes <= 0 {
+				return out, nil, fmt.Errorf("issue #%d: expected_versions requires positive review and notes counters", num)
+			}
+			out.ExpectedVersions[key] = v
+		}
 	}
 	if rawBase := strings.TrimSpace(dec.BaseExportedAt); rawBase != "" {
 		norm, ok := model.NormalizeRFC3339NanoFixed(rawBase)

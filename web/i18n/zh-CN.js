@@ -53,7 +53,6 @@ SiteI18n.extend("zh-CN", {
       "toastPrSynced": "已刷新 {open} 个开放 PR 状态（{calls} 次 GraphQL，耗时 {ms}ms）",
       "toastIssueSynced": "已完成双流增量同步（待分拣新单 {pending} 条）",
       "toastPendingResolved": "已处理待分拣单据 #{num}",
-      "toastPendingSyncWarn": "已处理 #{num}（实时 PR 刷新跳过：{warn}）",
       "toastRetriageAcked": "已确认维持 Issue #{num} 的当前分级",
       "toastRetriageBatchAcked": "已批量确认维持 {count} 条单据的当前分级",
       "toastIssueExcluded": "已将补充单 #{num} 移入排除名单",
@@ -67,6 +66,7 @@ SiteI18n.extend("zh-CN", {
         "substantive_new_comments": "新增实质性讨论"
       },
       "drawer": {
+        "issueUnavailable": "Issue #{num} 已移出活跃列表，编辑窗口已关闭；请从当前队列重新查看。",
         "title": "校准 Issue #{num}",
         "inspectTitle": "Issue #{num} 研判详情",
         "close": "关闭",
@@ -125,6 +125,10 @@ SiteI18n.extend("zh-CN", {
         "suggestedBadge": "预判 ({confidence})",
         "suggestedSignals": "命中信号",
         "prFilesSummary": "主干 PR #{num}：非测试文件 {nonTest} 个 (+{add}/-{del}) · 测试 {test} 个",
+        "savedRefreshFailed": "已保存，但刷新结果失败；再次操作前请检查最新状态。",
+        "missingReviewVersion": "审核数据不完整，请刷新后再确认。",
+        "staleDraft": "此草稿基于较早的数据，请先审核最新内容再提交。",
+        "reviewLatest": "审核最新内容",
         "canonicalExcludeTip": "标准集单据 (sig/planner + type/bug) 不可排除，请使用筛除分类入库",
         "scopesLabel": "命中规则",
         "bodySummary": "查看正文与最近评论 ({comments})",

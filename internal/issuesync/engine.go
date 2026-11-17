@@ -176,6 +176,8 @@ type gqlPRSearchNode struct {
 	Body        string `json:"body"`
 	URL         string `json:"url"`
 	BaseRefName string `json:"baseRefName"`
+	HeadOID     string `json:"headRefOid"`
+	BaseOID     string `json:"baseRefOid"`
 	State       string `json:"state"`
 	IsDraft     bool   `json:"isDraft"`
 	UpdatedAt   string `json:"updatedAt"`
@@ -184,6 +186,9 @@ type gqlPRSearchNode struct {
 		Nodes []struct {
 			Name string `json:"name"`
 		} `json:"nodes"`
+		PageInfo *struct {
+			HasNextPage bool `json:"hasNextPage"`
+		} `json:"pageInfo"`
 	} `json:"labels"`
 	Repo struct {
 		NameWithOwner string `json:"nameWithOwner"`
@@ -325,6 +330,8 @@ type gqlTimelinePR struct {
 	State       string `json:"state"`
 	IsDraft     bool   `json:"isDraft"`
 	BaseRefName string `json:"baseRefName"`
+	HeadOID     string `json:"headRefOid"`
+	BaseOID     string `json:"baseRefOid"`
 	URL         string `json:"url"`
 	UpdatedAt   string `json:"updatedAt"`
 	MergedAt    string `json:"mergedAt"`
@@ -332,6 +339,9 @@ type gqlTimelinePR struct {
 		Nodes []struct {
 			Name string `json:"name"`
 		} `json:"nodes"`
+		PageInfo *struct {
+			HasNextPage bool `json:"hasNextPage"`
+		} `json:"pageInfo"`
 	} `json:"labels"`
 	Repo struct {
 		NameWithOwner string `json:"nameWithOwner"`
@@ -399,6 +409,8 @@ func (it gqlFullIssueNode) toLiveUpdate() LiveIssueUpdate {
 			pr.Repo.NameWithOwner, pr.Number, pr.Title, pr.State, pr.IsDraft,
 			pr.URL, pr.UpdatedAt, pr.labelNames(), pr.BaseRefName, model.LinkSourceTimeline,
 		)
+		ref.HeadOID, ref.BaseOID = pr.HeadOID, pr.BaseOID
+		ref.CherryPickKnown = ref.IsCherryPick || (pr.Labels.PageInfo != nil && !pr.Labels.PageInfo.HasNextPage)
 		ref.MergedAt = strings.TrimSpace(pr.MergedAt)
 		byURL[ref.URL] = ref
 	}
@@ -840,6 +852,8 @@ func (e *Engine) PlanSync(ctx context.Context, state SyncState, opts Options) (S
 			prNode.State, prNode.IsDraft, prNode.URL, prNode.UpdatedAt,
 			prNode.labelNames(), prNode.BaseRefName, model.LinkSourcePRRef,
 		)
+		ref.HeadOID, ref.BaseOID = prNode.HeadOID, prNode.BaseOID
+		ref.CherryPickKnown = ref.IsCherryPick || (prNode.Labels.PageInfo != nil && !prNode.Labels.PageInfo.HasNextPage)
 		ref.MergedAt = strings.TrimSpace(prNode.MergedAt)
 		prKey := model.PRKey(ref.Repo, ref.Num)
 		if prevIssues, ok := prevPRToIssues[prKey]; ok {

@@ -192,7 +192,6 @@ func TestStoreOverrideSurvivalAndPendingResolution(t *testing.T) {
 	}
 }
 
-
 func TestBatchTriageAndStandalonePRTargets(t *testing.T) {
 	tmp := t.TempDir()
 	seedPath := filepath.Join(tmp, "seed.json")
@@ -364,15 +363,19 @@ func TestBatchTriageAndStandalonePRTargets(t *testing.T) {
 	if bRes.RemainingPending != 0 || len(bRes.AcceptedIssues) != 1 || len(bRes.ExcludedIssues) != 1 || len(bRes.OverriddenIssues) != 1 {
 		t.Fatalf("unexpected batch result: %+v", bRes)
 	}
-	// MissingPRTargets should surface #73064 (from seed without pr_status) and newly linked pingcap/tiflash#11200
+	// An explicit sync should resolve newly linked uncached PRs.
 	foundTiflash := false
-	for _, mt := range bRes.MissingPRTargets {
+	targets, err = st.ListOpenPRTargets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mt := range targets {
 		if mt.Repo == "pingcap/tiflash" && mt.Number == 11200 {
 			foundTiflash = true
 		}
 	}
 	if !foundTiflash {
-		t.Fatalf("expected pingcap/tiflash#11200 in MissingPRTargets, got %+v", bRes.MissingPRTargets)
+		t.Fatalf("expected pingcap/tiflash#11200 in sync targets, got %+v", targets)
 	}
 
 	dsAfter, err := st.BuildDataset(true)
@@ -416,7 +419,6 @@ func TestBatchTriageAndStandalonePRTargets(t *testing.T) {
 		t.Fatalf("expected #73200 reverted to initial AI baseline EASY/CRITICAL, got %+v (err=%v)", rev, err)
 	}
 }
-
 
 func TestApplyIssueSyncThreeTierPRsArchiveAndRetriage(t *testing.T) {
 	tmp := t.TempDir()
@@ -486,13 +488,13 @@ func TestApplyIssueSyncThreeTierPRsArchiveAndRetriage(t *testing.T) {
 		t.Fatalf("expected 0 Day-1 retriage issues, got %v", dsInit.SyncMeta.RetriageIssueNums)
 	}
 
-	// Verify FILTER_NON_OPT_OR_FIXED PR #73500 is isolated from ListOpenPRTargets, while #68000 is included
+	// First resolution includes every associated incomplete PR, even filtered or merged ones.
 	openTargets, err := st.ListOpenPRTargets()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(openTargets) != 1 || openTargets[0].Number != 68000 {
-		t.Fatalf("expected only #68000 in ListOpenPRTargets (isolating #73500), got %+v", openTargets)
+	if len(openTargets) != 3 || openTargets[0].Number != 73500 || openTargets[1].Number != 68000 || openTargets[2].Number != 67129 {
+		t.Fatalf("expected all three incomplete associated PRs, got %+v", openTargets)
 	}
 
 	// Sync #1:
@@ -1536,13 +1538,13 @@ func TestRound2SpecialDBPathSyncRacesReconcileAndTypoDetection(t *testing.T) {
 	if err := json.Unmarshal(rawTplJSON, &tplPatch); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.ApplyIssueOverride(78001, tplPatch); err != nil {
+	if err := st.ApplyIssueOverride(78001, tplPatch); err != nil {
 		t.Fatalf("ApplyIssueOverride(78001) failed: %v", err)
 	}
 	// Stale IfUnmodifiedSince must fail with ErrOverrideConflict
 	var stalePatch model.TriagePatchRequest
 	_ = json.Unmarshal([]byte(`{"cat":"EASY","severity":"MINOR","subsystem":"statistics","if_unmodified_since":"2020-01-01T00:00:00.000000000Z"}`), &stalePatch)
-	if _, err := st.ApplyIssueOverride(78001, stalePatch); !errors.Is(err, ErrOverrideConflict) {
+	if err := st.ApplyIssueOverride(78001, stalePatch); !errors.Is(err, ErrOverrideConflict) {
 		t.Fatalf("expected ErrOverrideConflict on stale IfUnmodifiedSince, got %v", err)
 	}
 
@@ -1573,7 +1575,7 @@ func TestRound2SpecialDBPathSyncRacesReconcileAndTypoDetection(t *testing.T) {
 		}
 	}
 	// Even after ResetIssueOverride restores auto_baseline_json, #78901 stays reconciled (no spurious retriage)!
-	if _, err := st.ResetIssueOverride(78001); err != nil {
+	if err := st.ResetIssueOverride(78001); err != nil {
 		t.Fatalf("ResetIssueOverride(78001): %v", err)
 	}
 	dsAfterReset, err := st.BuildDataset(true)
@@ -2176,7 +2178,7 @@ func TestRound3StoreConvergenceInvariants(t *testing.T) {
 	//    even though #97901 actually merged on GitHub 5 minutes BEFORE human calibration (MergedAt < nowISO).
 	//    Next PR sync delivering MERGED MUST still trigger fix_pr_merged_still_open!
 	mergedBeforeCalib := time.Now().UTC().Add(-5 * time.Minute).Format(time.RFC3339)
-	if _, err := st.ApplyIssueOverride(97001, model.TriagePatchRequest{
+	if err := st.ApplyIssueOverride(97001, model.TriagePatchRequest{
 		Cat:       "HARD",
 		Severity:  "CRITICAL",
 		Subsystem: "logical_rewrite",
@@ -2237,7 +2239,7 @@ func TestRound3StoreConvergenceInvariants(t *testing.T) {
 	if _, err := st.AcknowledgeIssueRetriageWithGuard(97001, "maint", preTriggerWatermark); !errors.Is(err, ErrOverrideConflict) {
 		t.Fatalf("expected stale AcknowledgeIssueRetriageWithGuard to fail with ErrOverrideConflict, got %v", err)
 	}
-	if _, err := st.ResetIssueOverrideWithGuard(97001, preTriggerWatermark); !errors.Is(err, ErrOverrideConflict) {
+	if err := st.ResetIssueOverrideWithGuard(97001, preTriggerWatermark); !errors.Is(err, ErrOverrideConflict) {
 		t.Fatalf("expected stale ResetIssueOverrideWithGuard to fail with ErrOverrideConflict, got %v", err)
 	}
 
@@ -2272,7 +2274,7 @@ func TestRound3StoreConvergenceInvariants(t *testing.T) {
 		t.Fatalf("expected note-only updates NOT to conflict with AcknowledgeIssueRetriageWithGuard, got %v", err)
 	}
 	// Reset classification override -> reverts Cat from HARD back to auto MEDIUM, while keeping bilingual notes!
-	if _, err := st.ResetIssueOverride(97001); err != nil {
+	if err := st.ResetIssueOverride(97001); err != nil {
 		t.Fatal(err)
 	}
 	dsAfterReset, err := st.BuildDataset(true)
@@ -2371,7 +2373,7 @@ func TestRound3StoreConvergenceInvariants(t *testing.T) {
 		t.Fatalf("OpenSnapshotForDryRun(%s) failed: %v", fileURI, err)
 	}
 	// Mutate inside snapshot store and verify live store does NOT see it!
-	if _, err := snapStore.ApplyIssueOverride(97002, model.TriagePatchRequest{
+	if err := snapStore.ApplyIssueOverride(97002, model.TriagePatchRequest{
 		Cat:       "HARD",
 		Severity:  "CRITICAL",
 		Subsystem: "logical_rewrite",

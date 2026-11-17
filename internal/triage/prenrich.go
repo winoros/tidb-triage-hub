@@ -23,11 +23,14 @@ fragment PRFileEnrichFields on PullRequest {
   updatedAt
   mergedAt
   baseRefName
+  headRefOid
+  baseRefOid
   additions
   deletions
   changedFiles
   body
   author { login }
+  labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
   files(first: 30) {
     nodes {
       path
@@ -86,6 +89,14 @@ func cleanPRBodyExcerpt(body string, maxRunes int) string {
 }
 
 type gqlPREnrichNode struct {
+	Labels *struct {
+		Nodes []struct {
+			Name string `json:"name"`
+		} `json:"nodes"`
+		PageInfo struct {
+			HasNextPage bool `json:"hasNextPage"`
+		} `json:"pageInfo"`
+	} `json:"labels"`
 	Number       int    `json:"number"`
 	Title        string `json:"title"`
 	State        string `json:"state"`
@@ -93,6 +104,8 @@ type gqlPREnrichNode struct {
 	UpdatedAt    string `json:"updatedAt"`
 	MergedAt     string `json:"mergedAt"`
 	BaseRefName  string `json:"baseRefName"`
+	HeadOID      string `json:"headRefOid"`
+	BaseOID      string `json:"baseRefOid"`
 	Additions    int    `json:"additions"`
 	Deletions    int    `json:"deletions"`
 	ChangedFiles int    `json:"changedFiles"`
@@ -226,7 +239,14 @@ func FetchPendingPRDetails(
 				if state == "OPEN" && node.IsDraft {
 					state = "DRAFT"
 				}
-				isCP := prstatus.IsCherryPickPR(node.Title, nil, node.BaseRefName)
+				var labels []string
+				if node.Labels != nil {
+					for _, label := range node.Labels.Nodes {
+						labels = append(labels, label.Name)
+					}
+				}
+				isCP := prstatus.IsCherryPickPR(node.Title, labels, node.BaseRefName)
+				cpKnown := isCP || (node.Labels != nil && !node.Labels.PageInfo.HasNextPage)
 
 				var (
 					nonTestFiles []string
@@ -254,6 +274,7 @@ func FetchPendingPRDetails(
 				}
 
 				det := model.PendingPRDetail{
+					HeadOID: node.HeadOID, BaseOID: node.BaseOID, CherryPickKnown: cpKnown,
 					Repo:              repo,
 					Num:               node.Number,
 					Title:             node.Title,

@@ -277,7 +277,7 @@ func TestMachineBToMachineASplitDeploymentEndToEnd(t *testing.T) {
 		t.Fatalf("expected dry-run counts to reflect post-conflict planned decisions (new=1, overrides=0), got: %s", dryOut.String())
 	}
 
-	// 7b. Live remote `triage` commits #72102 + syncs manual PR #74500, preserves Web UI #72001 & #72101, and auto-backups to backupDBOnB!
+	// 7b. Live remote `triage` commits #72102 + links manual PR #74500, preserves Web UI #72001 & #72101, and auto-backups to backupDBOnB!
 	var liveOut, liveErr bytes.Buffer
 	if err := executeTriage([]string{"--stdin", "--backup-path", backupDBOnB}, bytes.NewReader(decisionsJSON), &liveOut, &liveErr); err != nil {
 		t.Fatalf("remote live triage failed: %v", err)
@@ -314,8 +314,8 @@ func TestMachineBToMachineASplitDeploymentEndToEnd(t *testing.T) {
 	if byNum[72102].Cat != "MEDIUM" || len(byNum[72102].PRs) != 1 || byNum[72102].PRs[0].Num != 74500 {
 		t.Fatalf("expected Machine B #72102 accepted with linked PR #74500, got %+v", byNum[72102])
 	}
-	if _, hasPR74500 := bakDS.PRStatus["pingcap/tidb#74500"]; !hasPR74500 {
-		t.Fatalf("expected Machine A to have fetched & classified PR #74500 into pr_status, got keys=%v", bakDS.PRStatus)
+	if _, hasPR74500 := bakDS.PRStatus["pingcap/tidb#74500"]; hasPR74500 {
+		t.Fatal("submission unexpectedly fetched PR #74500")
 	}
 }
 
@@ -399,7 +399,7 @@ func TestRemoteClientURLCanonicalizationBackupMagicAndPostCommitWarn(t *testing.
 		t.Fatalf("expected active DB WAL overwrite guard error, got %v", err)
 	}
 
-	// 4. Post-commit PR sync outage returns 200 OK with pr_sync_warning AND still downloads auto-backup!
+	// 4. Submission is independent of GitHub availability and still downloads auto-backup.
 	dbPathA := filepath.Join(tmp, "post_commit_a.db")
 	stA, err := store.Open(dbPathA)
 	if err != nil {
@@ -443,8 +443,8 @@ func TestRemoteClientURLCanonicalizationBackupMagicAndPostCommitWarn(t *testing.
 	if err := executeTriage([]string{"--stdin", "--backup-path", bakDest}, bytes.NewReader(decBytes), &outBuf, &errBuf); err != nil {
 		t.Fatalf("expected post-commit PR sync failure to degrade to warning without failing triage, got %v", err)
 	}
-	if !strings.Contains(outBuf.String(), `"pr_sync_warning"`) || !strings.Contains(errBuf.String(), "[warn] triage decisions saved") {
-		t.Fatalf("expected pr_sync_warning in stdout and stderr, stdout=%s stderr=%s", outBuf.String(), errBuf.String())
+	if strings.Contains(outBuf.String(), `"pr_sync_warning"`) || strings.Contains(errBuf.String(), "[warn]") {
+		t.Fatalf("submission unexpectedly accessed GitHub: stdout=%s stderr=%s", outBuf.String(), errBuf.String())
 	}
 	if !strings.Contains(errBuf.String(), "[backup] saved remote SQLite snapshot") {
 		t.Fatalf("expected auto-backup to still succeed after post-commit PR warning, stderr=%s", errBuf.String())
@@ -471,7 +471,7 @@ func TestRound2CLISubcommandGuardWarningsAndShortTimeoutBackup(t *testing.T) {
 		t.Fatalf("expected unexpected positional argument error on serve, got %v", err)
 	}
 
-	// 2. openStoreAndSyncerMaybeDryRun NEVER seeds an existing empty SQLite DB on disk when dryRun=true
+	// 2. An existing empty database is seeded only inside the disposable dry-run snapshot.
 	tmp := t.TempDir()
 	emptyOnDiskDB := filepath.Join(tmp, "existing_empty.db")
 	stEmpty, err := store.Open(emptyOnDiskDB)
@@ -486,8 +486,8 @@ func TestRound2CLISubcommandGuardWarningsAndShortTimeoutBackup(t *testing.T) {
 	}
 	cnt, _ := stDry.IssueCount()
 	cleanupDry()
-	if cnt != 0 {
-		t.Fatalf("expected existing empty DB not to be seeded during dry-run, got %d issues", cnt)
+	if cnt != 1 {
+		t.Fatalf("expected empty dry-run snapshot to use the same seed as normal startup, got %d issues", cnt)
 	}
 
 	// 3. Remote status --skip-quota rejects missing token with 401 (via require_auth=1),

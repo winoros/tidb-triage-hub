@@ -1485,6 +1485,7 @@
     </div>
     <div class="drawer-body">
       <div class="retriage-banner" id="editRetriageBanner" hidden></div>
+      <div class="sug-banner" id="editStaleNotice" hidden><span data-i18n="report.rw.inbox.staleDraft"></span> <button type="button" class="btn" id="editReviewLatestBtn" data-i18n="report.rw.inbox.reviewLatest"></button></div>
       <div class="drawer-meta-card" id="editIssueMetaCard"></div>
 
       <div id="editFormWrap" style="display:flex;flex-direction:column;gap:12px;">
@@ -1729,10 +1730,13 @@
   var mtxSev = null;
   var activePrStage = "ALL";
   var editingIssueNum = null;
-  var editingTriagedAt = "";
-  var editingWasWritable = false;
+  // Inspect has no draft. A writable draft owns its reviewed binding and defaults.
+  var editingDraft = null;
+  var frozenEditDraft = null;
+  var capturePendingCardDrafts = function() {};
   var editDrawerGen = 0;
   var sessionEpoch = 0;
+  var workbenchRevision = Number.isSafeInteger(window.TRIAGE_SNAPSHOT_REVISION) ? window.TRIAGE_SNAPSHOT_REVISION : 0;
   var expandedCiKeys = {};
   var overviewCollapsed = false;
   var copyFeedbackTimer = null;
@@ -1752,7 +1756,7 @@
   var RETRIAGE_LIST = [];
   var activeInboxTab = "pending";
   var inboxTabInitialized = false;
-  var EXCLUDED_ITEMS = null;
+  var EXCLUDED_ITEMS = Array.isArray(window.TRIAGE_EXCLUDED) ? window.TRIAGE_EXCLUDED : null;
   var excludedLoading = false;
   var excludedLoadError = "";
   var excludedQuery = "";
@@ -2850,6 +2854,16 @@
     renderAll();
   }
 
+  function applyWorkbenchSnapshot(resp) {
+    if (!resp || !Number.isSafeInteger(resp.snapshot_revision) || resp.snapshot_revision <= 0 || resp.snapshot_revision < workbenchRevision) return false;
+    workbenchRevision = resp.snapshot_revision;
+    capturePendingCardDrafts(document.getElementById("inboxBody"));
+    EXCLUDED_ITEMS = Array.isArray(resp.excluded_issues) ? resp.excluded_issues : null;
+    setDatasetAndRender(resp.dataset, Array.isArray(resp.pending_candidates) ? resp.pending_candidates : [], true);
+    refreshOpenEditDrawer();
+    return true;
+  }
+
   function stripWorkbenchFromDataset() {
     DATA_HAS_WORKBENCH = false;
     PENDING = [];
@@ -2866,15 +2880,13 @@
         delete r.retriage_reasons;
         delete r.retriage_details;
         delete r.triaged_at;
+        delete r.version;
         delete r.manual_override;
         delete r.force_keep;
         if (Array.isArray(r.prs)) {
           r.prs.forEach(function(p) { delete p.ack_at; });
         }
       });
-    }
-    if (!editingWasWritable) {
-      editingTriagedAt = "";
     }
     rebuildDerivedIndexes();
     var dropEpoch = sessionEpoch;
@@ -3257,7 +3269,7 @@
         var lbl = formatRetriageReason(d.code);
         return '<li><b>' + esc(lbl) + '</b>' + (d.summary ? (' — ' + fmtInlineCode(d.summary)) : '') + '</li>';
       }).join("");
-      var keepBtn = (CAN_TRIAGE && DATA_HAS_WORKBENCH)
+      var keepBtn = canSubmitEditDraft()
         ? '<button type="button" class="btn btn-amber" id="drawerAckRetriageBtn">' + ICONS.check + '<span>' + esc(t("report.rw.drawer.keepCurrentBtn")) + '</span></button>'
         : '';
       rBanner.innerHTML =
@@ -3292,16 +3304,14 @@
     if (!editingIssueNum || document.getElementById("editDrawer").hidden) return;
     var rec = DATA.find(function(r) { return r.number === editingIssueNum; });
     if (!rec) return;
-    var canEdit = Boolean(CAN_TRIAGE && DATA_HAS_WORKBENCH);
-    if (canEdit && !editingWasWritable) {
-      populateEditDrawerFormFromRecord(rec);
-      editingTriagedAt = rec.triaged_at || "";
-      editingWasWritable = true;
-    }
+    var canEdit = canSubmitEditDraft();
     document.getElementById("editDrawerTitle").textContent = canEdit
       ? t("report.rw.drawer.title", { num: editingIssueNum })
       : t("report.rw.drawer.inspectTitle", { num: editingIssueNum });
     renderDrawerRetriageBanner(rec);
+    var staleNotice = document.getElementById("editStaleNotice");
+    var stale = canEdit && JSON.stringify(editingDraft.version) !== JSON.stringify(copyReviewVersion(rec.version));
+    staleNotice.hidden = !stale;
 
     ["edCat", "edSev", "edSub", "edBorderline", "edForceKeep", "edNoteZh", "edNoteEn"].forEach(function(id) {
       document.getElementById(id).disabled = !canEdit;
@@ -3353,8 +3363,7 @@
     if (!rec) return;
     if (!preserveGen) {
       editingIssueNum = num;
-      editingWasWritable = Boolean(CAN_TRIAGE && DATA_HAS_WORKBENCH);
-      editingTriagedAt = editingWasWritable ? (rec.triaged_at || "") : "";
+      editingDraft = CAN_TRIAGE && DATA_HAS_WORKBENCH ? editDraftFromRecord(rec) : null;
       editDrawerGen += 1;
     }
 
@@ -3392,11 +3401,66 @@
 
   function closeEditDrawer() {
     editingIssueNum = null;
-    editingTriagedAt = "";
-    editingWasWritable = false;
+    editingDraft = null;
     editDrawerGen += 1;
     document.getElementById("editDrawer").hidden = true;
     syncBodyDrawerLock();
+  }
+
+  function clearSessionDrafts() {
+    pendingDrafts = {};
+    frozenEditDraft = null;
+    closeEditDrawer();
+    closeInboxDrawer();
+    document.getElementById("inboxBody").innerHTML = "";
+  }
+
+  function recordNote(rec) {
+    return { "zh-CN": (rec.note && rec.note["zh-CN"]) || "", en: (rec.note && rec.note.en) || "" };
+  }
+
+  function readEditFormValues() {
+    var values = {};
+    ["edCat", "edSev", "edSub", "edBorderline", "edForceKeep", "edNoteZh", "edNoteEn", "edExcludeReason"].forEach(function(id) {
+      var el = document.getElementById(id);
+      values[id] = el.type === "checkbox" ? el.checked : el.value;
+    });
+    return values;
+  }
+
+  function restoreEditFormValues(values) {
+    Object.keys(values).forEach(function(id) {
+      var el = document.getElementById(id);
+      if (el.type === "checkbox") el.checked = values[id]; else el.value = values[id];
+    });
+  }
+
+  function freezeSessionDrafts() {
+    capturePendingCardDrafts(document.getElementById("inboxBody"));
+    // Inspect cannot replace a writable draft frozen by an earlier auth failure.
+    if (editingIssueNum && !document.getElementById("editDrawer").hidden && editingDraft && validReviewVersion(editingDraft.version)) {
+      frozenEditDraft = { num: editingIssueNum, binding: editingDraft, values: readEditFormValues() };
+    }
+    closeEditDrawer();
+    closeInboxDrawer();
+    document.getElementById("inboxBody").innerHTML = "";
+  }
+
+  function restoreSessionDrafts() {
+    if (!frozenEditDraft || !CAN_TRIAGE || !DATA_HAS_WORKBENCH) return;
+    var draft = frozenEditDraft;
+    frozenEditDraft = null;
+    if (!draft.binding || !validReviewVersion(draft.binding.version)) return;
+    var rec = DATA.find(function(r) { return r.number === draft.num; });
+    if (!rec) {
+      showToast(t("report.rw.drawer.issueUnavailable", { num: draft.num }), "error");
+      return;
+    }
+    if (!validReviewVersion(rec.version)) return;
+    openEditDrawer(draft.num);
+    editingDraft = draft.binding;
+    restoreEditFormValues(draft.values);
+    syncOpenEditDrawerSessionUI(false);
   }
 
   function closeInboxDrawer() {
@@ -3404,13 +3468,15 @@
     syncBodyDrawerLock();
   }
 
-  document.getElementById("edCat").addEventListener("change", function() {
-    var c = this.value;
+  function syncEditSeverityConstraints() {
+    var c = document.getElementById("edCat").value;
     var isReal = (c === "EASY" || c === "MEDIUM" || c === "HARD");
     var sevEl = document.getElementById("edSev");
     if (!isReal) sevEl.value = "N/A";
     else if (sevEl.value === "N/A") sevEl.value = "MODERATE";
-  });
+  }
+
+  document.getElementById("edCat").addEventListener("change", syncEditSeverityConstraints);
 
   document.getElementById("closeEditDrawerBtn").addEventListener("click", closeEditDrawer);
   document.getElementById("cancelEditBtn").addEventListener("click", closeEditDrawer);
@@ -3428,7 +3494,102 @@
     setTimeout(function() { inp.focus(); }, 20);
   }
 
+  function copyReviewVersion(version) {
+    return version ? { review: version.review, notes: version.notes } : null;
+  }
+
+  function pendingReviewBinding(existing, candidate) {
+    return existing || { version: copyReviewVersion(candidate.version), watermark: candidate.sync_watermark || "" };
+  }
+
+  function reviewLatestPending(draft, candidate) {
+    ["cat", "sev", "sub", "bdr", "fk", "noteZh", "noteEn", "exReason"].forEach(function(key) {
+      if (!draft.dirty || !draft.dirty[key]) delete draft[key];
+    });
+    draft.binding = pendingReviewBinding(null, candidate);
+  }
+
+  function markPendingFieldDirty(el) {
+    if (!el || !el.closest) return;
+    var card = el.closest("[data-pend-num]");
+    if (!card) return;
+    var fields = { "p-cat": "cat", "p-sev": "sev", "p-sub": "sub", "p-bdr": "bdr", "p-fk": "fk", "p-note-zh": "noteZh", "p-note-en": "noteEn", "p-ex-reason": "exReason" };
+    var draft = pendingDrafts[card.getAttribute("data-pend-num")];
+    if (!draft) return;
+    draft.dirty = draft.dirty || {};
+    Object.keys(fields).forEach(function(cls) { if (el.classList.contains(cls)) draft.dirty[fields[cls]] = true; });
+    capturePendingCardDraft(card);
+  }
+
+  // Only an existing, bound draft may receive form values. A committed card
+  // can remain in the DOM briefly, but must never recreate a consumed draft.
+  function capturePendingCardDraft(card) {
+    var key = card.getAttribute("data-pend-num");
+    var draft = pendingDrafts[key];
+    if (!draft || !draft.binding) return;
+    var fields = { cat: ".p-cat", sev: ".p-sev", sub: ".p-sub", bdr: ".p-bdr", fk: ".p-fk", noteZh: ".p-note-zh", noteEn: ".p-note-en", exReason: ".p-ex-reason" };
+    Object.keys(fields).forEach(function(key) {
+      var el = card.querySelector(fields[key]);
+      if (el) draft[key] = key === "bdr" || key === "fk" ? el.checked : el.value;
+    });
+  }
+
+  function discardPendingDraft(number) {
+    delete pendingDrafts[String(number)];
+  }
+
+  function editValuesFromRecord(rec) {
+    var note = recordNote(rec);
+    return { edCat: rec.cat, edSev: rec.severity, edSub: rec.subsystem,
+      edBorderline: Boolean(rec.is_borderline_kept), edForceKeep: Boolean(rec.force_keep),
+      edNoteZh: note["zh-CN"], edNoteEn: note.en };
+  }
+
+  function validReviewVersion(version) {
+    return Boolean(version && Number.isSafeInteger(version.review) && version.review > 0 && Number.isSafeInteger(version.notes) && version.notes > 0);
+  }
+
+  function cardReviewVersion(card) {
+    try {
+      var version = JSON.parse(card.getAttribute("data-review-version"));
+      return validReviewVersion(version) ? version : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function editDraftFromRecord(rec) {
+    if (!validReviewVersion(rec.version)) return null;
+    return { version: copyReviewVersion(rec.version), originalNote: recordNote(rec), originalValues: editValuesFromRecord(rec) };
+  }
+
+  function canSubmitEditDraft() {
+    return Boolean(CAN_TRIAGE && DATA_HAS_WORKBENCH && editingIssueNum && editingDraft && validReviewVersion(editingDraft.version) &&
+      DATA.some(function(r) { return r.number === editingIssueNum; }));
+  }
+
+  function reviewLatestEdit() {
+    var rec = DATA.find(function(r) { return r.number === editingIssueNum; });
+    if (!rec || !canSubmitEditDraft() || !validReviewVersion(rec.version)) return;
+    var latest = editDraftFromRecord(rec);
+    Object.keys(latest.originalValues).forEach(function(id) {
+      var el = document.getElementById(id);
+      var value = el.type === "checkbox" ? el.checked : el.value;
+      if (value === editingDraft.originalValues[id]) {
+        if (el.type === "checkbox") el.checked = latest.originalValues[id]; else el.value = latest.originalValues[id];
+      }
+    });
+    editDrawerGen += 1;
+    editingDraft = latest;
+    syncEditSeverityConstraints();
+    syncOpenEditDrawerSessionUI(false);
+  }
+
+  document.getElementById("editReviewLatestBtn").addEventListener("click", reviewLatestEdit);
+
   function apiFetch(subpath, opts) {
+    var requestEpoch = sessionEpoch;
+    var requestEdit = { number: editingIssueNum, generation: editDrawerGen };
     var reqOpts = opts ? Object.assign({}, opts) : {};
     if (!reqOpts.cache) reqOpts.cache = "no-store";
     var method = String(reqOpts.method || "GET").toUpperCase();
@@ -3445,8 +3606,9 @@
           var errMsg = (body && typeof body.error === "string") ? body.error : "";
           var isAuthFailure = res.status === 401 ||
             (res.status === 403 && (!IS_AUTHENTICATED || errMsg.indexOf("permission required") !== -1));
-          if (isAuthFailure && AUTH_REQUIRED && String(subpath || "").indexOf("api/session/") === -1) {
+          if (isAuthFailure && requestEpoch === sessionEpoch && AUTH_REQUIRED && String(subpath || "").indexOf("api/session/") === -1) {
             sessionEpoch += 1;
+            freezeSessionDrafts();
             stripWorkbenchFromDataset();
             applySessionState({
               viewer: { login: "viewer", role: "viewer" },
@@ -3459,6 +3621,12 @@
           var msg = errMsg || ("HTTP " + res.status + (res.statusText ? " " + res.statusText : ""));
           var err = new Error(msg);
           err.status = res.status;
+          if (body && body.committed && requestEpoch === sessionEpoch) {
+            return handleCommittedWithoutSnapshot(subpath, requestEpoch, requestEdit);
+          }
+          if (res.status === 409 && method !== "GET" && requestEpoch === sessionEpoch) {
+            return refreshAfterConflict(err, requestEpoch);
+          }
           throw err;
         }
         return body || {};
@@ -3466,8 +3634,75 @@
     });
   }
 
+  function handleCommittedWithoutSnapshot(path, epoch, requestEdit) {
+    capturePendingCardDrafts(document.getElementById("inboxBody"));
+    var pendingMatch = String(path).match(/api\/pending\/(\d+)\/resolve/);
+    if (pendingMatch) discardPendingDraft(pendingMatch[1]);
+    var issueMatch = String(path).match(/api\/issues\/(\d+)\//);
+    if (issueMatch && requestEdit && requestEdit.number === Number(issueMatch[1]) &&
+        editingIssueNum === requestEdit.number && editDrawerGen === requestEdit.generation) closeEditDrawer();
+    // The commit may invalidate our snapshot. Suspend controls now; only an
+    // accepted snapshot restores them. A late failure cannot undo that recovery.
+    document.getElementById("inboxBody").innerHTML = "";
+    DATA_HAS_WORKBENCH = false;
+    PENDING = [];
+    EXCLUDED_ITEMS = null;
+    closeInboxDrawer();
+    syncOpenEditDrawerSessionUI(false);
+    renderAll();
+    return apiFetch("./api/state").then(function(resp) {
+      if (epoch !== sessionEpoch || !CAN_TRIAGE) return;
+      applyWorkbenchSnapshot(resp);
+      if (!document.getElementById("inboxDrawer").hidden) renderInboxDrawer();
+    }).catch(function() {}).then(function() {
+      var err = new Error(t("report.rw.inbox.savedRefreshFailed"));
+      err.committed = true;
+      throw err;
+    });
+  }
+
+  function refreshAfterConflict(err, epoch) {
+    return apiFetch("./api/state").then(function(resp) {
+      if (epoch !== sessionEpoch || !CAN_TRIAGE) return;
+      applyWorkbenchSnapshot(resp);
+      if (!document.getElementById("inboxDrawer").hidden) renderInboxDrawer();
+    }).catch(function() {}).then(function() { throw err; });
+  }
+
+  // Every workbench snapshot reconciles the editor, while its draft keeps the
+  // version originally reviewed. Inspect becomes editable only from this snapshot.
+  function refreshOpenEditDrawer() {
+    if (!editingIssueNum || document.getElementById("editDrawer").hidden) return;
+    var rec = DATA.find(function(r) { return r.number === editingIssueNum; });
+    if (!rec) {
+      var missingNum = editingIssueNum;
+      closeEditDrawer();
+      showToast(t("report.rw.drawer.issueUnavailable", { num: missingNum }), "error");
+      return;
+    }
+    var values = editingDraft ? readEditFormValues() : null;
+    var excludeOpen = document.getElementById("editExcludeZone").open;
+    if (!editingDraft && CAN_TRIAGE && DATA_HAS_WORKBENCH) editingDraft = editDraftFromRecord(rec);
+    openEditDrawer(editingIssueNum, true);
+    if (values) restoreEditFormValues(values);
+    document.getElementById("editExcludeZone").open = excludeOpen;
+  }
+
+  function applyEditMutationSnapshot(resp, number, generation) {
+    if (editDrawerGen === generation && editingIssueNum === number) closeEditDrawer();
+    applyWorkbenchSnapshot(resp);
+  }
+
+  function acknowledgedCount(resp) {
+    return Array.isArray(resp.acknowledged) ? resp.acknowledged.length : 0;
+  }
+
+  function noteForPatch(current, original) {
+    return current["zh-CN"] !== original["zh-CN"].trim() || current.en !== original.en.trim() ? current : undefined;
+  }
+
   function submitCurrentOverride() {
-    if (!CAN_TRIAGE || !DATA_HAS_WORKBENCH || !editingIssueNum) return;
+    if (!canSubmitEditDraft()) return;
     var num = editingIssueNum;
     var myGen = editDrawerGen;
     var payload = {
@@ -3476,11 +3711,11 @@
       subsystem: document.getElementById("edSub").value,
       is_borderline_kept: document.getElementById("edBorderline").checked,
       force_keep: document.getElementById("edForceKeep").checked,
-      if_unmodified_since: editingTriagedAt,
-      note: {
+      expected_version: editingDraft.version,
+      note: noteForPatch({
         "zh-CN": document.getElementById("edNoteZh").value.trim(),
         "en": document.getElementById("edNoteEn").value.trim()
-      }
+      }, editingDraft.originalNote)
     };
     var btn = document.getElementById("saveOverrideBtn");
     if (btn.disabled) return;
@@ -3492,22 +3727,8 @@
       body: JSON.stringify(payload)
     }).then(function(resp) {
       if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
-      if (resp.dataset) {
-        setDatasetAndRender(resp.dataset, undefined, true);
-      } else {
-        var idx = DATA.findIndex(function(r) { return r.number === num; });
-        if (idx !== -1 && resp.record) DATA[idx] = resp.record;
-        rebuildDerivedIndexes();
-        renderAll();
-      }
-      if (editDrawerGen === myGen && editingIssueNum === num) {
-        closeEditDrawer();
-      }
-      if (resp.pr_sync_warning) {
-        showToast(t("report.rw.toastPendingSyncWarn", { num: num, warn: resp.pr_sync_warning }), "success");
-      } else {
-        showToast(t("report.rw.toastSaved", { num: num }), "success");
-      }
+      applyEditMutationSnapshot(resp, num, myGen);
+      showToast(t("report.rw.toastSaved", { num: num }), "success");
     }).catch(function(err) {
       if (reqEpoch !== sessionEpoch) return;
       showToast(err.message, "error");
@@ -3520,35 +3741,18 @@
     document.getElementById("saveOverrideBtn").addEventListener("click", submitCurrentOverride);
 
     document.getElementById("resetOverrideBtn").addEventListener("click", function() {
-      if (!CAN_TRIAGE || !DATA_HAS_WORKBENCH || !editingIssueNum) return;
+      if (!canSubmitEditDraft()) return;
       var num = editingIssueNum;
       var myGen = editDrawerGen;
       var reqEpoch = sessionEpoch;
       var btn = this;
       var delPath = "./api/issues/" + num + "/triage";
-      if (editingTriagedAt) {
-        delPath += "?if_unmodified_since=" + encodeURIComponent(editingTriagedAt);
-      }
       btn.disabled = true;
-      apiFetch(delPath, { method: "DELETE" })
+      apiFetch(delPath, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expected_version: editingDraft.version }) })
         .then(function(resp) {
           if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
-          if (resp.dataset) {
-            setDatasetAndRender(resp.dataset, undefined, true);
-          } else {
-            var idx = DATA.findIndex(function(r) { return r.number === num; });
-            if (idx !== -1 && resp.record) DATA[idx] = resp.record;
-            rebuildDerivedIndexes();
-            renderAll();
-          }
-          if (editDrawerGen === myGen && editingIssueNum === num) {
-            closeEditDrawer();
-          }
-          if (resp.pr_sync_warning) {
-            showToast(t("report.rw.toastPendingSyncWarn", { num: num, warn: resp.pr_sync_warning }), "success");
-          } else {
-            showToast(t("report.rw.toastReset", { num: num }), "success");
-          }
+          applyEditMutationSnapshot(resp, num, myGen);
+          showToast(t("report.rw.toastReset", { num: num }), "success");
         }).catch(function(err) {
           if (reqEpoch !== sessionEpoch) return;
           showToast(err.message, "error");
@@ -3559,7 +3763,7 @@
 
     document.getElementById("editRetriageBanner").addEventListener("click", function(e) {
       var ackBtn = e.target.closest("#drawerAckRetriageBtn");
-      if (!CAN_TRIAGE || !DATA_HAS_WORKBENCH || !ackBtn || !editingIssueNum) return;
+      if (!ackBtn || !canSubmitEditDraft()) return;
       var num = editingIssueNum;
       var myGen = editDrawerGen;
       var reqEpoch = sessionEpoch;
@@ -3567,14 +3771,11 @@
       apiFetch("./api/issues/" + num + "/retriage/ack", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ if_unmodified_since: editingTriagedAt })
+        body: JSON.stringify({ expected_version: editingDraft.version })
       })
         .then(function(resp) {
           if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
-          setDatasetAndRender(resp.dataset, undefined, true);
-          if (editDrawerGen === myGen && editingIssueNum === num) {
-            closeEditDrawer();
-          }
+          applyEditMutationSnapshot(resp, num, myGen);
           showToast(t("report.rw.toastRetriageAcked", { num: num }), "success");
         }).catch(function(err) {
           if (reqEpoch === sessionEpoch) showToast(err.message, "error");
@@ -3583,7 +3784,7 @@
     });
 
     document.getElementById("edExcludeConfirmBtn").addEventListener("click", function() {
-      if (!CAN_TRIAGE || !DATA_HAS_WORKBENCH || !editingIssueNum) return;
+      if (!canSubmitEditDraft()) return;
       var num = editingIssueNum;
       var myGen = editDrawerGen;
       var reqEpoch = sessionEpoch;
@@ -3593,14 +3794,10 @@
       apiFetch("./api/issues/" + num + "/exclude", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason: reason, if_unmodified_since: editingTriagedAt })
+        body: JSON.stringify({ reason: reason, expected_version: editingDraft.version })
       }).then(function(resp) {
         if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
-        EXCLUDED_ITEMS = null;
-        setDatasetAndRender(resp.dataset, resp.pending_candidates, true);
-        if (editDrawerGen === myGen && editingIssueNum === num) {
-          closeEditDrawer();
-        }
+        applyEditMutationSnapshot(resp, num, myGen);
         showToast(t("report.rw.toastIssueExcluded", { num: num }), "success");
       }).catch(function(err) {
         if (reqEpoch === sessionEpoch) showToast(err.message, "error");
@@ -3650,7 +3847,7 @@
         }).join("");
         var dateDisp = (item.excluded_at || "").slice(0, 10) || "—";
         var srcDisp = item.source || "manual";
-        return '<div class="pend-card" data-ex-num="' + item.number + '">' +
+        return '<div class="pend-card" data-ex-num="' + item.number + '" data-review-version="' + esc(JSON.stringify(item.version || null)) + '">' +
           '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">' +
             '<div><a class="iss-title-link" href="' + issUrl + '" target="_blank" rel="noopener">#' + item.number + titleDisp + '</a></div>' +
             '<button type="button" class="btn x-restore-btn">' + ICONS.reset + '<span>' + esc(t("report.rw.inbox.restoreBtn")) + '</span></button>' +
@@ -3667,10 +3864,9 @@
       var reqEpoch = sessionEpoch;
       excludedLoading = true;
       excludedLoadError = "";
-      apiFetch("./api/excluded").then(function(resp) {
+      apiFetch("./api/state").then(function(resp) {
         if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
-        EXCLUDED_ITEMS = resp.excluded_issues || [];
-        SCOPE_COUNTS.excluded = EXCLUDED_ITEMS.length;
+        applyWorkbenchSnapshot(resp);
       }).catch(function(err) {
         if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
         excludedLoadError = (err && err.message) || "Failed to load excluded issues";
@@ -3702,38 +3898,17 @@
       syncBodyDrawerLock();
     }
 
-    function capturePendingCardDrafts(container) {
+    capturePendingCardDrafts = function(container) {
       if (!container) return;
       var cards = container.querySelectorAll("[data-pend-num]");
-      for (var i = 0; i < cards.length; i++) {
-        var c = cards[i];
-        var key = c.getAttribute("data-pend-num");
-        if (!key) continue;
-        pendingDrafts[key] = {
-          cat: c.querySelector(".p-cat") ? c.querySelector(".p-cat").value : null,
-          sev: c.querySelector(".p-sev") ? c.querySelector(".p-sev").value : null,
-          sub: c.querySelector(".p-sub") ? c.querySelector(".p-sub").value : null,
-          bdr: c.querySelector(".p-bdr") ? c.querySelector(".p-bdr").checked : null,
-          fk: c.querySelector(".p-fk") ? c.querySelector(".p-fk").checked : null,
-          noteZh: c.querySelector(".p-note-zh") ? c.querySelector(".p-note-zh").value : "",
-          noteEn: c.querySelector(".p-note-en") ? c.querySelector(".p-note-en").value : "",
-          exReason: c.querySelector(".p-ex-reason") ? c.querySelector(".p-ex-reason").value : ""
-        };
-      }
-    }
+      for (var i = 0; i < cards.length; i++) capturePendingCardDraft(cards[i]);
+    };
 
     renderInboxDrawer = function() {
       document.getElementById("inboxDrawerTitle").textContent = t("report.rw.inbox.title");
       updateInboxTabsHeader();
       var body = document.getElementById("inboxBody");
-      capturePendingCardDrafts(body);
-      var livePendingKeys = Object.create(null);
-      for (var pi = 0; pi < PENDING.length; pi++) {
-        livePendingKeys[String(PENDING[pi].number)] = true;
-      }
-      Object.keys(pendingDrafts).forEach(function(k) {
-        if (!livePendingKeys[k]) delete pendingDrafts[k];
-      });
+
       var loc = SiteI18n.getLocale();
 
       if (activeInboxTab === "retriage") {
@@ -3761,7 +3936,7 @@
           var noteStr = getNoteText(rec, loc);
           var prsHtml = rec.prs && rec.prs.length ? '<div class="pr-row" style="margin-top:2px;">' + rec.prs.map(formatPrChip).join("") + '</div>' : '';
 
-          return '<div class="pend-card" data-retriage-num="' + rec.number + '">' +
+          return '<div class="pend-card" data-retriage-num="' + rec.number + '" data-review-version="' + esc(JSON.stringify(rec.version || null)) + '" data-review-watermark="' + esc(rec.triaged_at || '') + '">' +
             '<div><a class="iss-title-link" href="' + issUrl + '" target="_blank" rel="noopener">#' + rec.number + ' · ' + fmtInlineCode(rec.title) + '</a> <span style="color:var(--muted);font-size:12px;">@' + esc(rec.author) + '</span></div>' +
             '<div class="cls-line">' + sevPill + catPill + subTxt + '</div>' +
             (noteStr ? '<div class="note-callout" style="margin-top:0;">' + fmtInlineCode(noteStr) + '</div>' : '') +
@@ -3796,15 +3971,22 @@
       var enums = window.REPORT_DATASET.enums;
       body.innerHTML = PENDING.map(function(pc) {
         var sug = pc.suggested_triage || null;
-        var draft = pendingDrafts[String(pc.number)] || null;
+        var draft = pendingDrafts[String(pc.number)] || (pendingDrafts[String(pc.number)] = {});
+        draft.binding = pendingReviewBinding(draft.binding, pc);
+        var stale = JSON.stringify(draft.binding.version) !== JSON.stringify(copyReviewVersion(pc.version)) || draft.binding.watermark !== (pc.sync_watermark || "");
         var defCat = (draft && draft.cat) ? draft.cat : ((sug && sug.cat) ? sug.cat : "MEDIUM");
         var defSev = (draft && draft.sev) ? draft.sev : ((sug && sug.severity) ? sug.severity : ((defCat === "EASY" || defCat === "MEDIUM" || defCat === "HARD") ? "MAJOR" : "N/A"));
+        var realCat = (defCat === "EASY" || defCat === "MEDIUM" || defCat === "HARD");
+        if (!realCat) defSev = "N/A";
+        else if (defSev === "N/A") defSev = "MAJOR";
         var defSub = (draft && draft.sub) ? draft.sub : ((sug && sug.subsystem) ? sug.subsystem : enums.subsystems[0]);
-        var defBdr = (draft && draft.bdr !== null) ? draft.bdr : Boolean(sug && sug.is_borderline_kept);
+        var defBdr = (draft && typeof draft.bdr === "boolean") ? draft.bdr : Boolean(sug && sug.is_borderline_kept);
         var defFk = Boolean(draft && draft.fk);
         var defNoteZh = (draft && draft.noteZh) || "";
         var defNoteEn = (draft && draft.noteEn) || "";
-        var defExReason = draft ? draft.exReason : ((sug && sug.exclude_reason) ? sug.exclude_reason : "");
+        var defExReason = typeof draft.exReason === "string" ? draft.exReason : ((sug && sug.exclude_reason) ? sug.exclude_reason : "");
+        Object.assign(draft, { cat: defCat, sev: defSev, sub: defSub, bdr: defBdr, fk: defFk,
+          noteZh: defNoteZh, noteEn: defNoteEn, exReason: defExReason });
         var isCanon = hasCanonicalLabels(pc.labels);
 
         var catOpts = enums.categories.map(function(v) {
@@ -3851,6 +4033,7 @@
             (pc.labels || []).map(function(l) { return '<span class="tag-mini">' + esc(l) + '</span>'; }).join("") +
           '</div>' +
           sugHtml +
+          (stale ? '<div class="sug-banner">' + esc(t("report.rw.inbox.staleDraft")) + ' <button type="button" class="btn p-review-btn">' + esc(t("report.rw.inbox.reviewLatest")) + '</button></div>' : '') +
           '<details><summary style="cursor:pointer;font-size:12px;font-weight:600;color:var(--link)">' + esc(t("report.rw.inbox.bodySummary", { comments: (pc.recent_comments || []).length })) + '</summary>' +
             '<div class="pend-pre">' + esc(fullPreview) + '</div>' +
           '</details>' +
@@ -3890,6 +4073,7 @@
     });
 
     document.getElementById("inboxBody").addEventListener("input", function(e) {
+      markPendingFieldDirty(e.target);
       if (e.target && e.target.id === "inboxExSearch") {
         excludedQuery = e.target.value || "";
         renderExcludedListInto(document.getElementById("inboxExList"));
@@ -3897,14 +4081,17 @@
     });
 
     document.getElementById("inboxBody").addEventListener("change", function(e) {
+      markPendingFieldDirty(e.target);
       if (e.target.classList.contains("p-cat")) {
         var card = e.target.closest("[data-pend-num]");
         if (!card) return;
         var c = e.target.value;
         var isReal = (c === "EASY" || c === "MEDIUM" || c === "HARD");
         var sevEl = card.querySelector(".p-sev");
+        var previousSev = sevEl.value;
         if (!isReal) sevEl.value = "N/A";
         else if (sevEl.value === "N/A") sevEl.value = "MAJOR";
+        if (sevEl.value !== previousSev) markPendingFieldDirty(sevEl);
       }
     });
 
@@ -3912,22 +4099,30 @@
       var reqEpoch = sessionEpoch;
       if (e.target.closest("#inboxKeepAllBtn")) {
         var keepAllBtn = e.target.closest("#inboxKeepAllBtn");
-        var nums = RETRIAGE_LIST.map(function(r) { return r.number; });
+        var renderedCards = Array.from(document.querySelectorAll("#inboxBody [data-retriage-num]"));
+        var nums = renderedCards.map(function(c) { return parseInt(c.getAttribute("data-retriage-num"), 10); });
         if (!nums.length) return;
-        var wms = {};
-        RETRIAGE_LIST.forEach(function(r) {
-          if (r.triaged_at) wms[String(r.number)] = r.triaged_at;
+        var versions = {};
+        var allValid = renderedCards.every(function(c) {
+          var version = cardReviewVersion(c);
+          if (!version) return false;
+          versions[c.getAttribute("data-retriage-num")] = version;
+          return true;
         });
+        if (!allValid) {
+          showToast(t("report.rw.inbox.missingReviewVersion"), "error");
+          return;
+        }
         keepAllBtn.disabled = true;
         apiFetch("./api/retriage/ack-batch", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ numbers: nums, watermarks: wms })
+          body: JSON.stringify({ numbers: nums, expected_versions: versions })
         }).then(function(resp) {
           if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
-          setDatasetAndRender(resp.dataset, undefined, true);
+          applyWorkbenchSnapshot(resp);
           renderInboxDrawer();
-          var ackCnt = Array.isArray(resp.acknowledged) ? resp.acknowledged.length : (resp.acknowledged || nums.length);
+          var ackCnt = acknowledgedCount(resp);
           showToast(t("report.rw.toastRetriageBatchAcked", { count: ackCnt }), "success");
         }).catch(function(err) {
           if (reqEpoch === sessionEpoch) showToast(err.message, "error");
@@ -3946,17 +4141,20 @@
         }
         if (e.target.closest(".r-keep-btn")) {
           var rKeepBtn = e.target.closest(".r-keep-btn");
-          var rRec = DATA.find(function(x) { return x.number === rNum; });
-          var rWatermark = (rRec && rRec.triaged_at) ? rRec.triaged_at : "";
+          var rVersion = cardReviewVersion(rCard);
+          if (!rVersion) {
+            showToast(t("report.rw.inbox.missingReviewVersion"), "error");
+            return;
+          }
           rKeepBtn.disabled = true;
           apiFetch("./api/issues/" + rNum + "/retriage/ack", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ if_unmodified_since: rWatermark })
+            body: JSON.stringify({ expected_version: rVersion })
           })
             .then(function(resp) {
               if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
-              setDatasetAndRender(resp.dataset, undefined, true);
+              applyWorkbenchSnapshot(resp);
               renderInboxDrawer();
               showToast(t("report.rw.toastRetriageAcked", { num: rNum }), "success");
             }).catch(function(err) {
@@ -3971,12 +4169,16 @@
       if (xCard && e.target.closest(".x-restore-btn")) {
         var xNum = parseInt(xCard.getAttribute("data-ex-num"), 10);
         var xBtn = e.target.closest(".x-restore-btn");
+        var xVersion = cardReviewVersion(xCard);
+        if (!xVersion) {
+          showToast(t("report.rw.inbox.missingReviewVersion"), "error");
+          return;
+        }
         xBtn.disabled = true;
-        apiFetch("./api/excluded/" + xNum, { method: "DELETE" })
+        apiFetch("./api/excluded/" + xNum, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expected_version: xVersion }) })
           .then(function(resp) {
             if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
-            EXCLUDED_ITEMS = resp.excluded_issues || [];
-            setDatasetAndRender(resp.dataset, undefined, true);
+            applyWorkbenchSnapshot(resp);
             renderInboxDrawer();
             showToast(t("report.rw.toastExcludedRestored", { num: xNum }), "success");
           }).catch(function(err) {
@@ -3990,7 +4192,20 @@
       if (!card) return;
       var num = parseInt(card.getAttribute("data-pend-num"), 10);
       var pcObj = PENDING.find(function(x) { return x.number === num; });
-      var pendWatermark = (pcObj && pcObj.sync_watermark) ? pcObj.sync_watermark : "";
+      if (e.target.closest(".p-review-btn")) {
+        capturePendingCardDrafts(document.getElementById("inboxBody"));
+        if (pcObj) reviewLatestPending(pendingDrafts[String(num)], pcObj);
+        renderInboxDrawer();
+        return;
+      }
+      if (!e.target.closest(".p-accept-btn") && !e.target.closest(".p-exclude-btn")) return;
+      var draft = pendingDrafts[String(num)];
+      if (!draft || !draft.binding || !validReviewVersion(draft.binding.version)) {
+        showToast(t("report.rw.inbox.missingReviewVersion"), "error");
+        return;
+      }
+      var binding = draft.binding;
+      var pendWatermark = binding.watermark;
 
       if (e.target.closest(".p-accept-btn")) {
         var btn = e.target.closest(".p-accept-btn");
@@ -4006,6 +4221,7 @@
             is_borderline_kept: card.querySelector(".p-bdr").checked,
             force_keep: card.querySelector(".p-fk").checked,
             if_unmodified_since: pendWatermark,
+            expected_version: binding.version,
             note: {
               "zh-CN": card.querySelector(".p-note-zh").value.trim(),
               "en": card.querySelector(".p-note-en").value.trim()
@@ -4013,15 +4229,10 @@
           })
         }).then(function(resp) {
           if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
-          delete pendingDrafts[String(num)];
-          EXCLUDED_ITEMS = null;
-          setDatasetAndRender(resp.dataset, resp.pending_candidates, true);
+          discardPendingDraft(num);
+          applyWorkbenchSnapshot(resp);
           renderInboxDrawer();
-          if (resp.pr_sync_warning) {
-            showToast(t("report.rw.toastPendingSyncWarn", { num: num, warn: resp.pr_sync_warning }), "success");
-          } else {
-            showToast(t("report.rw.toastPendingResolved", { num: num }), "success");
-          }
+          showToast(t("report.rw.toastPendingResolved", { num: num }), "success");
         }).catch(function(err) {
           if (reqEpoch === sessionEpoch) showToast(err.message, "error");
           btn.disabled = false;
@@ -4035,13 +4246,13 @@
           body: JSON.stringify({
             action: "exclude",
             exclude_reason: card.querySelector(".p-ex-reason").value.trim(),
-            if_unmodified_since: pendWatermark
+            if_unmodified_since: pendWatermark,
+            expected_version: binding.version
           })
         }).then(function(resp) {
           if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
-          delete pendingDrafts[String(num)];
-          EXCLUDED_ITEMS = null;
-          setDatasetAndRender(resp.dataset, resp.pending_candidates, true);
+          discardPendingDraft(num);
+          applyWorkbenchSnapshot(resp);
           renderInboxDrawer();
           showToast(t("report.rw.toastPendingResolved", { num: num }), "success");
         }).catch(function(err) {
@@ -4053,7 +4264,7 @@
   }
 
   {
-    function bindHeaderSyncAction(btnId, lblId, idleI18nKey, endpoint, invalidateExcluded, onSuccess) {
+    function bindHeaderSyncAction(btnId, lblId, idleI18nKey, endpoint, onSuccess) {
       document.getElementById(btnId).addEventListener("click", function() {
         if (!CAN_SYNC) return;
         var btn = this;
@@ -4069,8 +4280,7 @@
           body: "{}"
         }).then(function(resp) {
           if (reqEpoch !== sessionEpoch || !CAN_TRIAGE) return;
-          if (invalidateExcluded) EXCLUDED_ITEMS = null;
-          if (resp.dataset) setDatasetAndRender(resp.dataset, resp.pending_candidates, true);
+          applyWorkbenchSnapshot(resp);
           var inboxDrawer = document.getElementById("inboxDrawer");
           if (inboxDrawer && !inboxDrawer.hidden) {
             renderInboxDrawer();
@@ -4087,7 +4297,7 @@
       });
     }
 
-    bindHeaderSyncAction("syncPrsBtn", "syncPrsBtnLbl", "report.rw.syncPrsBtn", "./api/sync/prs", false, function(resp) {
+    bindHeaderSyncAction("syncPrsBtn", "syncPrsBtnLbl", "report.rw.syncPrsBtn", "./api/sync/prs", function(resp) {
       var st = resp.stats || {};
       showToast(t("report.rw.toastPrSynced", {
         open: st.open_count || 0,
@@ -4096,7 +4306,7 @@
       }), "success");
     });
 
-    bindHeaderSyncAction("syncIssuesBtn", "syncIssuesBtnLbl", "report.rw.syncIssuesBtn", "./api/sync/issues", true, function(resp) {
+    bindHeaderSyncAction("syncIssuesBtn", "syncIssuesBtnLbl", "report.rw.syncIssuesBtn", "./api/sync/issues", function(resp) {
       var r = resp.result || {};
       showToast(t("report.rw.toastIssueSynced", {
         pending: r.pending_count || 0
@@ -4130,9 +4340,9 @@
       }
       sessionEpoch += 1;
       excludedLoading = false;
-      EXCLUDED_ITEMS = null;
-      setDatasetAndRender(stateResp.dataset, stateResp.pending_candidates || [], true);
       applySessionState(stateResp.session);
+      applyWorkbenchSnapshot(stateResp);
+      restoreSessionDrafts();
       btn.disabled = false;
       closeAuthModal();
     }).catch(function(err) {
@@ -4165,8 +4375,7 @@
     }).then(function(nextSess) {
       sessionEpoch += 1;
       excludedLoading = false;
-      closeEditDrawer();
-      closeInboxDrawer();
+      clearSessionDrafts();
       stripWorkbenchFromDataset();
       applySessionState(nextSess);
     }).catch(function(err) {
@@ -4185,7 +4394,7 @@
       document.getElementById("syncPopover").hidden = true;
       return;
     }
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && !document.getElementById("editDrawer").hidden && CAN_TRIAGE && DATA_HAS_WORKBENCH) {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && !document.getElementById("editDrawer").hidden && canSubmitEditDraft()) {
       e.preventDefault();
       submitCurrentOverride();
       return;
@@ -4221,33 +4430,7 @@
   SiteI18n.onChange(function() {
     renderAll();
     if (!document.getElementById("inboxDrawer").hidden) renderInboxDrawer();
-    if (editingIssueNum) {
-      var savedTriagedAt = editingTriagedAt;
-      var savedWasWritable = editingWasWritable;
-      var edDraft = {
-        cat: document.getElementById("edCat").value,
-        sev: document.getElementById("edSev").value,
-        sub: document.getElementById("edSub").value,
-        bdr: document.getElementById("edBorderline").checked,
-        fk: document.getElementById("edForceKeep").checked,
-        noteZh: document.getElementById("edNoteZh").value,
-        noteEn: document.getElementById("edNoteEn").value,
-        exOpen: document.getElementById("editExcludeZone").open,
-        exReason: document.getElementById("edExcludeReason").value
-      };
-      openEditDrawer(editingIssueNum, true);
-      editingTriagedAt = savedTriagedAt;
-      editingWasWritable = savedWasWritable;
-      document.getElementById("edCat").value = edDraft.cat;
-      document.getElementById("edSev").value = edDraft.sev;
-      document.getElementById("edSub").value = edDraft.sub;
-      document.getElementById("edBorderline").checked = edDraft.bdr;
-      document.getElementById("edForceKeep").checked = edDraft.fk;
-      document.getElementById("edNoteZh").value = edDraft.noteZh;
-      document.getElementById("edNoteEn").value = edDraft.noteEn;
-      document.getElementById("editExcludeZone").open = edDraft.exOpen;
-      document.getElementById("edExcludeReason").value = edDraft.exReason;
-    }
+    refreshOpenEditDrawer();
   });
   SiteI18n.onThemeChange(updateThemeBtnUI);
 

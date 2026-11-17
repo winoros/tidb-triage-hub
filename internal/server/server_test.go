@@ -790,7 +790,7 @@ func TestRound2OriginDowngradeBasicAuthCoexistenceAndConflictCodes(t *testing.T)
 	}
 }
 
-func TestBackupTimeoutHeaderAndPreMutationPRFetch(t *testing.T) {
+func TestBackupTimeoutHeaderAndExplicitPRRefresh(t *testing.T) {
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "pre_fetch.db")
 	st, err := store.Open(dbPath)
@@ -827,7 +827,11 @@ func TestBackupTimeoutHeaderAndPreMutationPRFetch(t *testing.T) {
 	sy := syncer.NewWithRunner(st, &mergedPRGraphQLRunner{})
 	srv := New(st, sy, Options{AuthToken: "maint-tok"})
 
-	// 1. PATCH /api/issues/88001/triage pre-fetches #88901=MERGED BEFORE baseline snapshot -> needs_retriage=false
+	// Refresh facts explicitly before reviewing and submitting a classification.
+	if _, err := sy.ExecuteSyncPRs(context.Background(), "88901", 0); err != nil {
+		t.Fatal(err)
+	}
+	// 1. PATCH acknowledges the already-refreshed MERGED baseline.
 	patchReq := httptest.NewRequest(http.MethodPatch, "/api/issues/88001/triage", bytes.NewBufferString(`{
 		"cat": "HARD",
 		"severity": "MAJOR",
@@ -902,7 +906,7 @@ func TestProxyTrustRightmostHopSameSiteReadHTTP2DeleteAndPendingConflict(t *test
 		t.Fatal(err)
 	}
 	// Ensure an override row exists so DELETE /api/issues/89001/triage exercises ResetIssueOverride
-	if _, err := st.ApplyIssueOverride(89001, model.TriagePatchRequest{
+	if err := st.ApplyIssueOverride(89001, model.TriagePatchRequest{
 		Cat:       "HARD",
 		Severity:  "MAJOR",
 		Subsystem: "logical_rewrite",

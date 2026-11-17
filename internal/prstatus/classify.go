@@ -102,6 +102,9 @@ type RawCheckItem struct {
 }
 
 type RawPRInput struct {
+	LabelsComplete     bool
+	HeadOID            string
+	BaseOID            string
 	Repo               string
 	Number             int
 	Title              string
@@ -509,6 +512,7 @@ func ClassifyPR(in RawPRInput, now time.Time) model.PRStatus {
 	}
 
 	return model.PRStatus{
+		HeadOID: in.HeadOID, BaseOID: in.BaseOID,
 		Repo:               in.Repo,
 		Num:                in.Number,
 		Label:              FormatPRLabel(in.Repo, in.Number),
@@ -518,6 +522,7 @@ func ClassifyPR(in RawPRInput, now time.Time) model.PRStatus {
 		State:              state,
 		IsDraft:            in.IsDraft,
 		IsCherryPick:       isCP,
+		CherryPickKnown:    isCP || in.LabelsComplete,
 		Mergeable:          in.Mergeable,
 		SizeLabel:          sizeLabel,
 		CreatedAt:          in.CreatedAt,

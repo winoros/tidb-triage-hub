@@ -129,6 +129,9 @@ func SortLinkedPRRefs(prs []model.LinkedPRRef) {
 		if ri != rj {
 			return ri < rj
 		}
-		return prs[i].Num > prs[j].Num
+		if prs[i].Num != prs[j].Num {
+			return prs[i].Num > prs[j].Num
+		}
+		return prs[i].Repo < prs[j].Repo
 	})
 }

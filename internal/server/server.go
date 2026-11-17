@@ -29,7 +29,6 @@ import (
 	"github.com/winoros/tidb-triage-hub/internal/issuesync"
 	"github.com/winoros/tidb-triage-hub/internal/jsonutil"
 	"github.com/winoros/tidb-triage-hub/internal/model"
-	"github.com/winoros/tidb-triage-hub/internal/prstatus"
 	"github.com/winoros/tidb-triage-hub/internal/store"
 	"github.com/winoros/tidb-triage-hub/internal/syncer"
 	webassets "github.com/winoros/tidb-triage-hub/web"
@@ -389,36 +388,39 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/sync/issues", s.handleSyncIssues)
 }
 
+func (s *Server) sessionSnapshot(canTriage bool) (store.WorkbenchSnapshot, error) {
+	if canTriage {
+		return s.store.LoadWorkbenchSnapshot()
+	}
+	ds, err := s.store.BuildDataset(false)
+	redactDatasetForViewer(&ds, false)
+	return store.WorkbenchSnapshot{Dataset: ds, PendingCandidates: []model.PendingCandidate{}, ExcludedIssues: []model.ExcludedIssueRecord{}}, err
+}
+
 func (s *Server) buildBootstrapPayloadJS(r *http.Request) (string, error) {
 	sess := s.resolveSession(r)
-	ds, err := s.store.BuildDataset(sess.Permissions.CanTriage)
+	snapshot, err := s.sessionSnapshot(sess.Permissions.CanTriage)
 	if err != nil {
 		return "", err
-	}
-	redactDatasetForViewer(&ds, sess.Permissions.CanTriage)
-	var pending []model.PendingCandidate
-	if sess.Permissions.CanTriage {
-		pending, err = s.store.ListPendingCandidates()
-		if err != nil {
-			return "", err
-		}
-	} else {
-		pending = []model.PendingCandidate{}
 	}
 
 	sessJS, err := jsonutil.MarshalCompactJS(sess)
 	if err != nil {
 		return "", err
 	}
-	dsJS, err := jsonutil.MarshalCompactJS(ds)
+	dsJS, err := jsonutil.MarshalCompactJS(snapshot.Dataset)
 	if err != nil {
 		return "", err
 	}
-	pendJS, err := jsonutil.MarshalCompactJS(pending)
+	pendJS, err := jsonutil.MarshalCompactJS(snapshot.PendingCandidates)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("window.TRIAGE_SESSION = %s;\nwindow.REPORT_DATASET = %s;\nwindow.TRIAGE_PENDING = %s;\n", sessJS, dsJS, pendJS), nil
+	excludedJS, err := jsonutil.MarshalCompactJS(snapshot.ExcludedIssues)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("window.TRIAGE_SESSION = %s;\nwindow.REPORT_DATASET = %s;\nwindow.TRIAGE_PENDING = %s;\nwindow.TRIAGE_EXCLUDED = %s;\nwindow.TRIAGE_SNAPSHOT_REVISION = %d;\n", sessJS, dsJS, pendJS, excludedJS, snapshot.Revision), nil
 }
 
 var reInlineScriptClose = regexp.MustCompile(`(?i)</script`)
@@ -686,14 +688,14 @@ func (s *Server) handlePostTriageDecisions(w http.ResponseWriter, r *http.Reques
 		switch {
 		case errors.Is(err, store.ErrBatchConflict) || errors.Is(err, store.ErrOverrideConflict):
 			writeErr(w, http.StatusConflict, err)
-		case errors.Is(err, syncer.ErrBatchInputInvalid) || errors.Is(err, store.ErrCanonicalCannotExclude) || errors.Is(err, store.ErrIssueNotFound):
+		case errors.Is(err, store.ErrInvalidInput) || errors.Is(err, syncer.ErrBatchInputInvalid) || errors.Is(err, store.ErrCanonicalCannotExclude) || errors.Is(err, store.ErrIssueNotFound):
 			writeErr(w, http.StatusBadRequest, err)
-		case errors.Is(err, syncer.ErrMissingGitHubPR):
-			writeErr(w, http.StatusUnprocessableEntity, err)
+		case errors.Is(err, context.Canceled):
+			writeContextAbortErr(w, err)
 		case errors.Is(err, context.DeadlineExceeded):
 			writeErr(w, http.StatusGatewayTimeout, err)
 		default:
-			writeJSON(w, http.StatusBadGateway, map[string]any{
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error":  err.Error(),
 				"result": res,
 			})
@@ -797,24 +799,17 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sess := s.resolveSession(r)
-	ds, err := s.store.BuildDataset(sess.Permissions.CanTriage)
+	snapshot, err := s.sessionSnapshot(sess.Permissions.CanTriage)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	redactDatasetForViewer(&ds, sess.Permissions.CanTriage)
-	pending := []model.PendingCandidate{}
-	if sess.Permissions.CanTriage {
-		pending, err = s.store.ListPendingCandidates()
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err)
-			return
-		}
-	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"session":            sess,
-		"dataset":            ds,
-		"pending_candidates": pending,
+		"dataset":            snapshot.Dataset,
+		"pending_candidates": snapshot.PendingCandidates,
+		"excluded_issues":    snapshot.ExcludedIssues,
+		"snapshot_revision":  snapshot.Revision,
 	})
 }
 
@@ -869,12 +864,12 @@ func (s *Server) guardSameSiteRead(w http.ResponseWriter, r *http.Request) bool 
 }
 
 // guardMutation enforces CSRF defenses on state-changing HTTP endpoints:
-// 1. Sec-Fetch-Site (if sent by browser) must be "same-origin" or "none".
-// 2. Origin (if sent by browser) must match the effective request scheme and host
-//    (or rightmost X-Forwarded-Host when TrustProxy is explicitly enabled).
-// 3. Requests carrying a non-empty body or Content-Type header must use "application/json"
-//    (allowing genuinely empty HTTP/2 DELETE streams with ContentLength == -1 while still
-//    blocking chunked HTML form / navigator.sendBeacon simple-request CSRF).
+//  1. Sec-Fetch-Site (if sent by browser) must be "same-origin" or "none".
+//  2. Origin (if sent by browser) must match the effective request scheme and host
+//     (or rightmost X-Forwarded-Host when TrustProxy is explicitly enabled).
+//  3. Requests carrying a non-empty body or Content-Type header must use "application/json"
+//     (allowing genuinely empty HTTP/2 DELETE streams with ContentLength == -1 while still
+//     blocking chunked HTML form / navigator.sendBeacon simple-request CSRF).
 func (s *Server) guardMutation(w http.ResponseWriter, r *http.Request) bool {
 	if sfs := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); sfs != "" {
 		if !strings.EqualFold(sfs, "same-origin") && !strings.EqualFold(sfs, "none") {
@@ -943,28 +938,48 @@ func decodeOptionalJSON(r *http.Request, dst any) error {
 	return nil
 }
 
-func (s *Server) syncTargetsBestEffort(ctx context.Context, targets []prstatus.PRTarget) (string, bool) {
-	if s.syncer == nil || len(targets) == 0 {
-		return "", false
-	}
-	prCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	if _, syncErr := s.syncer.SyncSpecificPRs(prCtx, targets, 10); syncErr != nil {
-		return syncErr.Error(), false
-	}
-	return "", true
-}
-
-func (s *Server) handlePatchIssueTriage(w http.ResponseWriter, r *http.Request) {
+func (s *Server) reviewMutationNumber(w http.ResponseWriter, r *http.Request) (int, bool) {
 	if _, ok := s.requireTriageSession(w, r); !ok {
-		return
+		return 0, false
 	}
 	if !s.guardMutation(w, r) {
-		return
+		return 0, false
 	}
 	num, err := strconv.Atoi(r.PathValue("number"))
 	if err != nil || num <= 0 {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid issue number"))
+		return 0, false
+	}
+	return num, true
+}
+
+func (s *Server) executeReviewCommand(w http.ResponseWriter, r *http.Request, cmd syncer.ReviewCommand) {
+	cmd.Actor = s.resolveSession(r).Viewer.Login
+	out, err := s.syncer.ExecuteReviewCommand(r.Context(), cmd)
+	if err != nil {
+		var committed *syncer.CommittedSnapshotError
+		switch {
+		case errors.As(err, &committed):
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error(), "committed": true})
+		case errors.Is(err, store.ErrInvalidInput), errors.Is(err, syncer.ErrBatchInputInvalid), errors.Is(err, store.ErrCanonicalCannotExclude):
+			writeErr(w, http.StatusBadRequest, err)
+		case errors.Is(err, store.ErrOverrideConflict), errors.Is(err, store.ErrBatchConflict):
+			writeErr(w, http.StatusConflict, err)
+		case errors.Is(err, store.ErrIssueNotFound):
+			writeErr(w, http.StatusNotFound, err)
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			writeContextAbortErr(w, err)
+		default:
+			writeErr(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handlePatchIssueTriage(w http.ResponseWriter, r *http.Request) {
+	num, ok := s.reviewMutationNumber(w, r)
+	if !ok {
 		return
 	}
 	var req model.TriagePatchRequest
@@ -972,264 +987,72 @@ func (s *Server) handlePatchIssueTriage(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	var prSyncWarn string
-	if preTargets, tErr := s.store.ListIssueMissingPRTargets(num); tErr == nil && len(preTargets) > 0 {
-		prSyncWarn, _ = s.syncTargetsBestEffort(r.Context(), preTargets)
-		if cErr := r.Context().Err(); cErr != nil {
-			writeContextAbortErr(w, cErr)
-			return
-		}
-	}
-	missingTargets, err := s.store.ApplyIssueOverride(num, req)
-	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrOverrideConflict):
-			writeErr(w, http.StatusConflict, err)
-		case errors.Is(err, store.ErrIssueNotFound):
-			writeErr(w, http.StatusNotFound, err)
-		default:
-			writeErr(w, http.StatusBadRequest, err)
-		}
-		return
-	}
-	if prSyncWarn == "" && len(missingTargets) > 0 {
-		prSyncWarn, _ = s.syncTargetsBestEffort(r.Context(), missingTargets)
-	}
-	ds, err := s.store.BuildDataset(true)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	var rec model.IssueRecord
-	found := false
-	for _, r0 := range ds.Records {
-		if r0.Number == num {
-			rec = r0
-			found = true
-			break
-		}
-	}
-	if !found {
-		writeErr(w, http.StatusNotFound, fmt.Errorf("issue #%d not found after update", num))
-		return
-	}
-	resp := map[string]any{
-		"record":  rec,
-		"dataset": ds,
-	}
-	if prSyncWarn != "" {
-		resp["pr_sync_warning"] = prSyncWarn
-	}
-	writeJSON(w, http.StatusOK, resp)
+	s.executeReviewCommand(w, r, syncer.ReviewCommand{Action: syncer.ReviewOverride, Number: num, Patch: req})
 }
 
 func (s *Server) handleDeleteIssueTriage(w http.ResponseWriter, r *http.Request) {
+	num, ok := s.reviewMutationNumber(w, r)
+	if !ok {
+		return
+	}
+	var guard model.ReviewPrecondition
+	if err := decodeOptionalJSON(r, &guard); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if guard.IfUnmodifiedSince == "" {
+		guard.IfUnmodifiedSince = r.URL.Query().Get("if_unmodified_since")
+	}
+	s.executeReviewCommand(w, r, syncer.ReviewCommand{Action: syncer.ReviewReset, Number: num, Guard: guard})
+}
+
+func (s *Server) handleAckIssueRetriage(w http.ResponseWriter, r *http.Request) {
+	num, ok := s.reviewMutationNumber(w, r)
+	if !ok {
+		return
+	}
+	var guard model.ReviewPrecondition
+	if err := decodeOptionalJSON(r, &guard); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	s.executeReviewCommand(w, r, syncer.ReviewCommand{Action: syncer.ReviewAck, Number: num, Guard: guard})
+}
+
+func (s *Server) handleAckBatchRetriage(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireTriageSession(w, r); !ok {
 		return
 	}
 	if !s.guardMutation(w, r) {
 		return
 	}
-	num, err := strconv.Atoi(r.PathValue("number"))
-	if err != nil || num <= 0 {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid issue number"))
-		return
-	}
-	var body struct {
-		IfUnmodifiedSince string `json:"if_unmodified_since"`
-	}
-	if err := decodeOptionalJSON(r, &body); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	ifUnmod := strings.TrimSpace(body.IfUnmodifiedSince)
-	if ifUnmod == "" {
-		ifUnmod = strings.TrimSpace(r.URL.Query().Get("if_unmodified_since"))
-	}
-
-	var prSyncWarn string
-	if preTargets, tErr := s.store.ListIssueMissingPRTargets(num); tErr == nil && len(preTargets) > 0 {
-		prSyncWarn, _ = s.syncTargetsBestEffort(r.Context(), preTargets)
-		if cErr := r.Context().Err(); cErr != nil {
-			writeContextAbortErr(w, cErr)
-			return
-		}
-	}
-	missingTargets, err := s.store.ResetIssueOverrideWithGuard(num, ifUnmod)
-	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrOverrideConflict):
-			writeErr(w, http.StatusConflict, err)
-		case errors.Is(err, store.ErrIssueNotFound):
-			writeErr(w, http.StatusNotFound, err)
-		default:
-			writeErr(w, http.StatusBadRequest, err)
-		}
-		return
-	}
-	if prSyncWarn == "" && len(missingTargets) > 0 {
-		prSyncWarn, _ = s.syncTargetsBestEffort(r.Context(), missingTargets)
-	}
-	ds, err := s.store.BuildDataset(true)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	var rec model.IssueRecord
-	found := false
-	for _, r0 := range ds.Records {
-		if r0.Number == num {
-			rec = r0
-			found = true
-			break
-		}
-	}
-	if !found {
-		writeErr(w, http.StatusNotFound, fmt.Errorf("issue #%d not found after reset", num))
-		return
-	}
-	resp := map[string]any{
-		"record":  rec,
-		"dataset": ds,
-	}
-	if prSyncWarn != "" {
-		resp["pr_sync_warning"] = prSyncWarn
-	}
-	writeJSON(w, http.StatusOK, resp)
-}
-
-func (s *Server) handleAckIssueRetriage(w http.ResponseWriter, r *http.Request) {
-	sess, ok := s.requireTriageSession(w, r)
-	if !ok {
-		return
-	}
-	if !s.guardMutation(w, r) {
-		return
-	}
-	num, err := strconv.Atoi(r.PathValue("number"))
-	if err != nil || num <= 0 {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid issue number"))
-		return
-	}
-	var body struct {
-		IfUnmodifiedSince string `json:"if_unmodified_since"`
-	}
-	if err := decodeOptionalJSON(r, &body); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	rec, err := s.store.AcknowledgeIssueRetriageWithGuard(num, sess.Viewer.Login, body.IfUnmodifiedSince)
-	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrOverrideConflict):
-			writeErr(w, http.StatusConflict, err)
-		case errors.Is(err, store.ErrIssueNotFound):
-			writeErr(w, http.StatusNotFound, err)
-		default:
-			writeErr(w, http.StatusBadRequest, err)
-		}
-		return
-	}
-	ds, err := s.store.BuildDataset(true)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"record":  rec,
-		"dataset": ds,
-	})
-}
-
-func (s *Server) handleAckBatchRetriage(w http.ResponseWriter, r *http.Request) {
-	sess, ok := s.requireTriageSession(w, r)
-	if !ok {
-		return
-	}
-	if !s.guardMutation(w, r) {
-		return
-	}
 	var req struct {
-		Numbers        model.FlexIntList `json:"numbers"`
-		BaseExportedAt string            `json:"base_exported_at"`
-		Watermarks     map[string]string `json:"watermarks"`
+		Numbers          model.FlexIntList              `json:"numbers"`
+		ExpectedVersions map[string]model.ReviewVersion `json:"expected_versions"`
+		BaseExportedAt   string                         `json:"base_exported_at"`
+		Watermarks       map[string]string              `json:"watermarks"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if len(req.Numbers) == 0 {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("numbers list cannot be empty"))
-		return
-	}
-	acked, err := s.store.AcknowledgeBatchRetriageWithGuard([]int(req.Numbers), sess.Viewer.Login, req.BaseExportedAt, req.Watermarks)
-	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrOverrideConflict):
-			writeErr(w, http.StatusConflict, err)
-		case errors.Is(err, store.ErrIssueNotFound):
-			writeErr(w, http.StatusNotFound, err)
-		default:
-			writeErr(w, http.StatusBadRequest, err)
-		}
-		return
-	}
-	ds, err := s.store.BuildDataset(true)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"acknowledged": acked,
-		"dataset":      ds,
-	})
+	s.executeReviewCommand(w, r, syncer.ReviewCommand{Action: syncer.ReviewAckBatch, Numbers: req.Numbers, ExpectedVersions: req.ExpectedVersions, BaseExportedAt: req.BaseExportedAt, Watermarks: req.Watermarks})
 }
 
 func (s *Server) handleExcludeIssue(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireTriageSession(w, r); !ok {
-		return
-	}
-	if !s.guardMutation(w, r) {
-		return
-	}
-	num, err := strconv.Atoi(r.PathValue("number"))
-	if err != nil || num <= 0 {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid issue number"))
+	num, ok := s.reviewMutationNumber(w, r)
+	if !ok {
 		return
 	}
 	var req struct {
-		Reason            string `json:"reason"`
-		IfUnmodifiedSince string `json:"if_unmodified_since"`
+		model.ReviewPrecondition
+		Reason string `json:"reason"`
 	}
 	if err := decodeOptionalJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.store.ExcludeExistingIssueWithGuard(num, req.Reason, false, req.IfUnmodifiedSince); err != nil {
-		switch {
-		case errors.Is(err, store.ErrOverrideConflict):
-			writeErr(w, http.StatusConflict, err)
-		case errors.Is(err, store.ErrIssueNotFound):
-			writeErr(w, http.StatusNotFound, err)
-		default:
-			writeErr(w, http.StatusBadRequest, err)
-		}
-		return
-	}
-	ds, err := s.store.BuildDataset(true)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	pending, err := s.store.ListPendingCandidates()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"dataset":            ds,
-		"pending_candidates": pending,
-	})
+	s.executeReviewCommand(w, r, syncer.ReviewCommand{Action: syncer.ReviewExclude, Number: num, Guard: req.ReviewPrecondition, Reason: req.Reason})
 }
 
 func (s *Server) handleGetExcluded(w http.ResponseWriter, r *http.Request) {
@@ -1250,51 +1073,21 @@ func (s *Server) handleGetExcluded(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteExcluded(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireTriageSession(w, r); !ok {
+	num, ok := s.reviewMutationNumber(w, r)
+	if !ok {
 		return
 	}
-	if !s.guardMutation(w, r) {
+	var guard model.ReviewPrecondition
+	if err := decodeOptionalJSON(r, &guard); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	num, err := strconv.Atoi(r.PathValue("number"))
-	if err != nil || num <= 0 {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid issue number"))
-		return
-	}
-	if err := s.store.RestoreExcludedIssue(num); err != nil {
-		if errors.Is(err, store.ErrIssueNotFound) {
-			writeErr(w, http.StatusNotFound, err)
-		} else {
-			writeErr(w, http.StatusBadRequest, err)
-		}
-		return
-	}
-	items, err := s.store.ListExcludedIssues()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	ds, err := s.store.BuildDataset(true)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"excluded_issues": items,
-		"dataset":         ds,
-	})
+	s.executeReviewCommand(w, r, syncer.ReviewCommand{Action: syncer.ReviewRestore, Number: num, Guard: guard})
 }
 
 func (s *Server) handleResolvePending(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireTriageSession(w, r); !ok {
-		return
-	}
-	if !s.guardMutation(w, r) {
-		return
-	}
-	num, err := strconv.Atoi(r.PathValue("number"))
-	if err != nil || num <= 0 {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid issue number"))
+	num, ok := s.reviewMutationNumber(w, r)
+	if !ok {
 		return
 	}
 	var req model.PendingResolveRequest
@@ -1302,50 +1095,7 @@ func (s *Server) handleResolvePending(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	var prSyncWarn string
-	if strings.EqualFold(strings.TrimSpace(req.Action), "accept") {
-		if preTargets, tErr := s.store.ListPendingMissingPRTargets(num); tErr == nil && len(preTargets) > 0 {
-			prSyncWarn, _ = s.syncTargetsBestEffort(r.Context(), preTargets)
-			if cErr := r.Context().Err(); cErr != nil {
-				writeContextAbortErr(w, cErr)
-				return
-			}
-		}
-	}
-	missingTargets, err := s.store.ResolvePendingCandidateWithTargets(num, req)
-	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrOverrideConflict):
-			writeErr(w, http.StatusConflict, err)
-		case errors.Is(err, store.ErrIssueNotFound):
-			writeErr(w, http.StatusNotFound, err)
-		default:
-			writeErr(w, http.StatusBadRequest, err)
-		}
-		return
-	}
-	if prSyncWarn == "" && len(missingTargets) > 0 {
-		prSyncWarn, _ = s.syncTargetsBestEffort(r.Context(), missingTargets)
-	}
-
-	ds, err := s.store.BuildDataset(true)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	pending, err := s.store.ListPendingCandidates()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	resp := map[string]any{
-		"dataset":            ds,
-		"pending_candidates": pending,
-	}
-	if prSyncWarn != "" {
-		resp["pr_sync_warning"] = prSyncWarn
-	}
-	writeJSON(w, http.StatusOK, resp)
+	s.executeReviewCommand(w, r, syncer.ReviewCommand{Action: syncer.ReviewResolve, Number: num, Pending: req})
 }
 
 func (s *Server) handleSyncPRs(w http.ResponseWriter, r *http.Request) {
@@ -1395,20 +1145,18 @@ func (s *Server) handleSyncPRs(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"stats": stats})
 		return
 	}
-	ds, err := s.store.BuildDataset(true)
+	snapshot, err := s.store.LoadWorkbenchSnapshot()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	pending, err := s.store.ListPendingCandidates()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
+	ds, pending := snapshot.Dataset, snapshot.PendingCandidates
 	writeJSON(w, http.StatusOK, map[string]any{
 		"stats":              stats,
 		"dataset":            ds,
 		"pending_candidates": pending,
+		"excluded_issues":    snapshot.ExcludedIssues,
+		"snapshot_revision":  snapshot.Revision,
 	})
 }
 
@@ -1485,20 +1233,18 @@ func (s *Server) handleSyncIssues(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"result": res})
 		return
 	}
-	ds, err := s.store.BuildDataset(true)
+	snapshot, err := s.store.LoadWorkbenchSnapshot()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	pending, err := s.store.ListPendingCandidates()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
+	ds, pending := snapshot.Dataset, snapshot.PendingCandidates
 	writeJSON(w, http.StatusOK, map[string]any{
 		"result":             res,
 		"dataset":            ds,
 		"pending_candidates": pending,
+		"excluded_issues":    snapshot.ExcludedIssues,
+		"snapshot_revision":  snapshot.Revision,
 	})
 }
 

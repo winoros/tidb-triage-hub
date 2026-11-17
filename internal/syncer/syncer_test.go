@@ -229,8 +229,9 @@ func TestExecuteSyncPRsManualSourceMissingPRAndPreCommitCancel(t *testing.T) {
 		t.Fatalf("expected ErrMissingGitHubPR for nonexistent PR #98999, got %v", err)
 	}
 
-	// 3. Finding #7: Cancelling ctx during pre-write PR fetch aborts BEFORE committing batch triage to SQLite!
+	// Cancellation before submission aborts without GitHub work or a SQLite commit.
 	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 	syCancel := NewWithRunner(st, &stubTargetedSyncRunner{cancelOnPRFetch: cancel})
 	_, err = syCancel.ApplyTriageDecisionsWithOptions(ctx, model.BatchTriageDecisions{
 		Overrides: map[string]model.TriagePatchRequest{

@@ -53,7 +53,6 @@ SiteI18n.extend("en", {
       "toastPrSynced": "Refreshed {open} open PRs ({calls} GraphQL calls in {ms}ms)",
       "toastIssueSynced": "Incremental issue sync complete ({pending} pending candidates)",
       "toastPendingResolved": "Resolved pending candidate #{num}",
-      "toastPendingSyncWarn": "Resolved #{num} (live PR sync skipped: {warn})",
       "toastRetriageAcked": "Confirmed current triage for Issue #{num}",
       "toastRetriageBatchAcked": "Confirmed current triage for {count} issues",
       "toastIssueExcluded": "Excluded supplemental issue #{num} from candidate pool",
@@ -67,6 +66,7 @@ SiteI18n.extend("en", {
         "substantive_new_comments": "Substantive Comments"
       },
       "drawer": {
+        "issueUnavailable": "Issue #{num} is no longer in the active list. The editor was closed; reload its current queue before reviewing again.",
         "title": "Calibrate Issue #{num}",
         "inspectTitle": "Issue #{num} Triage Details",
         "close": "Close",
@@ -125,6 +125,10 @@ SiteI18n.extend("en", {
         "suggestedBadge": "Suggested ({confidence})",
         "suggestedSignals": "Signals",
         "prFilesSummary": "Mainline PR #{num}: {nonTest} non-test files (+{add}/-{del}) · {test} test",
+        "savedRefreshFailed": "Saved, but the response could not be refreshed. Check the latest state before trying again.",
+        "missingReviewVersion": "Review data is incomplete. Refresh before acknowledging.",
+        "staleDraft": "This draft was reviewed against older data. Review the latest issue before applying it.",
+        "reviewLatest": "Review latest",
         "canonicalExcludeTip": "Canonical issue (sig/planner + type/bug) cannot be excluded; accept as Filtered instead",
         "scopesLabel": "Matched Scopes",
         "bodySummary": "Inspect Issue Body & Recent Comments ({comments})",

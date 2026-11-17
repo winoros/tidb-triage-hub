@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -154,7 +153,7 @@ func (sy *Syncer) syncSpecificPRs(ctx context.Context, targets []prstatus.PRTarg
 		return prstatus.FetchStats{}, err
 	}
 	finished := time.Now()
-	if err := sy.store.UpsertPRStatuses(statuses, time.Time{}); err != nil {
+	if err := sy.store.ApplyPRFetchResults(statuses, stats.UnavailablePRs, time.Time{}); err != nil {
 		return prstatus.FetchStats{}, err
 	}
 	sy.store.RecordSyncRun("pr_status_targeted", started, finished, stats)
@@ -172,7 +171,7 @@ func (sy *Syncer) syncPRStatusesLocked(ctx context.Context) (prstatus.FetchStats
 		return prstatus.FetchStats{}, err
 	}
 	finished := time.Now()
-	if err := sy.store.UpsertPRStatuses(statuses, finished); err != nil {
+	if err := sy.store.ApplyPRFetchResults(statuses, stats.UnavailablePRs, finished); err != nil {
 		return prstatus.FetchStats{}, err
 	}
 	sy.lastFullPRSyncUnix.Store(finished.UnixNano())
@@ -362,199 +361,26 @@ func (sy *Syncer) SyncIssuesWithOptions(ctx context.Context, opts IssueSyncOptio
 
 type TriageApplyResult struct {
 	store.BatchTriageResult
-	SyncedNewPRs       int                        `json:"synced_new_prs"`
-	PRStats            *prstatus.FetchStats       `json:"pr_stats,omitempty"`
-	PRSyncWarning      string                     `json:"pr_sync_warning,omitempty"`
 	ValidationWarnings []triage.ValidationWarning `json:"validation_warnings,omitempty"`
-}
-
-func collectManualLinkTargets(manualLinks map[string][]string) []prstatus.PRTarget {
-	if len(manualLinks) == 0 {
-		return nil
-	}
-	seen := make(map[string]bool)
-	var out []prstatus.PRTarget
-	for _, specs := range manualLinks {
-		for _, sp := range specs {
-			targets, err := prstatus.ParsePRSpecs(sp, store.DefaultRepo)
-			if err != nil {
-				continue
-			}
-			for _, t := range targets {
-				k := model.PRKey(t.Repo, t.Number)
-				if !seen[k] {
-					seen[k] = true
-					t.TrackSources = []string{"issue_linked"}
-					out = append(out, t)
-				}
-			}
-		}
-	}
-	return out
-}
-
-func mergePRFetchStats(dst *prstatus.FetchStats, src prstatus.FetchStats) {
-	dst.GraphQLCalls += src.GraphQLCalls
-	dst.GraphQLCost += src.GraphQLCost
-	dst.TotalFetched += src.TotalFetched
-	dst.OpenCount += src.OpenCount
-	dst.ClosedCount += src.ClosedCount
-	dst.DurationMs += src.DurationMs
-	if src.RateLimitLimit > 0 {
-		dst.RateLimitLimit = src.RateLimitLimit
-		dst.RateLimitRemaining = src.RateLimitRemaining
-		dst.RateLimitResetUTC8 = src.RateLimitResetUTC8
-	}
-}
-
-func collectDecisionIssueNums[V any](m map[string]V) []int {
-	if len(m) == 0 {
-		return nil
-	}
-	var nums []int
-	seen := make(map[int]bool, len(m))
-	for k := range m {
-		s := strings.TrimPrefix(strings.TrimSpace(k), "#")
-		if n, err := strconv.Atoi(s); err == nil && n > 0 && !seen[n] {
-			seen[n] = true
-			nums = append(nums, n)
-		}
-	}
-	return nums
 }
 
 func (sy *Syncer) ApplyTriageDecisions(ctx context.Context, dec model.BatchTriageDecisions, syncNewPRs bool, minQuota int) (TriageApplyResult, error) {
 	return sy.ApplyTriageDecisionsWithOptions(ctx, dec, store.BatchApplyOptions{SkipConflicts: false}, syncNewPRs, minQuota)
 }
 
-func (sy *Syncer) ApplyTriageDecisionsWithOptions(ctx context.Context, dec model.BatchTriageDecisions, applyOpts store.BatchApplyOptions, syncNewPRs bool, minQuota int) (TriageApplyResult, error) {
-	// Intentionally do not acquire sy.mu here: Store.mu serializes SQLite batch writes safely in <5ms,
-	// and ApplyIssueSync re-reads live tables inside its write transaction, so batch triage calls
-	// (including remote Machine B `triage`) never stall behind multi-minute background syncs.
+// ApplyTriageDecisionsWithOptions commits reviewed decisions without network
+// I/O. The last two arguments are retained for source compatibility with older
+// callers; refresh PRs explicitly before exporting a review snapshot.
+func (sy *Syncer) ApplyTriageDecisionsWithOptions(ctx context.Context, dec model.BatchTriageDecisions, applyOpts store.BatchApplyOptions, _ bool, _ int) (TriageApplyResult, error) {
 	if err := ctx.Err(); err != nil {
 		return TriageApplyResult{}, err
 	}
-
 	started := time.Now()
-	var combinedStats prstatus.FetchStats
-	hasStats := false
-	quotaChecked := false
-	prSyncWarn := ""
-
-	// Pre-fetch uncached PRs BEFORE mutating SQLite so baseline snapshotting sees true GitHub PR states
-	// immediately on the first transaction, avoiding any post-commit transient window.
-	if syncNewPRs && (len(dec.ManualPRLinks) > 0 || len(dec.NewIssues) > 0 || len(dec.Overrides) > 0) {
-		planned, _, err := sy.store.PlanBatchDecisionsWithOptions(dec, applyOpts)
-		if err != nil {
-			return TriageApplyResult{}, err
-		}
-		syncedKeys := make(map[string]bool)
-		manualTargets := collectManualLinkTargets(planned.ManualPRLinks)
-		if len(manualTargets) > 0 {
-			if minQuota > 0 {
-				if _, err := ghgql.CheckQuota(ctx, sy.runner, minQuota); err != nil {
-					return TriageApplyResult{}, fmt.Errorf("pre-flight quota check for %d manual PR link(s) failed: %w", len(manualTargets), err)
-				}
-				quotaChecked = true
-			}
-			stats, err := sy.syncSpecificPRs(ctx, manualTargets)
-			if err != nil {
-				return TriageApplyResult{}, fmt.Errorf("pre-fetching %d manual PR link(s) failed: %w", len(manualTargets), err)
-			}
-			missingPRs, err := sy.store.HasPRStatuses(manualTargets)
-			if err != nil {
-				return TriageApplyResult{}, err
-			}
-			if len(missingPRs) > 0 {
-				return TriageApplyResult{}, fmt.Errorf("%w: %s", ErrMissingGitHubPR, strings.Join(missingPRs, ", "))
-			}
-			for _, t := range manualTargets {
-				syncedKeys[model.PRKey(t.Repo, t.Number)] = true
-			}
-			mergePRFetchStats(&combinedStats, stats)
-			hasStats = true
-		}
-
-		var preTargets []prstatus.PRTarget
-		addPreTargets := func(list []prstatus.PRTarget) {
-			for _, t := range list {
-				k := model.PRKey(t.Repo, t.Number)
-				if !syncedKeys[k] {
-					syncedKeys[k] = true
-					preTargets = append(preTargets, t)
-				}
-			}
-		}
-		if newNums := collectDecisionIssueNums(planned.NewIssues); len(newNums) > 0 {
-			if list, err := sy.store.ListPendingMissingPRTargets(newNums...); err == nil {
-				addPreTargets(list)
-			}
-		}
-		if ovrNums := collectDecisionIssueNums(planned.Overrides); len(ovrNums) > 0 {
-			if list, err := sy.store.ListIssueMissingPRTargets(ovrNums...); err == nil {
-				addPreTargets(list)
-			}
-		}
-		if len(preTargets) > 0 {
-			if minQuota > 0 && !quotaChecked {
-				if _, qErr := ghgql.CheckQuota(ctx, sy.runner, minQuota); qErr != nil {
-					if err := ctx.Err(); err != nil {
-						return TriageApplyResult{}, err
-					}
-					prSyncWarn = fmt.Sprintf("triage decisions saved, but pre-flight quota check for %d newly linked PR(s) failed: %v", len(preTargets), qErr)
-				} else {
-					quotaChecked = true
-				}
-			}
-			if prSyncWarn == "" {
-				stats, sErr := sy.syncSpecificPRs(ctx, preTargets)
-				if sErr != nil {
-					if err := ctx.Err(); err != nil {
-						return TriageApplyResult{}, err
-					}
-					prSyncWarn = fmt.Sprintf("triage decisions saved, but syncing %d newly linked PR(s) failed: %v", len(preTargets), sErr)
-				} else {
-					mergePRFetchStats(&combinedStats, stats)
-					hasStats = true
-				}
-			}
-		}
-	}
-
-	if err := ctx.Err(); err != nil {
-		return TriageApplyResult{}, err
-	}
-	bRes, err := sy.store.ApplyBatchTriageDecisionsWithOptions(dec, applyOpts)
+	res, err := sy.store.ApplyBatchTriageDecisionsWithOptions(dec, applyOpts)
 	if err != nil {
 		return TriageApplyResult{}, err
 	}
-	out := TriageApplyResult{
-		BatchTriageResult: bRes,
-		PRSyncWarning:     prSyncWarn,
-	}
-	if syncNewPRs && out.PRSyncWarning == "" && len(bRes.MissingPRTargets) > 0 {
-		if minQuota > 0 && !quotaChecked {
-			if _, qErr := ghgql.CheckQuota(ctx, sy.runner, minQuota); qErr != nil {
-				out.PRSyncWarning = fmt.Sprintf("triage decisions saved, but pre-flight quota check for %d newly linked PR(s) failed: %v", len(bRes.MissingPRTargets), qErr)
-			}
-		}
-		if out.PRSyncWarning == "" {
-			stats, sErr := sy.syncSpecificPRs(ctx, bRes.MissingPRTargets)
-			if sErr != nil {
-				out.PRSyncWarning = fmt.Sprintf("triage decisions saved, but syncing %d newly linked PR(s) failed: %v", len(bRes.MissingPRTargets), sErr)
-			} else {
-				if cnt, cntErr := sy.store.CountRetriageNeeded(); cntErr == nil {
-					out.RemainingRetriage = cnt
-				}
-				mergePRFetchStats(&combinedStats, stats)
-				hasStats = true
-			}
-		}
-	}
-	if hasStats {
-		out.SyncedNewPRs = combinedStats.TotalFetched
-		out.PRStats = &combinedStats
-	}
+	out := TriageApplyResult{BatchTriageResult: res}
 	sy.store.RecordSyncRun("triage_apply", started, time.Now(), out)
 	return out, nil
 }

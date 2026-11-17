@@ -25,10 +25,12 @@ fragment IssueFields on Issue {
             state
             isDraft
             baseRefName
+            headRefOid
+            baseRefOid
             url
             updatedAt
             mergedAt
-            labels(first: 10) { nodes { name } }
+            labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
             repository { nameWithOwner }
           }
         }
@@ -42,10 +44,12 @@ fragment IssueFields on Issue {
             state
             isDraft
             baseRefName
+            headRefOid
+            baseRefOid
             url
             updatedAt
             mergedAt
-            labels(first: 10) { nodes { name } }
+            labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
             repository { nameWithOwner }
           }
         }
@@ -112,11 +116,13 @@ query($q: String!, $cursor: String) {
         body
         url
         baseRefName
+        headRefOid
+        baseRefOid
         state
         isDraft
         updatedAt
         mergedAt
-        labels(first: 10) { nodes { name } }
+        labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
         repository { nameWithOwner }
         closingIssuesReferences(first: 20) {
           totalCount

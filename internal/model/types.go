@@ -129,24 +129,41 @@ func (n *LocalizedNote) IsEmpty() bool {
 }
 
 type LinkedPRRef struct {
-	Num          int    `json:"num"`
-	Repo         string `json:"repo"`
-	Label        string `json:"label"`
-	URL          string `json:"url"`
-	State        string `json:"state"`
-	Title        string `json:"title"`
-	IsCherryPick bool   `json:"is_cherry_pick"`
-	UpdatedAt    string `json:"updated_at"`
-	MergedAt     string `json:"merged_at,omitempty"`
-	AckAt        string `json:"-"`
-	Source       string `json:"source,omitempty"`
+	Num             int    `json:"num"`
+	Repo            string `json:"repo"`
+	Label           string `json:"label"`
+	URL             string `json:"url"`
+	State           string `json:"state"`
+	Title           string `json:"title"`
+	IsCherryPick    bool   `json:"is_cherry_pick"`
+	UpdatedAt       string `json:"updated_at"`
+	MergedAt        string `json:"merged_at,omitempty"`
+	AckAt           string `json:"-"`
+	Source          string `json:"source,omitempty"`
+	HeadOID         string `json:"head_oid,omitempty"`
+	BaseOID         string `json:"base_oid,omitempty"`
+	CherryPickKnown bool   `json:"cherry_pick_known,omitempty"`
 }
 
 func PRKey(repo string, num int) string {
 	return fmt.Sprintf("%s#%d", repo, num)
 }
 
+// ReviewVersion identifies the facts/classification and notes read by a reviewer.
+// The counters are independent and never reset when an issue leaves or re-enters a queue.
+// They are opaque to clients: echo the version from the reviewed snapshot unchanged.
+type ReviewVersion struct {
+	Review int64 `json:"review"`
+	Notes  int64 `json:"notes"`
+}
+
+type ReviewPrecondition struct {
+	ExpectedVersion   *ReviewVersion `json:"expected_version,omitempty"`
+	IfUnmodifiedSince string         `json:"if_unmodified_since,omitempty"`
+}
+
 type IssueRecord struct {
+	Version          *ReviewVersion `json:"version,omitempty"`
 	Number           int            `json:"number"`
 	Title            string         `json:"title"`
 	Author           string         `json:"author"`
@@ -237,6 +254,9 @@ type PRStatus struct {
 	RunningChecksCount int           `json:"running_checks_count,omitempty"`
 	PassedChecksCount  int           `json:"passed_checks_count,omitempty"`
 	TrackSources       []string      `json:"track_sources,omitempty"`
+	HeadOID            string        `json:"head_oid,omitempty"`
+	BaseOID            string        `json:"base_oid,omitempty"`
+	CherryPickKnown    bool          `json:"cherry_pick_known,omitempty"`
 }
 
 type DeltaClosedIssue struct {
@@ -345,6 +365,9 @@ type PendingPRDetail struct {
 	TestFileCount     int          `json:"test_file_count"`
 	ChangedFiles      []PRFileStat `json:"changed_files,omitempty"`
 	BodyExcerpt       string       `json:"body_excerpt,omitempty"`
+	HeadOID           string       `json:"head_oid,omitempty"`
+	BaseOID           string       `json:"base_oid,omitempty"`
+	CherryPickKnown   bool         `json:"cherry_pick_known,omitempty"`
 }
 
 type PendingClues struct {
@@ -368,6 +391,7 @@ type SuggestedTriage struct {
 }
 
 type PendingCandidate struct {
+	Version         *ReviewVersion    `json:"version,omitempty"`
 	Revision        int               `json:"-"`
 	SyncWatermark   string            `json:"sync_watermark,omitempty"`
 	Number          int               `json:"number"`
@@ -388,6 +412,7 @@ type PendingCandidate struct {
 }
 
 type RetriageCandidate struct {
+	Version          *ReviewVersion    `json:"version,omitempty"`
 	Number           int               `json:"number"`
 	URL              string            `json:"url"`
 	Title            string            `json:"title"`
@@ -412,12 +437,13 @@ type RetriageCandidate struct {
 }
 
 type ExcludedIssueRecord struct {
-	Number         int      `json:"number"`
-	Title          string   `json:"title,omitempty"`
-	Reason         string   `json:"reason"`
-	ExcludedLabels []string `json:"excluded_labels,omitempty"`
-	Source         string   `json:"source,omitempty"`
-	ExcludedAt     string   `json:"excluded_at"`
+	Version        *ReviewVersion `json:"version,omitempty"`
+	Number         int            `json:"number"`
+	Title          string         `json:"title,omitempty"`
+	Reason         string         `json:"reason"`
+	ExcludedLabels []string       `json:"excluded_labels,omitempty"`
+	Source         string         `json:"source,omitempty"`
+	ExcludedAt     string         `json:"excluded_at"`
 }
 
 // FlexIntList unmarshals JSON arrays containing either integers ([73063]) or issue strings (["73063", "#73064"]).
@@ -464,9 +490,10 @@ type TriageConflict struct {
 }
 
 type NotePatchRequest struct {
-	ZhCN              string `json:"zh-CN"`
-	En                string `json:"en"`
-	IfUnmodifiedSince string `json:"if_unmodified_since,omitempty"`
+	ZhCN              string         `json:"zh-CN"`
+	En                string         `json:"en"`
+	ExpectedVersion   *ReviewVersion `json:"expected_version,omitempty"`
+	IfUnmodifiedSince string         `json:"if_unmodified_since,omitempty"`
 }
 
 func (n NotePatchRequest) LocalizedNote() *LocalizedNote {
@@ -478,6 +505,7 @@ func (n *NotePatchRequest) UnmarshalJSON(data []byte) error {
 		ZhCN              string         `json:"zh-CN"`
 		En                string         `json:"en"`
 		Note              *LocalizedNote `json:"note"`
+		ExpectedVersion   *ReviewVersion `json:"expected_version,omitempty"`
 		IfUnmodifiedSince string         `json:"if_unmodified_since"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
@@ -491,19 +519,23 @@ func (n *NotePatchRequest) UnmarshalJSON(data []byte) error {
 	*n = NotePatchRequest{
 		ZhCN:              zh,
 		En:                en,
+		ExpectedVersion:   aux.ExpectedVersion,
 		IfUnmodifiedSince: aux.IfUnmodifiedSince,
 	}
 	return nil
 }
 
 type BatchTriageDecisions struct {
-	BaseExportedAt string                        `json:"base_exported_at,omitempty"`
-	NewIssues      map[string]TriagePatchRequest `json:"new_issues,omitempty"`
-	ExcludeIssues  map[string]string             `json:"exclude_issues,omitempty"`
-	Overrides      map[string]TriagePatchRequest `json:"overrides,omitempty"`
-	Notes          map[string]NotePatchRequest   `json:"notes,omitempty"`
-	AckRetriage    FlexIntList                   `json:"ack_retriage,omitempty"`
-	ManualPRLinks  map[string][]string           `json:"manual_pr_links,omitempty"`
+	// ExpectedVersions covers every selected action, including ack/exclude/manual links.
+	// A non-nil map opts into the version protocol and requires an entry for each action.
+	ExpectedVersions map[string]ReviewVersion      `json:"expected_versions"`
+	BaseExportedAt   string                        `json:"base_exported_at,omitempty"`
+	NewIssues        map[string]TriagePatchRequest `json:"new_issues,omitempty"`
+	ExcludeIssues    map[string]string             `json:"exclude_issues,omitempty"`
+	Overrides        map[string]TriagePatchRequest `json:"overrides,omitempty"`
+	Notes            map[string]NotePatchRequest   `json:"notes,omitempty"`
+	AckRetriage      FlexIntList                   `json:"ack_retriage,omitempty"`
+	ManualPRLinks    map[string][]string           `json:"manual_pr_links,omitempty"`
 }
 
 type TriagePatchRequest struct {
@@ -513,6 +545,7 @@ type TriagePatchRequest struct {
 	IsBorderlineKept  bool           `json:"is_borderline_kept"`
 	ForceKeep         bool           `json:"force_keep"`
 	Note              *LocalizedNote `json:"note"`
+	ExpectedVersion   *ReviewVersion `json:"expected_version,omitempty"`
 	IfUnmodifiedSince string         `json:"if_unmodified_since,omitempty"`
 
 	unmarshaled       bool `json:"-"`
@@ -528,6 +561,7 @@ func (r *TriagePatchRequest) UnmarshalJSON(data []byte) error {
 		IsBorderlineKept  *bool          `json:"is_borderline_kept"`
 		ForceKeep         *bool          `json:"force_keep"`
 		Note              *LocalizedNote `json:"note"`
+		ExpectedVersion   *ReviewVersion `json:"expected_version,omitempty"`
 		IfUnmodifiedSince string         `json:"if_unmodified_since"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
@@ -538,6 +572,7 @@ func (r *TriagePatchRequest) UnmarshalJSON(data []byte) error {
 		Severity:          aux.Severity,
 		Subsystem:         aux.Subsystem,
 		Note:              aux.Note,
+		ExpectedVersion:   aux.ExpectedVersion,
 		IfUnmodifiedSince: aux.IfUnmodifiedSince,
 		unmarshaled:       true,
 	}
@@ -574,6 +609,7 @@ func (r TriagePatchRequest) MarshalJSON() ([]byte, error) {
 		IsBorderlineKept  *bool          `json:"is_borderline_kept,omitempty"`
 		ForceKeep         *bool          `json:"force_keep,omitempty"`
 		Note              *LocalizedNote `json:"note"`
+		ExpectedVersion   *ReviewVersion `json:"expected_version,omitempty"`
 		IfUnmodifiedSince string         `json:"if_unmodified_since,omitempty"`
 	}{
 		Cat:               r.Cat,
@@ -582,6 +618,7 @@ func (r TriagePatchRequest) MarshalJSON() ([]byte, error) {
 		IsBorderlineKept:  bdrPtr,
 		ForceKeep:         fkPtr,
 		Note:              r.Note,
+		ExpectedVersion:   r.ExpectedVersion,
 		IfUnmodifiedSince: r.IfUnmodifiedSince,
 	})
 }
@@ -731,6 +768,7 @@ type PendingResolveRequest struct {
 	ForceKeep         bool           `json:"force_keep,omitempty"`
 	Note              *LocalizedNote `json:"note,omitempty"`
 	ExcludeReason     string         `json:"exclude_reason,omitempty"`
+	ExpectedVersion   *ReviewVersion `json:"expected_version,omitempty"`
 	IfUnmodifiedSince string         `json:"if_unmodified_since,omitempty"`
 }
 

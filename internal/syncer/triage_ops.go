@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -103,6 +104,38 @@ func (sy *Syncer) BuildStatusReportWithOptions(ctx context.Context, dbDisplay st
 	return out, nil
 }
 
+// refreshExportEvidence persists missing evidence before an export reads its final
+// snapshot. Read-only exports consistently use the evidence already in the store.
+func (sy *Syncer) refreshExportEvidence(ctx context.Context, enabled bool, refs []model.LinkedPRRef) (string, error) {
+	if !enabled || len(refs) == 0 {
+		return "", nil
+	}
+	refs, err := sy.store.FilterAutomaticPRLookups(refs)
+	if err != nil {
+		return "", err
+	}
+	if len(refs) == 0 {
+		return "", nil
+	}
+	if sy.store.ReadOnly() {
+		return "read-only database: exporting persisted evidence without GitHub refresh", nil
+	}
+	details, fetchErr := triage.FetchPendingPRDetails(ctx, sy.Runner(), nil, refs)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := sy.store.SyncFetchedPRDetails(details); err != nil {
+		if store.IsReadOnlyError(err) {
+			return "read-only database: refreshed evidence could not be persisted; exporting stored evidence", nil
+		}
+		return "", err
+	}
+	if fetchErr != nil {
+		return fetchErr.Error(), nil
+	}
+	return "", nil
+}
+
 func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOptions) (map[string]any, int, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
@@ -113,29 +146,24 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 		if err != nil {
 			return nil, 0, fmt.Errorf("list backfill candidates: %w", err)
 		}
-		var prDetailMap map[string]model.PendingPRDetail
-		var bfEnrichErr error
-		if opts.EnrichPRs && len(recs) <= 30 {
-			var allPRs []model.LinkedPRRef
-			for _, r := range recs {
-				allPRs = append(allPRs, triage.FilterRelevantKernelPRs(r.PRs)...)
-			}
-			if len(allPRs) > 0 {
-				prDetailMap, bfEnrichErr = triage.FetchPendingPRDetails(ctx, sy.Runner(), nil, allPRs)
-				if err := ctx.Err(); err != nil {
-					return nil, 0, err
-				}
-				if len(prDetailMap) > 0 {
-					_ = sy.store.SyncFetchedPRDetails(prDetailMap)
-					if refreshed, rErr := sy.store.ListBackfillNoteCandidates(opts.BackfillNotes, opts.CatFilter); rErr == nil {
-						recs = refreshed
-					}
-				}
-			}
+		var refs []model.LinkedPRRef
+		for _, r := range recs {
+			refs = append(refs, triage.PRsNeedingEnrichment(r.PRs, r.PRDetails)...)
 		}
+		enrichWarning, err := sy.refreshExportEvidence(ctx, opts.EnrichPRs && len(recs) <= 30, refs)
+		if err != nil {
+			return nil, 0, err
+		}
+		// Re-read after all external work, even when enrichment returned no PRs.
+		// The timestamp is a conservative legacy cutoff; versions identify the snapshot.
 		exportedAt := model.NowRFC3339Nano()
+		recs, err = sy.store.ListBackfillNoteCandidates(opts.BackfillNotes, opts.CatFilter)
+		if err != nil {
+			return nil, 0, err
+		}
 
 		type backfillItem struct {
+			Version     *model.ReviewVersion    `json:"version"`
 			Number      int                     `json:"number"`
 			URL         string                  `json:"url"`
 			Title       string                  `json:"title"`
@@ -150,13 +178,13 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 		}
 		items := make([]backfillItem, 0, len(recs))
 		tmplNotes := make(map[string]model.NotePatchRequest, len(recs))
+		expectedVersions := make(map[string]model.ReviewVersion, len(recs))
 		for _, r := range recs {
+			expectedVersions[strconv.Itoa(r.Number)] = *r.Version
 			syncedPRs := r.PRs
-			var dets []model.PendingPRDetail
-			if len(prDetailMap) > 0 {
-				syncedPRs, dets = triage.SyncPRRefsWithDetails(r.PRs, prDetailMap)
-			}
+			dets := r.PRDetails
 			items = append(items, backfillItem{
+				Version:     r.Version,
 				Number:      r.Number,
 				URL:         fmt.Sprintf("https://github.com/pingcap/tidb/issues/%d", r.Number),
 				Title:       r.Title,
@@ -172,6 +200,7 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 			tmplNotes[strconv.Itoa(r.Number)] = model.NotePatchRequest{
 				ZhCN:              "TODO: 填写中文根因与影响简述",
 				En:                "TODO: Fill in concise English root-cause & impact note",
+				ExpectedVersion:   r.Version,
 				IfUnmodifiedSince: r.TriagedAt,
 			}
 		}
@@ -180,16 +209,17 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 			"mode":            "backfill_notes",
 			"exported_at_utc": exportedAt,
 			"backfill_count":  len(items),
-			"instructions":    "Inspect each issue & linked PR diff (`gh issue view <num> --repo pingcap/tidb --comments`, `gh pr diff <pr> --repo pingcap/tidb`), fill in `notes` (preserving `base_exported_at` and `if_unmodified_since`), and apply via `triage-hub triage --stdin --skip-todo`.",
+			"instructions":    "Inspect each issue & linked PR diff (`gh issue view <num> --repo pingcap/tidb --comments`, `gh pr diff <pr> --repo pingcap/tidb`), fill in `notes` (preserving `expected_versions` and `expected_version`), and apply via `triage-hub triage --stdin --skip-todo`.",
 			"triage_rubric":   triage.DefaultRubric(opts.Compact),
 			"backfill_issues": items,
 			"decisions_template": model.BatchTriageDecisions{
-				BaseExportedAt: exportedAt,
-				Notes:          tmplNotes,
+				ExpectedVersions: expectedVersions,
+				BaseExportedAt:   exportedAt,
+				Notes:            tmplNotes,
 			},
 		}
-		if bfEnrichErr != nil {
-			bundle["enrichment_warning"] = fmt.Sprintf("PR file enrichment degraded: %v", bfEnrichErr)
+		if enrichWarning != "" {
+			bundle["enrichment_warning"] = "PR file enrichment degraded: " + enrichWarning
 		}
 		return bundle, len(items), nil
 	}
@@ -260,114 +290,41 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 		}
 	}
 
-	var enrichWarnings []string
-	dirtyIdx := make([]int, 0)
+	var refs []model.LinkedPRRef
+	for _, pc := range pending {
+		refs = append(refs, triage.PRsNeedingEnrichment(pc.PRs, pc.PRDetails)...)
+	}
+	for _, rc := range retriageList {
+		refs = append(refs, triage.PRsNeedingEnrichment(rc.PRs, rc.PRDetails)...)
+	}
+	enrichWarning, err := sy.refreshExportEvidence(ctx, opts.EnrichPRs, refs)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Finish enrichment first, then bind facts, notes and versions in one read.
+	snapshot, err := sy.store.LoadReviewSnapshot(!skipPending, !skipRetriage, specificRetriageNums)
+	if err != nil {
+		return nil, 0, err
+	}
+	pending = filterPendingSlice(snapshot.Pending)
+	retriageList = snapshot.Retriage
+	exportedAt := snapshot.ExportedAt
 	for i := range pending {
-		if pending[i].SuggestedTriage == nil || (opts.EnrichPRs && triage.CandidateNeedsPREnrichment(pending[i])) {
-			dirtyIdx = append(dirtyIdx, i)
+		p := &pending[i]
+		if p.Clues == nil {
+			p.Clues = triage.ExtractClues(p.Title, p.Body, p.Labels, p.RecentComments, p.PRDetails)
+		}
+		if p.SuggestedTriage == nil {
+			p.SuggestedTriage = triage.SuggestTriage(p.Title, p.Labels, p.PRs, p.PRDetails, p.Clues)
 		}
 	}
-	if len(dirtyIdx) > 0 {
-		toEnrich := make([]model.PendingCandidate, len(dirtyIdx))
-		for k, idx := range dirtyIdx {
-			toEnrich[k] = pending[idx]
-		}
-		enriched, enrichErr := triage.EnrichAndAnalyzePending(ctx, sy.Runner(), nil, toEnrich, opts.EnrichPRs)
-		if err := ctx.Err(); err != nil {
-			return nil, 0, err
-		}
-		if enrichErr != nil {
-			enrichWarnings = append(enrichWarnings, enrichErr.Error())
-		}
-		var toPersist []model.PendingCandidate
-		for k, idx := range dirtyIdx {
-			prevSug := pending[idx].SuggestedTriage
-			wasUnanalyzed := prevSug == nil
-			if enrichErr != nil && !wasUnanalyzed && triage.CandidateNeedsPREnrichment(enriched[k]) {
-				enriched[k].SuggestedTriage = prevSug
-			}
-			pending[idx] = enriched[k]
-			if enrichErr == nil || (!opts.EnrichPRs && wasUnanalyzed) || !triage.CandidateNeedsPREnrichment(enriched[k]) {
-				toPersist = append(toPersist, enriched[k])
-			}
-		}
-		if len(toPersist) > 0 {
-			if persisted, pErr := sy.store.PersistEnrichedPendingCandidates(toPersist); pErr == nil {
-				persistedMap := make(map[int]model.PendingCandidate, len(persisted))
-				for _, pc := range persisted {
-					persistedMap[pc.Number] = pc
-				}
-				triedPersist := make(map[int]bool, len(toPersist))
-				for _, pc := range toPersist {
-					triedPersist[pc.Number] = true
-				}
-				nextPending := make([]model.PendingCandidate, 0, len(pending))
-				for _, pc := range pending {
-					if triedPersist[pc.Number] {
-						if livePC, ok := persistedMap[pc.Number]; ok {
-							nextPending = append(nextPending, livePC)
-						}
-						continue
-					}
-					nextPending = append(nextPending, pc)
-				}
-				pending = nextPending
-			}
-		} else if liveNums, nErr := sy.store.ListPendingCandidateNumbers(); nErr == nil {
-			liveSet := make(map[int]bool, len(liveNums))
-			for _, n := range liveNums {
-				liveSet[n] = true
-			}
-			nextPending := make([]model.PendingCandidate, 0, len(pending))
-			for _, pc := range pending {
-				if liveSet[pc.Number] {
-					nextPending = append(nextPending, pc)
-				}
-			}
-			pending = nextPending
-		}
+	for i := range retriageList {
+		r := &retriageList[i]
+		r.Clues = triage.ExtractClues(r.Title, r.Body, r.Labels, r.RecentComments, r.PRDetails)
+		r.SuggestedTriage = triage.SuggestTriage(r.Title, r.Labels, r.PRs, r.PRDetails, r.Clues)
 	}
 
-	if len(retriageList) > 0 {
-		var allPRs []model.LinkedPRRef
-		if opts.EnrichPRs {
-			for _, rc := range retriageList {
-				allPRs = append(allPRs, triage.FilterRelevantKernelPRs(rc.PRs)...)
-			}
-		}
-		var detMap map[string]model.PendingPRDetail
-		if len(allPRs) > 0 {
-			var rtEnrichErr error
-			detMap, rtEnrichErr = triage.FetchPendingPRDetails(ctx, sy.Runner(), nil, allPRs)
-			if err := ctx.Err(); err != nil {
-				return nil, 0, err
-			}
-			if rtEnrichErr != nil {
-				enrichWarnings = append(enrichWarnings, rtEnrichErr.Error())
-			}
-			if len(detMap) > 0 {
-				_ = sy.store.SyncFetchedPRDetails(detMap)
-				if refreshed, rErr := loadRetriage(); rErr == nil {
-					retriageList = refreshed
-				}
-			}
-		}
-		for i := range retriageList {
-			if len(detMap) > 0 {
-				retriageList[i].PRs, retriageList[i].PRDetails = triage.SyncPRRefsWithDetails(retriageList[i].PRs, detMap)
-			}
-			retriageList[i].Clues = triage.ExtractClues(
-				retriageList[i].Title, retriageList[i].Body, retriageList[i].Labels,
-				retriageList[i].RecentComments, retriageList[i].PRDetails,
-			)
-			retriageList[i].SuggestedTriage = triage.SuggestTriage(
-				retriageList[i].Title, retriageList[i].Labels, retriageList[i].PRs,
-				retriageList[i].PRDetails, retriageList[i].Clues,
-			)
-		}
-	}
-
-	exportedAt := model.NowRFC3339Nano()
 	if pending == nil {
 		pending = []model.PendingCandidate{}
 	}
@@ -375,9 +332,14 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 		retriageList = []model.RetriageCandidate{}
 	}
 
+	expectedVersions := make(map[string]model.ReviewVersion, len(pending)+len(retriageList))
+	for _, r := range retriageList {
+		expectedVersions[strconv.Itoa(r.Number)] = *r.Version
+	}
 	tmplNew := make(map[string]model.TriagePatchRequest, len(pending))
 	suggestedExcludesHint := make(map[string]string)
 	for _, pc := range pending {
+		expectedVersions[strconv.Itoa(pc.Number)] = *pc.Version
 		cat := "TODO: REVIEW"
 		sev := "TODO: REVIEW"
 		subsys := "TODO: REVIEW"
@@ -400,6 +362,7 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 			Severity:          sev,
 			Subsystem:         subsys,
 			IsBorderlineKept:  borderline,
+			ExpectedVersion:   pc.Version,
 			IfUnmodifiedSince: pc.SyncWatermark,
 			Note: &model.LocalizedNote{
 				ZhCN: "TODO: 填写中文根因与影响简述",
@@ -414,7 +377,7 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 		"exported_at_utc": exportedAt,
 		"pending_count":   len(pending),
 		"retriage_count":  len(retriageList),
-		"instructions":    "Independently judge `pending_candidates` (SQL realism/reachability, PR diff, difficulty, and severity — do NOT blindly accept `decisions_template` pre-fills) and `retriage_candidates` against `triage_rubric` (including `retriage_guide`). Preserve `base_exported_at` and `if_unmodified_since` so concurrent edits/syncs are safely detected. For each `retriage_candidates` item, explicitly add it to ONE of `overrides` (classification recalibration; copy `triaged_at` to `if_unmodified_since`), `ack_retriage` (classification unchanged, advance baseline), `notes` (note-only update without resetting baseline), or `exclude_issues` (supplemental non-optimizer only). Submit via `triage-hub triage --stdin` (`--skip-todo`, `--dry-run`). Canonical (`sig/planner` + `type/bug`) issues must NEVER be put in `exclude_issues`.",
+		"instructions":    "Independently judge `pending_candidates` (SQL realism/reachability, PR diff, difficulty, and severity — do NOT blindly accept `decisions_template` pre-fills) and `retriage_candidates` against `triage_rubric` (including `retriage_guide`). Preserve `expected_versions` and each `expected_version` unchanged; they bind decisions to the reviewed snapshot. Timestamps are only a legacy fallback. For each `retriage_candidates` item, explicitly add it to ONE of `overrides` (classification recalibration; keep the item in `expected_versions`), `ack_retriage` (classification unchanged, advance baseline), `notes` (note-only update without resetting baseline), or `exclude_issues` (supplemental non-optimizer only). Submit via `triage-hub triage --stdin` (`--skip-todo`, `--dry-run`). Canonical (`sig/planner` + `type/bug`) issues must NEVER be put in `exclude_issues`.",
 		"valid_enums": map[string]any{
 			"cat":       model.ValidCategories,
 			"severity":  model.ValidSeverities,
@@ -422,11 +385,12 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 		},
 		"triage_rubric": triage.DefaultRubric(opts.Compact),
 		"decisions_template": model.BatchTriageDecisions{
-			BaseExportedAt: exportedAt,
-			NewIssues:      tmplNew,
-			ExcludeIssues:  map[string]string{},
-			Overrides:      tmplOvr,
-			AckRetriage:    model.FlexIntList{},
+			ExpectedVersions: expectedVersions,
+			BaseExportedAt:   exportedAt,
+			NewIssues:        tmplNew,
+			ExcludeIssues:    map[string]string{},
+			Overrides:        tmplOvr,
+			AckRetriage:      model.FlexIntList{},
 		},
 		"pending_candidates":  pending,
 		"retriage_candidates": retriageList,
@@ -434,8 +398,8 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 	if len(suggestedExcludesHint) > 0 {
 		bundle["suggested_excludes_hint"] = suggestedExcludesHint
 	}
-	if len(enrichWarnings) > 0 {
-		bundle["enrichment_warning"] = fmt.Sprintf("PR file enrichment degraded: %s", strings.Join(enrichWarnings, "; "))
+	if enrichWarning != "" {
+		bundle["enrichment_warning"] = "PR file enrichment degraded: " + enrichWarning
 	}
 
 	return bundle, len(pending) + len(retriageList), nil
@@ -451,71 +415,99 @@ func HasActionableDecisions(dec model.BatchTriageDecisions) bool {
 		len(dec.ManualPRLinks) > 0
 }
 
-// FormatDryRunBatchResult formats the canonical dry-run output map from post-conflict-filtered `planned` decisions.
-func FormatDryRunBatchResult(
-	planned model.BatchTriageDecisions,
-	dbValidated bool,
-	warnings []triage.ValidationWarning,
-	conflicts []model.TriageConflict,
-) map[string]any {
-	out := map[string]any{
-		"dry_run":             true,
-		"db_validated":        dbValidated,
-		"new_issues_count":    len(planned.NewIssues),
-		"exclude_count":       len(planned.ExcludeIssues),
-		"overrides_count":     len(planned.Overrides),
-		"notes_count":         len(planned.Notes),
-		"ack_retriage_count":  len(planned.AckRetriage),
-		"manual_pr_links":     len(planned.ManualPRLinks),
-		"validation_warnings": warnings,
-		"prepared_decisions":  planned,
-	}
-	if len(conflicts) > 0 {
-		out["skipped_conflicts"] = conflicts
-	}
-	return out
+type DryRunBatchResult struct {
+	DryRun             bool                       `json:"dry_run"`
+	DBValidated        bool                       `json:"db_validated"`
+	NewIssuesCount     int                        `json:"new_issues_count"`
+	ExcludeCount       int                        `json:"exclude_count"`
+	OverridesCount     int                        `json:"overrides_count"`
+	NotesCount         int                        `json:"notes_count"`
+	AckRetriageCount   int                        `json:"ack_retriage_count"`
+	ManualPRLinks      int                        `json:"manual_pr_links"`
+	ValidationWarnings []triage.ValidationWarning `json:"validation_warnings"`
+	PreparedDecisions  model.BatchTriageDecisions `json:"prepared_decisions"`
+	SkippedConflicts   []model.TriageConflict     `json:"skipped_conflicts,omitempty"`
 }
 
-// ExecuteBatchTriage validates, optionally dry-runs, or applies batch triage decisions.
-func (sy *Syncer) ExecuteBatchTriage(ctx context.Context, req BatchTriageExecuteRequest) (any, error) {
+type BatchTriageExecutionResult struct {
+	Applied TriageApplyResult
+	Preview *DryRunBatchResult
+}
+
+func (r BatchTriageExecutionResult) MarshalJSON() ([]byte, error) {
+	if r.Preview != nil {
+		return json.Marshal(r.Preview)
+	}
+	return json.Marshal(r.Applied)
+}
+
+func FormatDryRunBatchResult(planned model.BatchTriageDecisions, dbValidated bool, warnings []triage.ValidationWarning, conflicts []model.TriageConflict) DryRunBatchResult {
+	return DryRunBatchResult{DryRun: true, DBValidated: dbValidated, NewIssuesCount: len(planned.NewIssues), ExcludeCount: len(planned.ExcludeIssues), OverridesCount: len(planned.Overrides), NotesCount: len(planned.Notes), AckRetriageCount: len(planned.AckRetriage), ManualPRLinks: len(planned.ManualPRLinks), ValidationWarnings: warnings, PreparedDecisions: planned, SkippedConflicts: conflicts}
+}
+
+type PreparedBatchTriage struct {
+	decisions     model.BatchTriageDecisions
+	warnings      []triage.ValidationWarning
+	dryRun        bool
+	skipConflicts bool
+}
+
+func (p PreparedBatchTriage) SyntaxPreview() DryRunBatchResult {
+	return FormatDryRunBatchResult(p.decisions, false, p.warnings, nil)
+}
+
+// PrepareBatchTriage is the shared syntax/rubric preflight for local and remote callers.
+func PrepareBatchTriage(req BatchTriageExecuteRequest) (PreparedBatchTriage, error) {
 	cleaned, warnings, err := triage.ValidateAndPrepareDecisions(req.Decisions, triage.ValidateOptions{
 		SkipTodo:       req.SkipTodo,
 		AllowEmptyNote: req.AllowEmptyNote,
 		StrictNotes:    req.StrictNotes,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrBatchInputInvalid, err)
+		return PreparedBatchTriage{}, fmt.Errorf("%w: %v", ErrBatchInputInvalid, err)
 	}
 
 	if !HasActionableDecisions(cleaned) {
-		return nil, fmt.Errorf("%w: no actionable entries remaining after validation (check if all entries were skipped by --skip-todo)", ErrBatchInputInvalid)
+		return PreparedBatchTriage{}, fmt.Errorf("%w: no actionable entries remaining after validation (check if all entries were skipped by --skip-todo)", ErrBatchInputInvalid)
 	}
 
-	applyOpts := store.BatchApplyOptions{SkipConflicts: req.SkipConflicts}
-	if req.DryRun {
+	return PreparedBatchTriage{decisions: cleaned, warnings: warnings, dryRun: req.DryRun, skipConflicts: req.SkipConflicts}, nil
+}
+
+// ExecuteBatchTriage validates, optionally dry-runs, or applies batch triage decisions.
+func (sy *Syncer) ExecuteBatchTriage(ctx context.Context, req BatchTriageExecuteRequest) (BatchTriageExecutionResult, error) {
+	if err := ctx.Err(); err != nil {
+		return BatchTriageExecutionResult{}, err
+	}
+	prepared, err := PrepareBatchTriage(req)
+	if err != nil {
+		return BatchTriageExecutionResult{}, err
+	}
+
+	return sy.ExecutePreparedBatchTriage(ctx, prepared)
+}
+
+// ExecutePreparedBatchTriage rechecks database preconditions but never repeats
+// syntax preparation; CLI callers can safely validate before opening a database.
+func (sy *Syncer) ExecutePreparedBatchTriage(ctx context.Context, prepared PreparedBatchTriage) (BatchTriageExecutionResult, error) {
+	if err := ctx.Err(); err != nil {
+		return BatchTriageExecutionResult{}, err
+	}
+	cleaned, warnings := prepared.decisions, prepared.warnings
+	applyOpts := store.BatchApplyOptions{SkipConflicts: prepared.skipConflicts}
+	if prepared.dryRun {
 		planned, conflicts, valErr := sy.store.PlanBatchDecisionsWithOptions(cleaned, applyOpts)
 		if valErr != nil {
-			if errors.Is(valErr, store.ErrBatchConflict) || errors.Is(valErr, store.ErrCanonicalCannotExclude) {
-				return nil, valErr
-			}
-			return nil, fmt.Errorf("%w: %w", ErrBatchInputInvalid, valErr)
+			return BatchTriageExecutionResult{}, valErr
 		}
-		return FormatDryRunBatchResult(planned, true, warnings, conflicts), nil
+		preview := FormatDryRunBatchResult(planned, true, warnings, conflicts)
+		return BatchTriageExecutionResult{Preview: &preview}, nil
 	}
 
-	syncNewPRs := true
-	if req.SyncNewPRs != nil {
-		syncNewPRs = *req.SyncNewPRs
-	}
-	minQuota := 20
-	if req.MinQuota != nil {
-		minQuota = *req.MinQuota
-	}
-
-	res, err := sy.ApplyTriageDecisionsWithOptions(ctx, cleaned, applyOpts, syncNewPRs, minQuota)
+	res, err := sy.ApplyTriageDecisionsWithOptions(ctx, cleaned, applyOpts, false, 0)
 	if err != nil {
-		return res, err
+		return BatchTriageExecutionResult{Applied: res}, err
 	}
 	res.ValidationWarnings = warnings
-	return res, nil
+	return BatchTriageExecutionResult{Applied: res}, nil
 }
