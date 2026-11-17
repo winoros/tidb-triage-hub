@@ -1,13 +1,16 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"github.com/winoros/tidb-triage-hub/internal/store"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,8 +20,14 @@ type oauthTransport func(*http.Request) (*http.Response, error)
 
 func (f oauthTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func oauthServer() *Server {
-	return New(nil, nil, Options{AuthToken: "cli-secret", GitHub: GitHubOptions{
+func oauthServer(t *testing.T) *Server {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "auth.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return New(st, nil, Options{AuthToken: "cli-secret", GitHub: GitHubOptions{
 		ClientID: "client", ClientSecret: "secret", CallbackURL: "https://hub.example/auth/github/callback", OwnerID: 7846227}})
 }
 func githubLogin(t *testing.T, s *Server, userID int64) *http.Cookie {
@@ -86,7 +95,7 @@ func githubLogin(t *testing.T, s *Server, userID int64) *http.Cookie {
 func TestGitHubIdentityPermissionsAndLogout(t *testing.T) {
 	for _, owner := range []bool{true, false} {
 		t.Run(fmt.Sprint(owner), func(t *testing.T) {
-			s := oauthServer()
+			s := oauthServer(t)
 			id := int64(123)
 			if owner {
 				id = 7846227
@@ -115,7 +124,7 @@ func TestGitHubIdentityPermissionsAndLogout(t *testing.T) {
 	}
 }
 func TestGitHubStateValidationAndExpiry(t *testing.T) {
-	s := oauthServer()
+	s := oauthServer(t)
 	s.github.pending["state"] = oauthEntry{time.Now().Add(-time.Second), "verifier"}
 	for _, cookie := range []string{"", "different", "state"} {
 		req := httptest.NewRequest("GET", "/auth/github/callback?state=state&code=code", nil)
@@ -128,7 +137,10 @@ func TestGitHubStateValidationAndExpiry(t *testing.T) {
 			t.Fatalf("accepted invalid state: %s", cookie)
 		}
 	}
-	s.github.sessions["expired"] = githubSession{time.Now().Add(-time.Second), githubIdentity{7846227, "winoros"}}
+	if err := s.store.CreateGitHubSession(context.Background(), "expired", "", s.githubAudience(),
+		store.GitHubSession{UserID: 7846227, Login: "winoros", Expires: time.Now().Add(-time.Second)}); err != nil {
+		t.Fatal(err)
+	}
 	req := httptest.NewRequest("GET", "/api/session", nil)
 	req.AddCookie(&http.Cookie{Name: githubCookie, Value: "expired"})
 	if s.resolveSession(req).Authenticated {
@@ -144,7 +156,7 @@ func TestAllMutationsDenyAnonymousAndOtherGitHubUsers(t *testing.T) {
 	}
 	for _, mode := range []string{"unconfigured", "anonymous", "other-user", "legacy-cookie"} {
 		t.Run(mode, func(t *testing.T) {
-			s := oauthServer()
+			s := oauthServer(t)
 			var c *http.Cookie
 			switch mode {
 			case "unconfigured":
@@ -171,7 +183,7 @@ func TestAllMutationsDenyAnonymousAndOtherGitHubUsers(t *testing.T) {
 	}
 }
 func TestGitHubTokenPolicy(t *testing.T) {
-	s := oauthServer()
+	s := oauthServer(t)
 	req := httptest.NewRequest("GET", "/api/session", nil)
 	req.Header.Set("Authorization", "Bearer cli-secret")
 	if !s.resolveSession(req).Permissions.CanTriage {
@@ -189,13 +201,13 @@ func TestGitHubTokenPolicy(t *testing.T) {
 }
 func TestGitHubConfigValidation(t *testing.T) {
 	for _, callback := range []string{"http://example.com/auth/github/callback", "https://example.com/wrong", "https://example.com/auth/github/callback?x=1"} {
-		opts := oauthServer().opts.GitHub
+		opts := oauthServer(t).opts.GitHub
 		opts.CallbackURL = callback
 		if opts.Validate() == nil {
 			t.Errorf("accepted %s", callback)
 		}
 	}
-	opts := oauthServer().opts.GitHub
+	opts := oauthServer(t).opts.GitHub
 	if err := opts.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +220,7 @@ func TestGitHubConfigValidation(t *testing.T) {
 func TestGitHubProviderFailureNeverCreatesSession(t *testing.T) {
 	for _, failure := range []string{"token-status", "token-error", "user-status", "user-invalid"} {
 		t.Run(failure, func(t *testing.T) {
-			s := oauthServer()
+			s := oauthServer(t)
 			s.github.pending["state"] = oauthEntry{time.Now().Add(time.Minute), "verifier"}
 			s.github.client.Transport = oauthTransport(func(r *http.Request) (*http.Response, error) {
 				status, body := http.StatusOK, `{"access_token":"token"}`
@@ -231,7 +243,7 @@ func TestGitHubProviderFailureNeverCreatesSession(t *testing.T) {
 			req.AddCookie(&http.Cookie{Name: oauthCookie, Value: "state"})
 			rec := httptest.NewRecorder()
 			s.Handler().ServeHTTP(rec, req)
-			if rec.Code != http.StatusBadGateway || len(s.github.sessions) != 0 {
+			if rec.Code != http.StatusBadGateway {
 				t.Fatal("failed provider request authenticated a user")
 			}
 		})
@@ -243,7 +255,7 @@ func TestAdditionalGitHubMaintainers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := oauthServer()
+	s := oauthServer(t)
 	s.opts.GitHub.MaintainerIDs = ids
 	for _, id := range append([]int64{7846227}, ids...) {
 		sess := s.githubSessionInfo(githubIdentity{ID: id, Login: "renamed-user"})
@@ -288,5 +300,120 @@ func TestParseGitHubMaintainerIDs(t *testing.T) {
 	ids, err = ParseGitHubMaintainerIDs(" ")
 	if err != nil || len(ids) != 0 {
 		t.Fatal("empty allowlist must be valid")
+	}
+}
+
+func TestGitHubSessionSurvivesDatabaseReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "restart.db")
+	opts := oauthServer(t).opts
+	open := func() *Server {
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		return New(st, nil, opts)
+	}
+	first := open()
+	cookie := githubLogin(t, first, 7846227)
+	request := func() *http.Request {
+		req := httptest.NewRequest("GET", "/api/session", nil)
+		req.AddCookie(cookie)
+		return req
+	}
+	if err := first.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second := open()
+	if !second.resolveSession(request()).Permissions.CanTriage {
+		t.Fatal("restart lost session")
+	}
+	second.opts.GitHub.OwnerID = 123
+	if sess := second.resolveSession(request()); !sess.Authenticated || sess.Permissions.CanTriage {
+		t.Fatal("session retained old permissions")
+	}
+	second.opts = opts
+	second.opts.GitHub.ClientSecret = "rotated-secret"
+	if !second.resolveSession(request()).Authenticated {
+		t.Fatal("secret rotation lost session")
+	}
+	second.opts.GitHub.ClientID = "another-app"
+	if second.resolveSession(request()).Authenticated {
+		t.Fatal("session accepted by another OAuth app")
+	}
+	second.opts = opts
+	second.opts.GitHub.CallbackURL = "https://other.example/auth/github/callback"
+	if second.resolveSession(request()).Authenticated {
+		t.Fatal("session accepted by another deployment")
+	}
+	second.opts = opts
+	logout := httptest.NewRequest("POST", "/api/session/logout", strings.NewReader("{}"))
+	logout.Header.Set("Content-Type", "application/json")
+	logout.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	second.Handler().ServeHTTP(rec, logout)
+	if rec.Code != 200 {
+		t.Fatalf("logout: %d", rec.Code)
+	}
+	if err := second.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	third := open()
+	if third.resolveSession(request()).Authenticated {
+		t.Fatal("restart resurrected revoked session")
+	}
+}
+
+func TestGitHubSessionStorageFailure(t *testing.T) {
+	s := oauthServer(t)
+	cookie := githubLogin(t, s, 7846227)
+	if err := s.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/api/session", nil)
+	req.AddCookie(cookie)
+	if s.resolveSession(req).Permissions.CanTriage {
+		t.Fatal("storage failure granted permission")
+	}
+	req = httptest.NewRequest("POST", "/api/session/logout", strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatal("logout falsely reported successful revocation")
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == githubCookie {
+			t.Fatal("failed revocation discarded retry cookie")
+		}
+	}
+}
+
+func TestGitHubLoginDisabledWithReadOnlyDatabase(t *testing.T) {
+	s := oauthServer(t)
+	cookie := githubLogin(t, s, 7846227)
+	path := s.store.DBPath()
+	if err := s.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	u := &url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}
+	st, err := store.Open(u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ro := New(st, nil, s.opts)
+	req := httptest.NewRequest("GET", "/api/session", nil)
+	req.AddCookie(cookie)
+	if sess := ro.resolveSession(req); sess.GitHubLogin || sess.Authenticated || sess.Permissions.CanTriage {
+		t.Fatalf("read-only DB advertised login: %+v", sess)
+	}
+	for _, path := range []string{"/auth/github", "/auth/github/callback?code=code&state=state"} {
+		rec := httptest.NewRecorder()
+		ro.Handler().ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("OAuth route enabled: %s", path)
+		}
 	}
 }

@@ -287,6 +287,11 @@ func OpenSnapshotForDryRun(dbPath, seedPath string, fallbackJSON []byte) (*Store
 		cleanupDir()
 		return nil, nil, err
 	}
+	if _, err := st.db.Exec("DELETE FROM github_sessions"); err != nil {
+		_ = st.Close()
+		cleanupDir()
+		return nil, nil, fmt.Errorf("remove dry-run login sessions: %w", err)
+	}
 	if _, err := st.BootstrapIfEmptyWithFallback(seedPath, fallbackJSON); err != nil {
 		_ = st.Close()
 		cleanupDir()
@@ -366,6 +371,12 @@ func (s *Store) BackupToContext(ctx context.Context, destPath string) error {
 		return fmt.Errorf("sqlite vacuum into %s: %w", absDest, vacErr)
 	}
 	_ = os.Chmod(tmpPath, 0o600)
+	// Export data without login sessions: restoring a backup must not resurrect
+	// a session that was revoked after the snapshot was taken.
+	if err := clearSnapshotSessions(ctx, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("remove backup login sessions: %w", err)
+	}
 	if err := os.Rename(tmpPath, absDest); err != nil {
 		_ = os.Remove(tmpPath)
 		return err

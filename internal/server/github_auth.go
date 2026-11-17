@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/winoros/tidb-triage-hub/internal/model"
+	"github.com/winoros/tidb-triage-hub/internal/store"
 )
 
 // GitHubOptions configures identity-only OAuth using stable GitHub user IDs.
@@ -79,19 +80,14 @@ type oauthEntry struct {
 	Expires  time.Time
 	Verifier string
 }
-type githubSession struct {
-	Expires time.Time
-	User    githubIdentity
-}
 type githubAuth struct {
-	mu       sync.Mutex
-	pending  map[string]oauthEntry
-	sessions map[string]githubSession
-	client   *http.Client
+	mu      sync.Mutex
+	pending map[string]oauthEntry
+	client  *http.Client
 }
 
 func newGitHubAuth() *githubAuth {
-	return &githubAuth{pending: make(map[string]oauthEntry), sessions: make(map[string]githubSession),
+	return &githubAuth{pending: make(map[string]oauthEntry),
 		client: &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 func randomAuthValue() string {
@@ -108,29 +104,37 @@ func (a *githubAuth) prune() {
 			delete(a.pending, k)
 		}
 	}
-	for k, v := range a.sessions {
-		if !now.Before(v.Expires) {
-			delete(a.sessions, k)
-		}
-	}
 }
 func (s *Server) githubCookie(w http.ResponseWriter, name, value string, age int) {
 	http.SetCookie(w, &http.Cookie{Name: name, Value: value, Path: "/", MaxAge: age,
 		HttpOnly: true, Secure: strings.HasPrefix(s.opts.GitHub.CallbackURL, "https://"), SameSite: http.SameSiteLaxMode})
 }
+
+// A read-only SQLite connection cannot create or revoke durable sessions.
+func (s *Server) githubLoginEnabled() bool {
+	return s.opts.GitHub.Enabled() && s.store != nil && !s.store.ReadOnly()
+}
+
 func (s *Server) githubSession(r *http.Request) (githubIdentity, bool) {
 	c, err := r.Cookie(githubCookie)
 	if err != nil {
 		return githubIdentity{}, false
 	}
-	s.github.mu.Lock()
-	defer s.github.mu.Unlock()
-	v, ok := s.github.sessions[c.Value]
-	return v.User, ok && time.Now().Before(v.Expires)
+	if s.store == nil {
+		return githubIdentity{}, false
+	}
+	session, ok, err := s.store.LoadGitHubSession(r.Context(), c.Value, s.githubAudience())
+	return githubIdentity{ID: session.UserID, Login: session.Login}, ok && err == nil
 }
+
+// Bind sessions to this OAuth app and deployment, while allowing secret rotation.
+func (s *Server) githubAudience() string {
+	return s.opts.GitHub.ClientID + "\n" + s.opts.GitHub.CallbackURL
+}
+
 func (s *Server) handleGitHubLogin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	if !s.opts.GitHub.Enabled() || s.opts.GitHub.Validate() != nil {
+	if !s.githubLoginEnabled() || s.opts.GitHub.Validate() != nil {
 		http.Error(w, "GitHub login is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -153,7 +157,7 @@ func (s *Server) handleGitHubLogin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
-	if !s.opts.GitHub.Enabled() || s.opts.GitHub.Validate() != nil {
+	if !s.githubLoginEnabled() || s.opts.GitHub.Validate() != nil {
 		http.Error(w, "GitHub login is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -191,18 +195,19 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := randomAuthValue()
-	s.github.mu.Lock()
-	s.github.prune()
+	oldToken := ""
 	if old, err := r.Cookie(githubCookie); err == nil {
-		delete(s.github.sessions, old.Value)
+		oldToken = old.Value
 	}
-	if len(s.github.sessions) >= 10000 {
-		s.github.mu.Unlock()
-		http.Error(w, "Too many active sessions", http.StatusServiceUnavailable)
+	if s.store == nil {
+		http.Error(w, "Login session storage unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	s.github.sessions[id] = githubSession{time.Now().Add(24 * time.Hour), user}
-	s.github.mu.Unlock()
+	if err := s.store.CreateGitHubSession(r.Context(), id, oldToken, s.githubAudience(),
+		store.GitHubSession{UserID: user.ID, Login: user.Login, Expires: time.Now().Add(24 * time.Hour)}); err != nil {
+		http.Error(w, "Cannot save login session; try again", http.StatusServiceUnavailable)
+		return
+	}
 	s.githubCookie(w, githubCookie, id, 86400)
 	s.writeSessionCookie(w, r, "", -1)
 	http.Redirect(w, r, "/", http.StatusSeeOther)

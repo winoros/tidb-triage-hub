@@ -232,13 +232,13 @@ func (s *Server) sessionFor(authenticated bool) model.SessionInfo {
 
 // resolveSession resolves RBAC permissions from ReadOnly flag, Bearer token, or maintainer cookie.
 func (s *Server) resolveSession(r *http.Request) model.SessionInfo {
-	if s.opts.GitHub.Enabled() {
+	if s.githubLoginEnabled() {
 		if user, ok := s.githubSession(r); ok {
 			return s.githubSessionInfo(user)
 		}
 	}
 	sess := s.sessionFor(s.isRequestAuthenticated(r))
-	sess.GitHubLogin = s.opts.GitHub.Enabled()
+	sess.GitHubLogin = s.githubLoginEnabled()
 	sess.TokenLogin = s.hasAuthToken && !s.opts.GitHub.Enabled() && !s.opts.ReadOnly
 	return sess
 }
@@ -575,13 +575,18 @@ func (s *Server) handleSessionLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	s.writeSessionCookie(w, r, "", -1)
 	if c, err := r.Cookie(githubCookie); err == nil {
-		s.github.mu.Lock()
-		delete(s.github.sessions, c.Value)
-		s.github.mu.Unlock()
+		if s.store == nil {
+			writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("login session storage unavailable"))
+			return
+		}
+		if err := s.store.DeleteGitHubSession(r.Context(), c.Value, s.githubAudience()); err != nil {
+			writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("cannot revoke login session; try again"))
+			return
+		}
 	}
 	s.githubCookie(w, githubCookie, "", -1)
 	sess := s.sessionFor(false)
-	sess.GitHubLogin = s.opts.GitHub.Enabled()
+	sess.GitHubLogin = s.githubLoginEnabled()
 	sess.TokenLogin = s.hasAuthToken && !s.opts.GitHub.Enabled() && !s.opts.ReadOnly
 	writeJSON(w, http.StatusOK, sess)
 }

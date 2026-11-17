@@ -54,14 +54,24 @@ an empty list grants no additional access. All other accounts and anonymous
 visitors remain read-only. IDs are checked on the server for every protected
 request, independent of displayed login names. `--github-owner-id` changes the
 owner. `--readonly` disables writes for everyone, including all maintainers.
-Restart the server after changing the allowlist; existing browser sessions will
-need to sign in again.
+Restart the server after changing the configured allowlist; existing sessions use
+the new permissions on their next request.
 
 OAuth uses state and PKCE, requests no additional scopes, and fetches the authenticated
 identity from GitHub. GitHub access tokens are not stored. Browser sessions expire
-after 24 hours, are revoked on logout, and are lost on server restart. Sessions are
-in memory: run a single server instance (multiple replicas would need a shared
-session store). HTTPS is required except for localhost development.
+after 24 hours and are revoked on logout. Sessions persist in the existing SQLite
+database across server restarts; only hashes of the random cookie tokens are stored.
+Sessions are bound to the OAuth Client ID and callback URL, so changing either
+requires signing in again. Changing the Client Secret does not invalidate sessions.
+An OAuth login already in progress must be retried if the server restarts.
+The first upgrade from in-memory sessions requires signing in once more.
+Application-exported SQLite backups and dry-run snapshots exclude login sessions;
+restoring one requires users to sign in again. Manual filesystem copies are not
+sanitized. GitHub sign-in is disabled when the SQLite connection uses `mode=ro`,
+since that connection cannot create or revoke sessions. The separate `--readonly`
+application flag still allows sign-in when its database connection is writable,
+but grants no modification permissions.
+HTTPS is required except for localhost development.
 
 Without any authentication configuration, HTTP writes are disabled. With GitHub
 OAuth enabled, the old browser token login and its cookies are disabled.
