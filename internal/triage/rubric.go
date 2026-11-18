@@ -36,25 +36,25 @@ type Rubric struct {
 func DefaultRubric(compact bool) Rubric {
 	r := Rubric{
 		DecisionSteps: []string{
-			"Step 1 (Scope & Canonical Check): Check `is_canonical` (`sig/planner` + `type/bug`). Canonical issues MUST NEVER be put in `exclude_issues` (use `FILTER_*` instead to preserve 1:1 GitHub canonical parity; sole-linked PRs of `FILTER_NON_OPT_OR_FIXED` issues are isolated from the PR Status Board). Non-canonical supplemental issues outside optimizer scope MUST go to `exclude_issues`.",
-			"Step 2 (Universal AI Judge — SQL Realism & Reachability): Even WITHOUT `fuzz`/`ai` labels or `clues.origin_signals`, external reports may still be unlabelled fuzzer/AI edge cases. Always judge the trigger SQL itself: separate realistic bugs from `FILTER_RANDOM_FUZZ` (artificial nested casts, obscure bitwise/type ops, SQLancer/TLP/NoREC), `FILTER_AI_OBSCURE` (unreachable static-audit edge cases or off-by-default flags/blacklists), `FILTER_NON_OPT_OR_FIXED` (already fixed on master, flaky unit test, or non-optimizer module on a canonical issue), and `ENHANCEMENT` (correct result, feature/rule/cost improvement request). Do NOT auto-accept an unreachable fuzz case merely because it triggers a `panic`, and do NOT auto-filter a tagged fuzz/AI case if the SQL is realistic.",
-			"Step 3 (Borderline Flag): Set `is_borderline_kept = true` ONLY when Step 2's AI Judge keeps a fuzzing/SQLancer/AI-audit bug (`EASY`/`MEDIUM`/`HARD`) because its trigger SQL is realistic and causes wrong results, panic, deadlock, or missing locks.",
-			"Step 4 (Subsystem & Difficulty — Beyond Line Counts): Map root cause (using `pr_details[].non_test_files`, `gh pr diff`, and `clues.code_paths` first) to one of the 7 subsystems, then grade engineering effort (`EASY` 1-3d single-point guard, `MEDIUM` 3-7d cross-stage invariant, `HARD` 1-3w+ architectural/CBO/MPP/concurrency). Do NOT blindly trust `suggested_triage` line-count heuristics (`<=55` lines can still be `MEDIUM`/`HARD` if it alters CBO/join-reorder/name-resolution invariants) or `hasMergedMainline -> FILTER_NON_OPT_OR_FIXED` (verify whether it is waiting for backport or only a partial fix).",
-			"Step 5 (Independent Severity & Bilingual Note): Grade `severity` independently from `severity_guide` (`N/A` for `ENHANCEMENT`/`FILTER_*`; `CRITICAL`/`MAJOR`/`MODERATE`/`MINOR` for real bugs — do NOT blindly copy GitHub `severity/*` labels). For wrong-result bugs, tie severity to triggerability: common/easily-hit `SELECT` wrong results -> `CRITICAL`; realistic non-edge-case wrong results -> `MAJOR`; corner-case borderline wrong results -> `MODERATE`. Write concise root-cause + symptom bilingual notes (`zh-CN` & `en`) wrapping code/SQL identifiers in paired backticks.",
+			"Step 1 (Scope & Canonical Check): Check `is_canonical` (`sig/planner` + `type/bug`). Canonical issues MUST NEVER be put in `exclude_issues` (use `FILTER_*` instead to preserve 1:1 GitHub canonical parity; PRs linked solely to `FILTER_NON_OPT_OR_FIXED` issues stay off the PR Status Board unless pinned via `sync-prs --pr`). Non-canonical supplemental issues outside optimizer scope MUST go to `exclude_issues`.",
+			"Step 2 (SQL Realism & Reachability): Even without `fuzz`/`ai` labels or `clues.origin_signals`, external reports may still be unlabelled fuzzer/AI edge cases. Always judge the trigger SQL itself: separate realistic bugs from `FILTER_RANDOM_FUZZ` (artificial nested casts, obscure bitwise/type ops, SQLancer/TLP/NoREC), `FILTER_AI_OBSCURE` (unreachable static-audit edge cases or off-by-default flags/blacklists), `FILTER_NON_OPT_OR_FIXED` (already fixed on master, flaky unit test, or non-optimizer module on a canonical issue), and `ENHANCEMENT` (correct result, feature/rule/cost improvement request). Do not auto-accept an unreachable fuzz case merely because it triggers a `panic`, and do not auto-filter a tagged fuzz/AI case if the SQL is realistic.",
+			"Step 3 (Borderline Flag): Set `is_borderline_kept = true` ONLY for real bugs (`EASY`/`MEDIUM`/`HARD`) found by fuzzing/SQLancer or static/AI audit whose trigger SQL is realistic and causes wrong results, panic, deadlock, or missing locks.",
+			"Step 4 (Subsystem & Difficulty — Beyond Line Counts): Map the root cause to one of the 7 subsystems using `pr_details[].non_test_files`, `body_excerpt`, and `clues.code_paths` first, falling back to `gh pr diff <pr> --repo <owner/repo> --exclude '*_test.go' --exclude '*.test' --exclude '*.json' --exclude '*.result' --exclude '*.out'` when ambiguous. Then grade engineering effort: `EASY` (1-3d single-point guard), `MEDIUM` (3-7d cross-stage invariant), or `HARD` (1-3w+ architectural/CBO/MPP/concurrency). Do not trust `suggested_triage` line-count heuristics (`<=55` lines can still be `MEDIUM`/`HARD` when altering CBO, join-reorder, or name-resolution invariants), and verify `hasMergedMainline -> FILTER_NON_OPT_OR_FIXED` is not waiting for backport or only a partial fix.",
+			"Step 5 (Independent Severity & Bilingual Note): Grade `severity` independently from `severity_guide` (`N/A` for `ENHANCEMENT`/`FILTER_*`; `CRITICAL`/`MAJOR`/`MODERATE`/`MINOR` for real bugs — do not blindly copy GitHub `severity/*` labels). For wrong-result bugs, tie severity to triggerability: common/easily-hit `SELECT` wrong results -> `CRITICAL`; realistic non-edge-case wrong results -> `MAJOR`; corner-case borderline wrong results -> `MODERATE`. Write concise root-cause + symptom bilingual notes (`zh-CN` & `en`) wrapping code/SQL identifiers in paired backticks.",
 		},
 		BoundaryRules: map[string]string{
-			"canonical_issues":    "Has BOTH `sig/planner` AND `type/bug`. Always keep in `new_issues` (never `exclude_issues`). Use `FILTER_RANDOM_FUZZ`, `FILTER_AI_OBSCURE`, or `FILTER_NON_OPT_OR_FIXED` when noisy or non-optimizer.",
-			"supplemental_issues": "Lacks `sig/planner` + `type/bug`. Accept ONLY genuine optimizer bugs (`EASY`/`MEDIUM`/`HARD`) or core optimizer `ENHANCEMENT`s. Put executor/expression/tikv/DDL/UI/flaky/fuzz noise into `exclude_issues` so their PRs never pollute the PR board.",
-			"is_borderline_kept":  "True ONLY when `cat` is `EASY`, `MEDIUM`, or `HARD` AND origin is fuzzer/SQLancer/AI-audit, kept because the AI Judge confirms trigger SQL is realistic and impact is severe (wrong result / panic / missing lock).",
-			"ai_judge_priority":   "Treat `suggested_triage` and `decisions_template` pre-fills as weak priors only (`default:logical_rewrite` and line-count difficulty can mislead). Always verify SQL realism, PR diff, and `severity_guide` independently.",
+			"canonical_issues":    "Has BOTH `sig/planner` AND `type/bug`. Always keep in `new_issues` or `overrides` (never `exclude_issues`). Use `FILTER_RANDOM_FUZZ`, `FILTER_AI_OBSCURE`, or `FILTER_NON_OPT_OR_FIXED` when noisy, already fixed, or non-optimizer.",
+			"supplemental_issues": "Lacks `sig/planner` + `type/bug`. Accept ONLY genuine optimizer bugs (`EASY`/`MEDIUM`/`HARD`) or core optimizer `ENHANCEMENT`s; put executor/expression/tikv/DDL/UI/flaky/fuzz noise into `exclude_issues`. When an already-tracked supplemental bug's fix PR merges on master (`fix_pr_merged_still_open`) and only issue closure remains, recalibrate via `overrides` to `FILTER_NON_OPT_OR_FIXED` instead of `exclude_issues` (`ack_retriage` if waiting for backport; add `force_keep: true` if `type/enhancement` is present).",
+			"is_borderline_kept":  "True ONLY for real bugs (`EASY`, `MEDIUM`, or `HARD`) from fuzzing/SQLancer or static/AI audit whose trigger SQL is realistic and causes wrong results, panic, deadlock, or missing locks.",
+			"ai_judge_priority":   "Do not trust `suggested_triage` or `decisions_template` pre-fills (`default:logical_rewrite` and line-count difficulty are rough heuristics). Verify SQL realism, PR diff, and `severity_guide` independently.",
 		},
 		RetriageGuide: map[string]string{
-			"new_fix_pr":               "Inspect `pr_details[].non_test_files` or `gh pr diff`: if it confirms current `cat`/`severity`/`subsystem`/`note`, add to `ack_retriage`; if root cause or effort shifted, submit `overrides`.",
+			"new_fix_pr":               "Inspect `pr_details[].non_test_files` (run `gh pr diff <pr> --repo <owner/repo>` using the Step 4 test/golden `--exclude` filters when `files_truncated` is true or scope is ambiguous): if it confirms current classification, add to `ack_retriage`; if `!is_canonical` and the PR proves a non-optimizer root cause, move to `exclude_issues`; otherwise update `overrides`.",
 			"fix_pr_merged_still_open": "Check comments/PRs for why the issue remains open: if waiting for cherry-pick/backport only, `ack_retriage`; if completely fixed on master and pending close, `overrides` to `FILTER_NON_OPT_OR_FIXED` (`severity: N/A`); if partial fix/regression, update `overrides`.",
 			"customer_reported":        "Re-evaluate `severity` (production customer impact often elevates wrong-result/plan-regression bugs to `MAJOR` or `CRITICAL`) and submit `overrides` or `ack_retriage`.",
 			"gh_severity_escalated":    "Verify against `severity_guide` independently; upgrade via `overrides` if warranted, or `ack_retriage` if current assessed severity is already accurate.",
 			"label_scope_changed":      "If `sig/planner` was removed and the issue is non-optimizer, it is no longer canonical-protected and can be moved to `exclude_issues`; if `duplicate`/`wontfix` or `type/enhancement` was added, update via `overrides`.",
-			"substantive_new_comments": "Read the new technical analysis: if root cause, subsystem, or validity (`not a bug`) pivoted, submit `overrides`; if it only confirms the existing diagnosis, `ack_retriage`.",
+			"substantive_new_comments": "Read the new technical analysis: if `!is_canonical` and confirmed non-optimizer or unreachable fuzz, move to `exclude_issues`; if root cause, subsystem, or validity (`not a bug`) changed, submit `overrides`; if it confirms the existing diagnosis, `ack_retriage`.",
 		},
 		Subsystems: []SubsystemGuide{
 			{
@@ -110,18 +110,18 @@ func DefaultRubric(compact bool) Rubric {
 		DifficultyGuide: map[string]string{
 			"EASY":   "1-3 days: Clear root cause, localized guard/key/type fix in 1-2 source files (~10-60 non-test lines) without cross-stage contract changes.",
 			"MEDIUM": "3-7 days: Multi-function or adjacent-stage invariant coordination (e.g., Ranger residual filter retention, schema mapping across rewrite + pruning, Global Stats merge).",
-			"HARD":   "1-3+ weeks: Cross-package architecture, CBO/cardinality tradeoffs risking plan regressions, ANALYZE concurrency/memory governance, MPP protocol, or single-pass name-resolution debt.",
+			"HARD":   "1-3+ weeks: Cross-package architecture, CBO/cardinality tradeoffs or Join Reorder changes risking plan regressions, ANALYZE concurrency/memory governance, MPP protocol, or single-pass name-resolution debt.",
 		},
 		SeverityGuide: map[string]string{
 			"CRITICAL": "S0: Panic/crash, instance OOM, permanent background worker exit, cluster GC block, DML wrong data mutation, silent missing `FOR UPDATE` lock, privilege bypass, or common/easily-hit read `SELECT` wrong result.",
-			"MAJOR":    "S1: Realistic `SELECT` wrong result that is not edge-case yet requires specific non-trivial conditions, valid common SQL failing with `ERROR 1105` / column-not-found, stats system-table deadlock, or order-of-magnitude production plan regression.",
+			"MAJOR":    "S1: Realistic `SELECT` wrong result requiring specific non-trivial conditions, valid common SQL failing with `ERROR 1105` / column-not-found, stats system-table deadlock, or order-of-magnitude production plan regression.",
 			"MODERATE": "S2: Corner-case / hard-to-hit wrong result retained as a borderline bug, moderate cardinality/cost skew (correct result, suboptimal plan without outage), Plan Cache/SPM miss, hint export mismatch, narrow MySQL compatibility gap.",
 			"MINOR":    "S3: Hint warning text, `EXPLAIN` / `SHOW STATS` / slow-log formatting, minor diagnostic polish.",
 			"N/A":      "Required whenever `cat` is `ENHANCEMENT` or `FILTER_*`.",
 		},
 		NoteStyleGuide: map[string]string{
 			"formula":    "[Origin tag if borderline] + `<Component/Func>` + <specific flaw> + <user-visible symptom>",
-			"length":     "zh-CN: 25-85 Chinese characters; en: 50-170 English characters. Concise, dense, single sentence.",
+			"length":     "Total UTF-8 runes including backticked identifiers — zh-CN: target 25-85 runes (<12 or >140 warns); en: target 50-170 runes (<25 or >260 warns). Concise single sentence.",
 			"formatting": "Wrap Go functions, structs, SQL clauses, hints, and sysvars in paired backticks (e.g. `detachCNFCondAndBuildRangeForIndex`, `INL_JOIN`, `ERROR 1105`). Never leave `TODO:`.",
 		},
 	}
@@ -136,7 +136,7 @@ func DefaultRubric(compact bool) Rubric {
 				Severity:  "MAJOR",
 				Subsystem: "access_path_partition_lock",
 				Note: &model.LocalizedNote{
-					ZhCN: "Ranger `detachCNFCondAndBuildRangeForIndex` 在 `eqOrInCount==0` 替换复合前缀索引区间时漏保留残余 `OR` 过滤条件导致错结果",
+					ZhCN: "`detachCNFCondAndBuildRangeForIndex` 在 `eqOrInCount==0` 时替换复合索引区间漏留残余 `OR` 条件导致错结果",
 					En:   "Ranger `detachCNFCondAndBuildRangeForIndex` drops residual `OR` filter on composite prefix index when `eqOrInCount==0`, causing wrong results",
 				},
 			},
@@ -179,7 +179,7 @@ func DefaultRubric(compact bool) Rubric {
 				},
 			},
 			{
-				Scenario:  "Unlabelled External Edge Case (no fuzz/ai label -> AI Judge filters as `FILTER_RANDOM_FUZZ` on canonical issue)",
+				Scenario:  "Unlabelled External Edge Case (no fuzz/ai label -> `FILTER_RANDOM_FUZZ` on canonical issue)",
 				IssueRef:  "#73120 (archetype)",
 				Action:    "accept",
 				Cat:       "FILTER_RANDOM_FUZZ",

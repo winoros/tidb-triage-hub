@@ -33,16 +33,20 @@ Usage:
   triage-hub [serve] [flags]      Start the HTTP web dashboard (default)
   triage-hub status [flags]       Show SQLite dataset summary, queues & GitHub GraphQL quota
   triage-hub sync-prs [flags]     Refresh open PR statuses (all tracked open PRs or targeted --pr specs)
-  triage-hub sync-issues [flags]  Run pure-Go dual-stream incremental (or --full) issue + PR sync
+  triage-hub sync-issues [flags]  Run incremental (or --full) issue + PR sync
   triage-hub pending [flags]      Export pending / re-triage / note-backfill bundle with Rubric & PR clues
   triage-hub triage [flags]       Validate & apply AI/human triage decisions (local SQLite or --remote)
   triage-hub backup [flags]       Create an online SQLite backup snapshot (from --remote or local --db)
 
-Remote / Split-Deployment Environment Variables:
-  TRIAGE_HUB_URL                  Remote Machine A base URL with explicit http:// or https:// scheme
-  TRIAGE_HUB_TOKEN                Shared maintainer token (server auth on ` + "`serve`" + `; Bearer token on CLI)
-  TRIAGE_HUB_ALLOW_INSECURE_HTTP  Set to 1 to allow sending token over non-loopback plain http://
-  GH_TOKEN / GITHUB_TOKEN         GitHub PAT for pure-Go GraphQL sync without requiring ` + "`gh`" + ` CLI binary
+Remote / Auth Environment Variables:
+  TRIAGE_HUB_URL                    Remote server base URL with explicit http:// or https:// scheme
+  TRIAGE_HUB_TOKEN                  Maintainer token (Bearer API/CLI auth; browser login when OAuth is unset)
+  TRIAGE_HUB_ALLOW_INSECURE_HTTP    Set to 1 to allow sending token over non-loopback plain http://
+  TRIAGE_HUB_GITHUB_CLIENT_ID       GitHub OAuth app client ID (requires SECRET + CALLBACK_URL)
+  TRIAGE_HUB_GITHUB_CLIENT_SECRET   GitHub OAuth app client secret
+  TRIAGE_HUB_GITHUB_CALLBACK_URL    GitHub OAuth callback URL (https://host/auth/github/callback)
+  TRIAGE_HUB_GITHUB_MAINTAINER_IDS  Comma-separated additional GitHub user IDs granted maintainer access
+  GH_TOKEN / GITHUB_TOKEN           GitHub PAT for direct HTTP GraphQL sync without ` + "`gh`" + ` CLI binary
 
 Run "triage-hub <command> -h" for command-specific flags.
 `
@@ -168,18 +172,18 @@ func newServeFlagSet() *flag.FlagSet {
 	fs.String("db", envOrDefault("TRIAGE_HUB_DB", "data/tidb_triage.db"), "SQLite database file path")
 	fs.String("web-dir", "web", "Frontend assets directory (falls back to embedded assets if absent)")
 	fs.String("seed-json", "seed/initial_dataset.json", "Initial seed dataset JSON (falls back to embedded seed if absent)")
-	fs.String("scripts-dir", "", "Deprecated (no-op): sync is now pure Go")
-	fs.String("auth-token", strings.TrimSpace(os.Getenv("TRIAGE_HUB_TOKEN")), "Shared maintainer token required for RW mutations & remote CLI (env: TRIAGE_HUB_TOKEN)")
+	fs.String("scripts-dir", "", "Deprecated (no-op)")
+	fs.String("auth-token", strings.TrimSpace(os.Getenv("TRIAGE_HUB_TOKEN")), "Maintainer token for Bearer API/CLI auth, and browser login when GitHub OAuth is unset (env: TRIAGE_HUB_TOKEN)")
 	fs.String("github-client-id", os.Getenv("TRIAGE_HUB_GITHUB_CLIENT_ID"), "GitHub OAuth app client ID")
 	fs.String("github-client-secret", os.Getenv("TRIAGE_HUB_GITHUB_CLIENT_SECRET"), "GitHub OAuth app client secret")
 	fs.String("github-callback-url", os.Getenv("TRIAGE_HUB_GITHUB_CALLBACK_URL"), "GitHub OAuth callback URL (https://host/auth/github/callback)")
-	fs.String("github-maintainer-ids", os.Getenv("TRIAGE_HUB_GITHUB_MAINTAINER_IDS"), "Comma-separated additional GitHub user IDs permitted to modify data")
+	fs.String("github-maintainer-ids", os.Getenv("TRIAGE_HUB_GITHUB_MAINTAINER_IDS"), "Comma-separated additional GitHub user IDs permitted to modify data (overrides env var)")
 	fs.Int64("github-owner-id", 7846227, "GitHub user ID permitted to modify data (default: winoros)")
 	fs.Bool("trust-proxy", envBoolDefault("TRIAGE_HUB_TRUST_PROXY", false), "Trust rightmost X-Forwarded-Proto / X-Forwarded-Host hop from loopback/private reverse proxies (env: TRIAGE_HUB_TRUST_PROXY)")
-	fs.String("trusted-proxy-cidrs", envOrDefault("TRIAGE_HUB_TRUSTED_PROXY_CIDRS", ""), "Optional comma-separated proxy CIDRs/IPs trusted when --trust-proxy is set (env: TRIAGE_HUB_TRUSTED_PROXY_CIDRS)")
-	fs.Bool("readonly", false, "Serve dashboard in read-only mode (disable all triage edits & sync mutations)")
+	fs.String("trusted-proxy-cidrs", envOrDefault("TRIAGE_HUB_TRUSTED_PROXY_CIDRS", ""), "Comma-separated proxy CIDRs/IPs trusted when --trust-proxy is set (replaces default loopback/private ranges; env: TRIAGE_HUB_TRUSTED_PROXY_CIDRS)")
+	fs.Bool("readonly", false, "Serve HTTP dashboard in read-only mode (disable API writes, background sync, and Inbox queues)")
 	fs.Bool("sync-prs-once", false, "Fetch and classify all open PR statuses once and exit")
-	fs.Bool("sync-issues-once", false, "Run dual-stream incremental issue + PR sync once and exit")
+	fs.Bool("sync-issues-once", false, "Run incremental issue + PR sync once and exit")
 	fs.Duration("sync-prs-interval", envDurationDefault("TRIAGE_HUB_SYNC_PRS_INTERVAL"), "Optional background open PR status sync interval (e.g. 30m; env: TRIAGE_HUB_SYNC_PRS_INTERVAL)")
 	fs.Duration("sync-issues-interval", envDurationDefault("TRIAGE_HUB_SYNC_ISSUES_INTERVAL"), "Optional background incremental issue sync interval (e.g. 2h; env: TRIAGE_HUB_SYNC_ISSUES_INTERVAL)")
 	return fs
@@ -484,13 +488,13 @@ func executeSyncIssues(args []string, stdout, stderr io.Writer) error {
 	seedPath := fs.String("seed-json", "seed/initial_dataset.json", "Initial seed dataset JSON used only when SQLite DB is empty")
 	full := fs.Bool("full", false, "Force full candidate re-verification instead of incremental search")
 	skipPRs := fs.Bool("skip-prs", false, "Skip full open PR status refresh after syncing issues")
-	dryRun := fs.Bool("dry-run", false, "Compute dual-stream sync plan and print summary without modifying SQLite")
+	dryRun := fs.Bool("dry-run", false, "Compute sync plan and print summary without modifying SQLite")
 	since := fs.String("since", "", "Optional explicit RFC3339 UTC watermark override (e.g. 2026-11-12T00:00:00Z)")
 	overlap := fs.Int("overlap", 15, "Safety overlap minutes subtracted from previous snapshot_utc")
 	maxIncDays := fs.Int("max-incremental-days", 14, "Auto-switch to --full when snapshot age exceeds N days")
-	lookbackDays := fs.Int("untriaged-lookback-days", issuesync.DefaultUntriagedLookbackDays, "Rolling lookback days for Tier-2 untriaged issue discovery")
+	lookbackDays := fs.Int("untriaged-lookback-days", issuesync.DefaultUntriagedLookbackDays, "Rolling lookback days for Tier-2 discovery (and standalone planner/*/epic/* scan window under --full)")
 	minQuota := fs.Int("min-quota", -1, "Minimum GraphQL points required before syncing (default 150 incremental, 350 full)")
-	fs.String("scripts-dir", "", "Deprecated (no-op): sync is now pure Go")
+	fs.String("scripts-dir", "", "Deprecated (no-op)")
 	timeout := fs.Duration("timeout", 6*time.Minute, "Command timeout")
 	rem := bindRemoteFlags(fs)
 	if err := fs.Parse(args); err != nil {
@@ -546,8 +550,8 @@ func executeSyncIssues(args []string, stdout, stderr io.Writer) error {
 	if res.PendingCount > 0 || res.RetriageCount > 0 {
 		fmt.Fprintf(stderr, "\n[triage-hub] Actionable items — pending: %d %v, retriage: %d %v\n",
 			res.PendingCount, res.PendingNumbers, res.RetriageCount, res.RetriageNumbers)
-		fmt.Fprintf(stderr, "  1. Inspect bundle: ./bin/triage-hub pending --compact\n")
-		fmt.Fprintf(stderr, "  2. Apply triage:   ./bin/triage-hub triage --stdin\n")
+		fmt.Fprintf(stderr, "  1. Export bundle:  ./bin/triage-hub pending --out bundle.json\n")
+		fmt.Fprintf(stderr, "  2. Apply triage:   ./bin/triage-hub triage --file decisions.json (or --stdin)\n")
 	}
 	return nil
 }
@@ -556,9 +560,9 @@ func executePending(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("pending", flag.ContinueOnError)
 	dbPath := fs.String("db", envOrDefault("TRIAGE_HUB_DB", "data/tidb_triage.db"), "SQLite database file path")
 	seedPath := fs.String("seed-json", "seed/initial_dataset.json", "Initial seed dataset JSON used only when SQLite DB is empty")
-	onlyNum := fs.Int("number", 0, "Filter to a single pending issue number")
-	numbersCSV := fs.String("numbers", "", "Comma-separated pending issue numbers to export")
-	scopeFilter := fs.String("scope", "", "Filter pending candidates whose matched_scopes contain this substring")
+	onlyNum := fs.Int("number", 0, "Filter to a single pending candidate number (omits re-triage; use --re-triage for active issues)")
+	numbersCSV := fs.String("numbers", "", "Comma-separated pending candidate numbers to export (omits re-triage)")
+	scopeFilter := fs.String("scope", "", "Filter pending candidates whose matched_scopes contain this substring (pair with --only-pending to omit re-triage)")
 	onlyPending := fs.Bool("only-pending", false, "Export only new pending candidates (omit flagged re-triage items)")
 	onlyRetriage := fs.Bool("only-retriage", false, "Export only flagged re-triage candidates")
 	reTriageCSV := fs.String("re-triage", "", "Comma-separated existing issue numbers to inspect for recalibration")
@@ -675,8 +679,8 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 	dryRun := fs.Bool("dry-run", false, "Validate decisions JSON and preview actions without writing to SQLite")
 	syncNewPRs := fs.Bool("sync-new-prs", false, "Deprecated: submissions do not fetch GitHub; refresh PRs before exporting decisions")
 	minQuota := fs.Int("min-quota", 20, "Deprecated: retained for command-line compatibility")
-	autoBackup := fs.Bool("auto-backup", envBoolDefault("TRIAGE_HUB_AUTO_BACKUP", true), "Automatically download a local SQLite backup after remote triage succeeds (env: TRIAGE_HUB_AUTO_BACKUP)")
-	backupPath := fs.String("backup-path", envOrDefault("TRIAGE_HUB_BACKUP_PATH", "data/remote_backup.db"), "Destination path for automatic post-triage remote SQLite backup")
+	autoBackup := fs.Bool("auto-backup", envBoolDefault("TRIAGE_HUB_AUTO_BACKUP", true), "Automatically download a local SQLite backup when remote triage commits changes (env: TRIAGE_HUB_AUTO_BACKUP)")
+	backupPath := fs.String("backup-path", envOrDefault("TRIAGE_HUB_BACKUP_PATH", "data/remote_backup.db"), "Destination path for automatic post-triage remote SQLite backup (env: TRIAGE_HUB_BACKUP_PATH)")
 	timeout := fs.Duration("timeout", 2*time.Minute, "Command timeout")
 	rem := bindRemoteFlags(fs)
 	if err := fs.Parse(args); err != nil {
@@ -878,8 +882,8 @@ func logSkippedConflictsFromMap(stderr io.Writer, out map[string]any) {
 
 func executeBackup(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
-	dbPath := fs.String("db", envOrDefault("TRIAGE_HUB_DB", "data/tidb_triage.db"), "Local SQLite database file path (when --remote is unset)")
-	outPath := fs.String("out", "", "Destination SQLite snapshot path (default data/remote_backup.db for remote, data/tidb_triage_backup.db for local)")
+	dbPath := fs.String("db", envOrDefault("TRIAGE_HUB_DB", "data/tidb_triage.db"), "Local SQLite database path (source DB when local; collision guard when --remote is set)")
+	outPath := fs.String("out", "", "Destination SQLite snapshot path (default $TRIAGE_HUB_BACKUP_PATH or data/remote_backup.db for remote, data/tidb_triage_backup.db for local)")
 	timeout := fs.Duration("timeout", 60*time.Second, "Backup download timeout")
 	rem := bindRemoteFlags(fs)
 	if err := fs.Parse(args); err != nil {

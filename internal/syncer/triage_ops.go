@@ -209,7 +209,7 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 			"mode":            "backfill_notes",
 			"exported_at_utc": exportedAt,
 			"backfill_count":  len(items),
-			"instructions":    "Inspect each issue & linked PR diff (`gh issue view <num> --repo pingcap/tidb --comments`, `gh pr diff <pr> --repo pingcap/tidb`), fill in `notes` (preserving `expected_versions` and `expected_version`), and apply via `triage-hub triage --stdin --skip-todo`.",
+			"instructions":    "Review each issue using `pr_details` first, and inspect `gh issue view <num> --repo pingcap/tidb --comments` or `gh pr diff <pr> --repo <owner/repo> --exclude '*_test.go' --exclude '*.test' --exclude '*.json' --exclude '*.result' --exclude '*.out'` when needed. Fill in both `zh-CN` and `en` under `notes` while keeping `expected_versions` and `expected_version` intact, then validate with `./bin/triage-hub triage --file <path> --skip-todo --dry-run` and apply without `--dry-run` (or via `--stdin`).",
 			"triage_rubric":   triage.DefaultRubric(opts.Compact),
 			"backfill_issues": items,
 			"decisions_template": model.BatchTriageDecisions{
@@ -377,7 +377,7 @@ func (sy *Syncer) BuildPendingBundle(ctx context.Context, opts PendingBundleOpti
 		"exported_at_utc": exportedAt,
 		"pending_count":   len(pending),
 		"retriage_count":  len(retriageList),
-		"instructions":    "Independently judge `pending_candidates` (SQL realism/reachability, PR diff, difficulty, and severity — do NOT blindly accept `decisions_template` pre-fills) and `retriage_candidates` against `triage_rubric` (including `retriage_guide`). Preserve `expected_versions` and each `expected_version` unchanged; they bind decisions to the reviewed snapshot. Timestamps are only a legacy fallback. For each `retriage_candidates` item, explicitly add it to ONE of `overrides` (classification recalibration; keep the item in `expected_versions`), `ack_retriage` (classification unchanged, advance baseline), `notes` (note-only update without resetting baseline), or `exclude_issues` (supplemental non-optimizer only). Submit via `triage-hub triage --stdin` (`--skip-todo`, `--dry-run`). Canonical (`sig/planner` + `type/bug`) issues must NEVER be put in `exclude_issues`.",
+		"instructions":    "Independently judge `pending_candidates` and `retriage_candidates` against `triage_rubric` for SQL realism/reachability, PR diff, difficulty, and severity; do not trust `decisions_template` pre-fills. Keep `expected_versions` and any pre-filled `expected_version` fields intact and matching so decisions stay bound to the reviewed snapshot. Resolve each flagged `retriage_candidates` item (`needs_retriage`) via ONE of `overrides` (omit `note` when unchanged; include `note` to update prose while clearing re-triage), `ack_retriage`, or `exclude_issues` (supplemental non-optimizer only; standalone `notes` updates prose without clearing `needs_retriage`). Canonical (`sig/planner` + `type/bug`) issues must NEVER be put in `exclude_issues`. Submit via `./bin/triage-hub triage --file <path>` or `--stdin` (`--dry-run`, `--skip-todo`).",
 		"valid_enums": map[string]any{
 			"cat":       model.ValidCategories,
 			"severity":  model.ValidSeverities,
