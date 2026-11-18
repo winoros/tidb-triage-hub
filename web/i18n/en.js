@@ -14,10 +14,7 @@ SiteI18n.extend("en", {
       "description": "Standalone triage & PR blocker workbench for open pingcap/tidb optimizer issues with noise filtering, Fix Difficulty, and Assessed Severity matrix."
     },
     "nav": {
-      "dataJson": "JSON",
-      "dataJsonFull": "Open JSON Snapshot (/api/dataset.json)",
-      "ghIssues": "GitHub",
-      "ghPrs": "Open TiDB planner issues on GitHub",
+      "more": "More",
       "toggleOverviewHide": "Hide Stats",
       "toggleOverviewShow": "Show Stats",
       "syncInfoBtn": "Sync Info"

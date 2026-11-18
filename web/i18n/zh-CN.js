@@ -14,10 +14,7 @@ SiteI18n.extend("zh-CN", {
       "description": "针对 pingcap/tidb 优化器开放单据的去噪筛除、修复难度（Difficulty）、严重度（Severity）与在途 PR 阻塞推进独立工作台。"
     },
     "nav": {
-      "dataJson": "JSON",
-      "dataJsonFull": "导出 JSON 快照 (/api/dataset.json)",
-      "ghIssues": "GitHub",
-      "ghPrs": "在 GitHub 查看优化器 Issue",
+      "more": "更多",
       "toggleOverviewHide": "收起概览",
       "toggleOverviewShow": "展开概览",
       "syncInfoBtn": "同步状态"
