@@ -184,13 +184,13 @@
     border-bottom: 1px solid var(--border);
   }
   .header-inner {
-    max-width: 1380px; margin: 0 auto; padding: 8px 20px;
+    max-width: 1380px; margin: 0 auto; padding: 2px 20px;
     min-height: 54px;
     display: flex; align-items: center; justify-content: space-between;
-    gap: 8px; flex-wrap: wrap;
+    gap: 8px; position: relative;
   }
   .header-left {
-    display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0;
+    display: flex; align-items: center; gap: 10px; flex: none;
   }
   .brand-wrap {
     display: inline-flex; align-items: center; gap: 9px;
@@ -250,7 +250,11 @@
 
   /* Header Right Utilities */
   .header-right {
-    display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+    display: flex; align-items: center; gap: 5px; flex: none;
+  }
+  #rwBar { display: inline-flex; align-items: center; gap: 6px; }
+  #githubIdentity {
+    max-width: 12ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .hdr-divider {
     width: 1px; height: 18px; background: var(--border); margin: 0 1px;
@@ -1006,12 +1010,6 @@
 
   /* ==================== BILINGUAL GEOMETRY LOCK (DESKTOP) & BREAKPOINTS ==================== */
   @media (min-width: 861px) {
-    #tabIssuesBtn { min-width: 152px; }
-    #tabPrsBtn { min-width: 138px; }
-    #pendingInboxBtn { min-width: 96px; }
-    #toggleOverviewBtn { min-width: 92px; }
-    #dataJsonLink { min-width: 70px; }
-    #ghIssuesLink { min-width: 78px; }
     #toggleRubricBtn { min-width: 146px; }
 
     .lg-btn[data-lg-cat="EASY"] { min-width: 92px; }
@@ -1041,6 +1039,30 @@
     .sub-chip { white-space: nowrap; }
   }
 
+  #headerMore { display: none; }
+  @media (max-width: 1200px) {
+    #headerMore { display: inline-flex; }
+    .header-right {
+      display: none; position: absolute; top: 100%; right: 12px;
+      max-height: calc(100dvh - var(--header-h)); overflow-y: auto;
+      padding: 10px; border: 1px solid var(--border); border-radius: 8px;
+      background: var(--bg-elevated); box-shadow: var(--shadow-lg);
+      grid-template-columns: 1fr auto;
+    }
+    #headerMore[aria-expanded="true"] + .header-right { display: grid; }
+    .header-right > :not(.lang-switch, #themeBtn), #rwBar > .btn { grid-column: 1 / -1; }
+    #rwBar { display: contents; }
+    #rwBar .hdr-divider { display: none; }
+    #githubIdentity { max-width: 22ch; }
+    .lang-switch { justify-content: center; }
+  }
+  @media (max-width: 660px) {
+    .brand-title { display: none; }
+  }
+  @media (max-width: 440px) {
+    .view-tab { padding-inline: 6px; }
+    .view-tab .ico, .tab-cnt { display: none; }
+  }
   @media (max-width: 1120px) {
     .kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .stage-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
@@ -1048,7 +1070,7 @@
     .analysis-grid { grid-template-columns: 1fr; }
   }
   @media (max-width: 860px) {
-    .header-inner { padding: 8px 12px; }
+    .header-inner { padding-inline: 12px; }
     .wrap { padding: 12px 12px 52px; }
     .stage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     table.issues-tbl thead, table.prs-tbl thead { display: none; }
@@ -1083,7 +1105,6 @@
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
         </span>
         <span class="brand-title" data-i18n="common.appBrand">TiDB Optimizer Triage Hub</span>
-        <span class="rw-badge" id="permBadge"></span>
       </div>
 
       <div class="view-tabs" role="tablist">
@@ -1100,24 +1121,18 @@
       </div>
     </div>
 
-    <div class="header-right">
-      <div id="rwBar" style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;" hidden>
+    <button type="button" id="headerMore" class="btn" aria-expanded="false" aria-controls="headerActions" data-i18n="report.nav.more">More</button>
+    <div class="header-right" id="headerActions">
+      <span class="rw-badge" id="permBadge"></span>
+      <div id="rwBar" hidden>
         <button type="button" class="btn btn-amber" id="pendingInboxBtn" hidden>
           <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"></polyline><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path></svg>
           <span data-i18n="report.rw.pendingBtn">Inbox</span>
           <span class="btn-badge" id="pendingCntBadge">0</span>
         </button>
-        <button type="button" class="btn" id="syncPrsBtn" hidden>
-          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-          <span id="syncPrsBtnLbl" data-i18n="report.rw.syncPrsBtn">Sync PRs</span>
-        </button>
-        <button type="button" class="btn" id="syncIssuesBtn" hidden>
-          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"></path><path d="M16 16h5v5"></path></svg>
-          <span id="syncIssuesBtnLbl" data-i18n="report.rw.syncIssuesBtn">Sync Issues</span>
-        </button>
         <button type="button" class="btn" id="authLogoutBtn" hidden>
           <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
-          <span class="hide-xs" data-i18n="report.rw.lockBtn">Lock</span>
+          <span data-i18n="report.rw.lockBtn">Lock</span>
         </button>
         <span class="hdr-divider"></span>
       </div>
@@ -1131,17 +1146,8 @@
 
       <button type="button" class="btn" id="toggleOverviewBtn">
         <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
-        <span id="toggleOverviewLbl" class="hide-xs"></span>
+        <span id="toggleOverviewLbl"></span>
       </button>
-
-      <a class="btn hide-xs" href="./api/dataset.json" id="dataJsonLink" target="_blank" rel="noopener" data-i18n-title="report.nav.dataJsonFull">
-        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
-        <span data-i18n="report.nav.dataJson">JSON</span>
-      </a>
-      <a class="btn hide-xs" href="https://github.com/pingcap/tidb/issues?q=is%3Aissue+is%3Aopen+label%3Asig%2Fplanner" id="ghIssuesLink" target="_blank" rel="noopener" data-i18n-title="report.nav.ghPrs">
-        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
-        <span data-i18n="report.nav.ghIssues">GitHub</span>
-      </a>
 
       <div class="lang-switch" role="group" data-i18n-aria-label="common.langSwitchAria" aria-label="Language">
         <button type="button" class="lang-btn" data-lang-opt="zh-CN">中</button>
@@ -1169,6 +1175,14 @@
     </div>
 
     <div class="ctx-right">
+      <button type="button" class="btn" id="syncPrsBtn" hidden>
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+        <span id="syncPrsBtnLbl" data-i18n="report.rw.syncPrsBtn">Sync PRs</span>
+      </button>
+      <button type="button" class="btn" id="syncIssuesBtn" hidden>
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"></path><path d="M16 16h5v5"></path></svg>
+        <span id="syncIssuesBtnLbl" data-i18n="report.rw.syncIssuesBtn">Sync Issues</span>
+      </button>
       <button type="button" class="copy-chip" id="copySyncBtn" data-i18n-title="report.sync.copyTitle"></button>
       <div class="sync-pop-wrap" id="deltaPopWrap" hidden>
         <button type="button" class="delta-pill" id="deltaTriggerBtn"></button>
@@ -1615,8 +1629,27 @@
     return p + String(subpath || "").replace(/^\.?\//, "");
   }
 
-  var djLink = document.getElementById("dataJsonLink");
-  if (djLink) djLink.setAttribute("href", appUrl("api/dataset.json"));
+  var moreButton = document.getElementById("headerMore");
+  var headerActions = document.getElementById("headerActions");
+  function closeHeaderActions() {
+    moreButton.setAttribute("aria-expanded", "false");
+  }
+  moreButton.addEventListener("click", function() {
+    moreButton.setAttribute("aria-expanded", moreButton.getAttribute("aria-expanded") !== "true");
+  });
+  document.addEventListener("click", function(event) {
+    if (!event.target.closest("#headerMore, #headerActions")) closeHeaderActions();
+  });
+  headerActions.addEventListener("click", function(event) {
+    if (moreButton.getAttribute("aria-expanded") === "true" && event.target.closest("button, a")) {
+      if (headerActions.contains(document.activeElement)) moreButton.focus();
+      closeHeaderActions();
+    }
+  });
+  document.addEventListener("focusin", function(event) {
+    if (!event.target.closest("#headerMore, #headerActions")) closeHeaderActions();
+  });
+  window.matchMedia("(max-width: 1200px)").addEventListener("change", closeHeaderActions);
 
   var SESSION = window.TRIAGE_SESSION || {
     viewer: { login: "anonymous", role: "viewer" },
@@ -3248,7 +3281,7 @@
     var authUnlockBtn = document.getElementById("authUnlockBtn");
     var authLogoutBtn = document.getElementById("authLogoutBtn");
     var actionCnt = PENDING.length + RETRIAGE_LIST.length;
-    if (rwBar) rwBar.hidden = !(CAN_TRIAGE || CAN_SYNC || (AUTH_REQUIRED && IS_AUTHENTICATED));
+    if (rwBar) rwBar.hidden = !(CAN_TRIAGE || (AUTH_REQUIRED && IS_AUTHENTICATED));
     if (pBtn) pBtn.hidden = !CAN_TRIAGE;
     if (syncPrsBtn) syncPrsBtn.hidden = !CAN_SYNC;
     if (syncIssuesBtn) syncIssuesBtn.hidden = !CAN_SYNC;
@@ -3258,6 +3291,7 @@
     if (githubIdentity) {
       githubIdentity.hidden = !(SESSION.github_login && IS_AUTHENTICATED);
       githubIdentity.textContent = SESSION.viewer ? "@" + SESSION.viewer.login : "";
+      githubIdentity.title = githubIdentity.textContent;
     }
     if (authUnlockBtn) authUnlockBtn.hidden = !(AUTH_REQUIRED && !IS_AUTHENTICATED && !SESSION.github_login && SESSION.token_login !== false);
     if (authLogoutBtn) authLogoutBtn.hidden = !(AUTH_REQUIRED && IS_AUTHENTICATED);
@@ -4404,6 +4438,11 @@
   // Global keyboard shortcuts
   document.addEventListener("keydown", function(e) {
     if (e.key === "Escape") {
+      if (moreButton.getAttribute("aria-expanded") === "true") {
+        closeHeaderActions();
+        moreButton.focus();
+        return;
+      }
       closeEditDrawer();
       closeInboxDrawer();
       closeAuthModal();
