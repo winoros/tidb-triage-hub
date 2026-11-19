@@ -185,9 +185,9 @@ func (rc *remoteClient) doJSON(ctx context.Context, method, subpath string, quer
 			Error string `json:"error"`
 		}
 		if json.Unmarshal(rawResp, &errPayload) == nil && errPayload.Error != "" {
-			return fmt.Errorf("remote HTTP %d: %s", resp.StatusCode, errPayload.Error)
+			return fmt.Errorf("%s: remote HTTP %d: %s", rc.baseURL, resp.StatusCode, errPayload.Error)
 		}
-		return fmt.Errorf("remote HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(rawResp)))
+		return fmt.Errorf("%s: remote HTTP %d: %s", rc.baseURL, resp.StatusCode, strings.TrimSpace(string(rawResp)))
 	}
 
 	rawResp, err := httputil.ReadBoundedBody(resp.Body, 32<<20)

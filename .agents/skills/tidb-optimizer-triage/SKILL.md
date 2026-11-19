@@ -10,7 +10,7 @@ Use this workflow when syncing GitHub issues/PRs or performing triage, deduplica
 ## Prerequisites
 
 - **CLI & GitHub auth**: Ensure `gh` is authenticated (used for `gh pr diff` / `gh issue view` / `gh issue list`, and by `triage-hub` when neither `GH_TOKEN` nor `GITHUB_TOKEN` is set) and `./bin/triage-hub` is built (`go build -o bin/triage-hub ./cmd/triage-hub`).
-- **Local vs. remote mode**: Non-`serve` commands use local SQLite unless `TRIAGE_HUB_URL` (`--remote`, explicit `https://` or `http://` scheme required) is set. Protected remote commands authenticate via `TRIAGE_HUB_TOKEN` (`--token`), and non-loopback `http://` URLs require `--allow-insecure-http` (`TRIAGE_HUB_ALLOW_INSECURE_HTTP=1`) when sending a token. Remote `triage` defaults to `--skip-conflicts=true` and saves `data/remote_backup.db` whenever a batch commits changes (`--auto-backup=false` disables intermediate backups).
+- **Local vs. remote mode**: Run `./bin/triage-hub bind` to inspect the project binding. Non-`serve` commands use the bound workbench by default. Explicit `--remote`, explicit local `--db`, and `TRIAGE_HUB_URL` take precedence in that order. Unbound checkouts default to SQLite. If the workbench rejects authentication, report the target and error; running locally cannot update it. Protected remote commands authenticate via `TRIAGE_HUB_TOKEN` (`--token`), and non-loopback `http://` URLs require `--allow-insecure-http` (`TRIAGE_HUB_ALLOW_INSECURE_HTTP=1`) when sending a token. Remote `triage` defaults to `--skip-conflicts=true` and saves `data/remote_backup.db` whenever a batch commits changes (`--auto-backup=false` disables intermediate backups).
 
 ## 1. Triage Workflow
 

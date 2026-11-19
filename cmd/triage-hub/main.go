@@ -31,6 +31,7 @@ const rootUsage = `tidb-triage-hub — TiDB Optimizer Issue & PR Triage Hub
 
 Usage:
   triage-hub [serve] [flags]      Start the HTTP web dashboard (default)
+  triage-hub bind [URL]           Set or show the workbench bound to this Git repository
   triage-hub status [flags]       Show SQLite dataset summary, queues & GitHub GraphQL quota
   triage-hub sync-prs [flags]     Refresh open PR statuses (all tracked open PRs or targeted --pr specs)
   triage-hub sync-issues [flags]  Run incremental (or --full) issue + PR sync
@@ -60,6 +61,8 @@ func dispatchCLI(args []string, stdin io.Reader, stdout, stderr io.Writer) error
 		switch args[0] {
 		case "serve":
 			return executeServe(args[1:], stdout)
+		case "bind":
+			return bindWorkbench(args[1:], stdout)
 		case "status":
 			return executeStatus(args[1:], stdout)
 		case "sync-prs":
@@ -397,7 +400,7 @@ func executeStatus(args []string, stdout io.Writer) error {
 	checkGH := fs.Bool("check-gh", true, "Query GitHub GraphQL rateLimit (0 GraphQL point cost)")
 	skipQuota := fs.Bool("skip-quota", false, "Skip querying GitHub GraphQL rateLimit")
 	rem := bindRemoteFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if err := rem.parse(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
@@ -441,7 +444,7 @@ func executeSyncPRs(args []string, stdout io.Writer) error {
 	minQuota := fs.Int("min-quota", -1, "Minimum GraphQL points required before syncing (default 100 full, 20 targeted)")
 	timeout := fs.Duration("timeout", 4*time.Minute, "Command timeout")
 	rem := bindRemoteFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if err := rem.parse(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
@@ -497,7 +500,7 @@ func executeSyncIssues(args []string, stdout, stderr io.Writer) error {
 	fs.String("scripts-dir", "", "Deprecated (no-op)")
 	timeout := fs.Duration("timeout", 6*time.Minute, "Command timeout")
 	rem := bindRemoteFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if err := rem.parse(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
@@ -573,7 +576,7 @@ func executePending(args []string, stdout, stderr io.Writer) error {
 	outPath := fs.String("out", "", "Optional output file path (defaults to stdout)")
 	timeout := fs.Duration("timeout", 90*time.Second, "Command timeout")
 	rem := bindRemoteFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if err := rem.parse(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
@@ -683,7 +686,7 @@ func executeTriage(args []string, stdin io.Reader, stdout, stderr io.Writer) err
 	backupPath := fs.String("backup-path", envOrDefault("TRIAGE_HUB_BACKUP_PATH", "data/remote_backup.db"), "Destination path for automatic post-triage remote SQLite backup (env: TRIAGE_HUB_BACKUP_PATH)")
 	timeout := fs.Duration("timeout", 2*time.Minute, "Command timeout")
 	rem := bindRemoteFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if err := rem.parse(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
@@ -886,7 +889,7 @@ func executeBackup(args []string, stdout io.Writer) error {
 	outPath := fs.String("out", "", "Destination SQLite snapshot path (default $TRIAGE_HUB_BACKUP_PATH or data/remote_backup.db for remote, data/tidb_triage_backup.db for local)")
 	timeout := fs.Duration("timeout", 60*time.Second, "Backup download timeout")
 	rem := bindRemoteFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if err := rem.parse(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {

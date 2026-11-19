@@ -625,6 +625,7 @@ func TestConvergenceURLForceQueryTimeoutGraceAndNegativeFlags(t *testing.T) {
 
 func TestLocalDryRunWithoutDBAndBackfillNotesIntentPreservesRetriage(t *testing.T) {
 	tmp := t.TempDir()
+	t.Chdir(tmp)
 
 	// 1. Local triage --dry-run with missing --db does NOT seed embedded initial_dataset.json
 	missingDB := filepath.Join(tmp, "nonexistent.db")
