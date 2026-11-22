@@ -104,7 +104,7 @@ test('pending accept sends the version of the draft rather than the refreshed gl
 
 test('first pending render prefills exclusion suggestion and preserves an intentionally empty draft', () => {
   const start = html.indexOf('      body.innerHTML = PENDING.map(function(pc) {');
-  const end = html.indexOf('\n    };', start);
+  const end = html.indexOf('\n    }', start);
   assert.ok(start >= 0 && end > start);
   const ctx = { workbenchRevision: 0,
     body: {}, PENDING: [{ number: 42, suggested_triage: { exclude_reason: 'Executor issue' }, version: { review: 1, notes: 1 } }],
@@ -179,6 +179,7 @@ test('passive auth loss freezes drafts; explicit logout clears them', () => {
   assert.equal(el('inboxBody').innerHTML, '');
   ctx.DATA[0].version = { review: 9, notes: 9 };
   ctx.restoreSessionDrafts();
+  assert.equal(el('editDrawer').opener, el('[data-edit-issue="42"]'));
   assert.equal(ctx.editingDraft.version.review, 1);
   assert.equal(el('edNoteEn').value, 'unsaved analysis');
   assert.equal(el('editStaleNotice').hidden, false);
@@ -270,7 +271,7 @@ function inboxHarness() {
     setDatasetAndRender: (_ds, pending) => { ctx.PENDING = pending; },
   };
   vm.createContext(ctx);
-  vm.runInContext(['copyReviewVersion', 'pendingReviewBinding', 'capturePendingCardDraft', 'discardPendingDraft',
+  vm.runInContext(['focusAfterDrawerRender', 'copyReviewVersion', 'pendingReviewBinding', 'capturePendingCardDraft', 'discardPendingDraft',
     'applyWorkbenchSnapshot', 'reviewLatestPending', 'markPendingFieldDirty', 'validReviewVersion', 'cardReviewVersion'].map(sourceFunction).join('\n'), ctx);
   const start = html.indexOf('    capturePendingCardDrafts = function(');
   const end = html.indexOf('\n    document.getElementById("pendingInboxBtn")', start);
@@ -374,7 +375,7 @@ function editorHarness() {
   const elements = {};
   function el(id) {
     return elements[id] || (elements[id] = {
-      hidden: false, value: '', checked: false, disabled: false, open: false,
+      id, hidden: false, value: '', checked: false, disabled: false, open: false,
       type: ['edBorderline', 'edForceKeep'].includes(id) ? 'checkbox' : 'text',
       setAttribute() {}, handlers: {},
       addEventListener(event, handler) { this.handlers[event] = handler; },
@@ -382,6 +383,8 @@ function editorHarness() {
   }
   el('editDrawer').hidden = true;
   el('inboxDrawer').hidden = true;
+  el('authModal').hidden = true;
+  el('rubricDrawer').hidden = true;
   function record(number = 42, review = 1) {
     return { number, title: 'planner issue', author: 'dev', cat: 'MEDIUM', severity: 'MAJOR', subsystem: 'logical_rewrite',
       note: { en: 'cause', 'zh-CN': '根因' }, version: { review, notes: 1 } };
@@ -390,21 +393,28 @@ function editorHarness() {
     DATA: [record()], CAN_TRIAGE: true, CAN_SYNC: true, DATA_HAS_WORKBENCH: true,
     editingIssueNum: null, editingDraft: null, editDrawerGen: 0, pendingDrafts: {}, frozenEditDraft: null,
     sessionEpoch: 1, AUTH_REQUIRED: true, IS_AUTHENTICATED: true,
-    document: { getElementById: el, handlers: {}, addEventListener(event, handler) { this.handlers[event] = handler; } },
+    document: { getElementById: el, querySelector: el, handlers: {}, addEventListener(event, handler) { this.handlers[event] = handler; } },
     window: { REPORT_DATASET: { enums: { categories: [], severities: [], subsystems: [] } } },
     capturePendingCardDrafts() {}, populateSelectOptions() {}, renderDrawerRetriageBanner() {}, syncBodyDrawerLock() {},
+    showDrawer(id, opener) {
+      el(id).opener = opener;
+      el(id).titleWhenOpened = el('editDrawerTitle').textContent;
+      el(id).hidden = false;
+    }, hideDrawer(id) { el(id).hidden = true; },
+    SiteI18n: { getLocale: () => 'en' },
     applySessionChrome() {}, renderAll() {}, esc: x => x || '', t: (key, args) => key + (args ? JSON.stringify(args) : ''),
     fmtInlineCode: x => x || '', fmtUsers: x => x, formatPrChip: x => '', toasts: [], showToast: message => ctx.toasts.push(message),
     setDatasetAndRender: (ds, pending) => { ctx.DATA = ds.records; ctx.PENDING = pending; ctx.DATA_HAS_WORKBENCH = true; },
     calls: [], apiFetch: (path, opts) => { ctx.calls.push({ path, opts, payload: opts?.body ? JSON.parse(opts.body) : null }); return new Promise(() => {}); },
   };
   vm.createContext(ctx);
-  const names = ['copyReviewVersion', 'recordNote', 'editValuesFromRecord', 'validReviewVersion', 'editDraftFromRecord',
+  const names = ['renderInspectSummary', 'activeDrawer', 'focusAfterDrawerRender', 'copyReviewVersion', 'recordNote', 'editValuesFromRecord', 'validReviewVersion', 'editDraftFromRecord',
     'canSubmitEditDraft', 'populateEditDrawerFormFromRecord', 'syncOpenEditDrawerSessionUI', 'openEditDrawer', 'closeEditDrawer',
     'closeInboxDrawer', 'readEditFormValues', 'restoreEditFormValues', 'freezeSessionDrafts', 'restoreSessionDrafts', 'clearSessionDrafts',
     'noteForPatch', 'submitCurrentOverride', 'syncEditSeverityConstraints', 'reviewLatestEdit', 'refreshOpenEditDrawer', 'applySessionState',
     'applyWorkbenchSnapshot', 'applyEditMutationSnapshot', 'submitAuthLogin', 'closeAuthModal'];
   vm.runInContext(names.map(sourceFunction).join('\n'), ctx);
+  ctx.drawerClosers = { authModal: ctx.closeAuthModal, editDrawer: ctx.closeEditDrawer, inboxDrawer: ctx.closeInboxDrawer };
   for (const id of ['resetOverrideBtn', 'editRetriageBanner', 'edExcludeConfirmBtn']) {
     const start = html.indexOf(`    document.getElementById("${id}").addEventListener("click", function(`);
     const end = html.indexOf('\n    });', start);
@@ -422,7 +432,14 @@ test('login promotes an open Inspect using the new snapshot before keyboard subm
   ctx.CAN_TRIAGE = false;
   ctx.DATA_HAS_WORKBENCH = false;
   ctx.openEditDrawer(42);
+  assert.match(el('editDrawer').titleWhenOpened, /inspectTitle.*42/);
   assert.equal(ctx.editingDraft, null);
+  assert.equal(el('editFormWrap').hidden, true);
+  assert.equal(el('editDrawerFtr').hidden, true);
+  assert.match(el('inspectSummary').innerHTML, /report.enums.cat.MEDIUM/);
+  assert.match(el('inspectSummary').innerHTML, /report.enums.subsystem.logical_rewrite/);
+  assert.match(el('inspectSummary').innerHTML, /根因/);
+  assert.match(el('inspectSummary').innerHTML, /cause/);
   el('authTokenInput').value = 'test-token';
   ctx.apiFetch = async path => path.endsWith('/login') ? {} : {
     session: { permissions: { can_triage: true, can_sync: true }, authenticated: true },
@@ -432,12 +449,32 @@ test('login promotes an open Inspect using the new snapshot before keyboard subm
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(ctx.editingDraft.version.review, 9);
   assert.equal(el('edCat').value, 'HARD');
+  assert.equal(el('inspectSummary').hidden, true);
+  assert.equal(el('editFormWrap').hidden, false);
   assert.equal(el('saveOverrideBtn').hidden, false);
   ctx.apiFetch = (path, opts) => { ctx.calls.push({ path, payload: JSON.parse(opts.body) }); return new Promise(() => {}); };
   ctx.document.handlers.keydown({ key: 'Enter', ctrlKey: true, preventDefault() {} });
   assert.equal(ctx.calls.length, 1);
   assert.equal(ctx.calls[0].payload.expected_version.review, 9);
   assert.equal(ctx.calls[0].payload.if_unmodified_since, undefined);
+});
+
+test('Escape closes only the top dialog and editor shortcuts stay inside the editor', () => {
+  const { ctx, el } = editorHarness();
+  el('inboxDrawer').hidden = false;
+  ctx.openEditDrawer(42);
+  el('authModal').hidden = false;
+  const press = (key, ctrlKey = false) => ctx.document.handlers.keydown({ key, ctrlKey, preventDefault() {} });
+  press('Enter', true);
+  assert.equal(ctx.calls.length, 0);
+  press('Escape');
+  assert.equal(el('authModal').hidden, true);
+  assert.equal(ctx.editingDraft.version.review, 1);
+  press('Escape');
+  assert.equal(el('editDrawer').hidden, true);
+  assert.equal(el('inboxDrawer').hidden, false);
+  press('Escape');
+  assert.equal(el('inboxDrawer').hidden, true);
 });
 
 test('read-only Inspect cannot overwrite an earlier frozen writable draft', () => {
@@ -473,7 +510,7 @@ test('snapshot reconciles editor metadata and stale notice without replacing its
   assert.equal(el('edNoteEn').value, 'local changes');
   assert.equal(el('edExcludeReason').value, 'draft reason');
   assert.equal(el('editExcludeZone').open, true);
-  assert.match(el('editIssueMetaCard').innerHTML, /updated title/);
+  assert.match(el('editIssueHeading').innerHTML, /updated title/);
   assert.equal(el('editStaleNotice').hidden, false);
 });
 

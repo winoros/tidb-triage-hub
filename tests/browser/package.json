@@ -1,0 +1,10 @@
+{
+  "name": "triage-hub-browser-tests",
+  "private": true,
+  "scripts": {
+    "test": "node --test *.test.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.60.0"
+  }
+}

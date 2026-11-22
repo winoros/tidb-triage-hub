@@ -15,27 +15,26 @@ SiteI18n.extend("en", {
     },
     "nav": {
       "more": "More",
-      "toggleOverviewHide": "Hide Stats",
-      "toggleOverviewShow": "Show Stats",
-      "syncInfoBtn": "Sync Info"
+      "syncInfoBtn": "Snapshot"
     },
     "views": {
       "issuesTab": "Issue Triage",
-      "prsTab": "PR Status"
+      "prsTab": "PR status"
     },
     "rw": {
-      "modeBadge": "RW Mode",
-      "readonlyBadge": "Read-Only",
+      "modeBadge": "Maintainer",
+      "readonlyBadge": "Read only",
       "pendingBtn": "Inbox",
       "syncPrsBtn": "Sync PRs",
       "syncIssuesBtn": "Sync Issues",
       "syncing": "Syncing…",
-      "unlockBtn": "Unlock RW",
-      "lockBtn": "Lock",
-      "authModalTitle": "Unlock Maintainer RW Mode",
+      "unlockBtn": "Sign in",
+      "lockBtn": "Sign out",
+      "authModalTitle": "Maintainer sign-in",
+      "sessionExpired": "Your session expired. Sign in again to resume your review.",
       "authModalHint": "Enter the server access token (TRIAGE_HUB_TOKEN) to enable triage calibration and GitHub sync buttons in this browser.",
       "authTokenPlaceholder": "Enter access token…",
-      "authSubmitBtn": "Unlock",
+      "authSubmitBtn": "Sign in",
       "authCancelBtn": "Cancel",
       "authInvalidToken": "Invalid access token",
       "editBtn": "Triage",
@@ -63,6 +62,10 @@ SiteI18n.extend("en", {
         "substantive_new_comments": "Substantive Comments"
       },
       "drawer": {
+        "rootCause": "Root-cause notes",
+        "english": "English",
+        "chinese": "Chinese",
+        "noNote": "No note recorded.",
         "issueUnavailable": "Issue #{num} is no longer in the active list. The editor was closed; reload its current queue before reviewing again.",
         "title": "Calibrate Issue #{num}",
         "inspectTitle": "Issue #{num} Triage Details",
@@ -103,6 +106,8 @@ SiteI18n.extend("en", {
         "cancelBtn": "Cancel"
       },
       "inbox": {
+        "loadingExcluded": "Loading excluded issues…",
+        "loadFailed": "Could not load excluded issues.",
         "title": "Triage & Review Inbox",
         "tabPending": "Pending ({count})",
         "tabRetriage": "Re-triage ({count})",
@@ -135,8 +140,11 @@ SiteI18n.extend("en", {
       }
     },
     "header": {
-      "title": "TiDB Optimizer Open Issues & In-Flight PR Workbench",
-      "subtitle": "{totalCan} canonical · {totalSup} supplemental ({totalAll} open)"
+      "subtitle": "pingcap/tidb · {totalCan} canonical issues · {totalSup} supplemental",
+      "boards": "Triage boards",
+      "issuesTitle": "Issue triage",
+      "prsTitle": "Pull request status",
+      "prSubtitle": "{mainline} mainline PRs · {backports} cherry-picks"
     },
     "sync": {
       "snapshotLabel": "Issue Snapshot",
@@ -145,92 +153,77 @@ SiteI18n.extend("en", {
       "queryLabel": "Incremental Query",
       "copyTitle": "Click to copy GitHub incremental search qualifier",
       "copied": "Query copied",
-      "deltaBadge": "Delta +{added} / -{closed}",
       "deltaTitle": "Changes Since Previous Snapshot",
       "deltaAdded": "New Open Candidates ({count})",
       "deltaClosed": "Closed & Graduated ({count})",
-      "popoverTitle": "Snapshot & Incremental Sync Metadata"
+      "copyFailed": "Copy failed. Select the query to copy it manually."
     },
     "kpi": {
       "scopedTotal": {
-        "label": "Scoped Candidates",
-        "hint": "All currently OPEN candidates (click for all)"
+        "label": "All candidates"
       },
       "realBugs": {
-        "label": "Actionable Real Bugs",
-        "hint": "{pct}% of scope · E {easy} / M {med} / H {hard}"
+        "label": "Confirmed bugs"
       },
       "highSev": {
-        "label": "High Severity (S0+S1)",
-        "hint": "Critical S0: {crit} · Major S1: {maj}"
+        "label": "High severity"
       },
       "prCoverage": {
-        "label": "Active Fix PR Coverage",
-        "hint": "{open} in-flight PR · {unclaimed} unclaimed"
+        "label": "Fix PR coverage"
       },
-      "enhAndNoise": {
-        "label": "Enhancements / Filtered",
-        "hint": "Fuzz {fuzz} · AI {ai} · Other {oth}"
+      "groups": {
+        "canonical": "Canonical {count}",
+        "supplemental": "Supplemental {count}",
+        "easy": "Easy {count}",
+        "medium": "Medium {count}",
+        "hard": "Hard {count}",
+        "critical": "S0 {count}",
+        "major": "S1 {count}",
+        "open": "Open PR {count}",
+        "uncovered": "No open PR {count}"
       }
     },
-    "legend": {
-      "easy": "Easy Bug",
-      "med": "Medium Bug",
-      "hard": "Hard Bug",
-      "enh": "Enhancement",
-      "flt": "Filtered Noise"
-    },
     "matrix": {
-      "title": "Real Bug Priority Matrix: Difficulty × Severity",
-      "subHtml": "Click any cell to filter below · Warm highlighted cells denote <b>Easy × S0/S1 Quick Wins</b>",
-      "quickWinTag": "Quick Win",
-      "corner": "Difficulty \\ Severity",
-      "colCrit": "S0 · Critical",
-      "colMaj": "S1 · Major",
-      "colMod": "S2 · Moderate",
-      "colMin": "S3 · Minor",
-      "colTotal": "Row Total",
-      "rowEasy": "Easy",
-      "rowEasySub": "Est. 1–3 days",
-      "rowMed": "Medium",
-      "rowMedSub": "Est. 3–7 days",
-      "rowHard": "Hard",
-      "rowHardSub": "Est. 1–3+ weeks",
-      "rowTotal": "Severity Total",
-      "cellSub": "{wait} open · {inPr} in PR",
-      "unclaimedSub": "{wait} unclaimed",
-      "resetSub": "Reset matrix",
-      "activeBadge": "Matrix: {diff} × {sev}",
-      "allDiff": "All Difficulties",
-      "allSev": "All Severities",
-      "clearTitle": "Clear matrix filter"
+      "hint": "Select a count to filter",
+      "title": "Priority matrix",
+      "corner": "Difficulty",
+      "difficulty": {
+        "EASY": "Easy",
+        "MEDIUM": "Medium",
+        "HARD": "Hard"
+      },
+      "total": "Total",
+      "quickWinTag": "Quick win",
+      "cellSub": "{wait} without a fix PR · {inPr} with one",
+      "resetSub": "Clear matrix filters"
     },
     "rubric": {
       "summary": "Triage Rubric",
-      "toggleHint": "Expand / Collapse",
+      "link": "Triage guide",
       "scope": {
-        "title": "1. Triage Scope & Retention Boundary",
-        "fuzzHtml": "<b>Filtered · Random / Differential Fuzz</b>: Extreme differential-testing queries generated by SQLancer, TLP / NoREC / CERT, deeply nested exotic-type set operations, random builtin chains, or manual rule blacklists.",
-        "aiHtml": "<b>Filtered · Obscure AI Corner Cases</b>: Synthetic edge cases crafted from static code audits (e.g., crafted hash collisions, extreme epoch sentinels, or non-default flags) practically unreachable in real SQL workloads.",
-        "nonOptHtml": "<b>Filtered · Non-Optimizer / Fixed / Invalid</b>: Issues belonging to executor, DDL, client-go, or Dashboard UI; issues already fixed on master pending closure/backport; and flaky unit tests.",
-        "keepHtml": "<b>Borderline Retention & Enhancements</b>: Fuzz-reduced or AI-discovered issues with realistic trigger paths causing <b>wrong results, deadlocks, missing locks, or crashes</b> are retained as real bugs; feature requests for new rewrite rules, access paths, or syntax with correct current behavior are classified as <b>Enhancement</b>."
+        "title": "Triage scope",
+        "fuzzHtml": "<b>Filtered · Random / Differential Fuzz</b> Extreme differential-testing queries generated by SQLancer, TLP / NoREC / CERT, deeply nested exotic-type set operations, random builtin chains, or manual rule blacklists.",
+        "aiHtml": "<b>Filtered · Obscure AI Corner Cases</b> Synthetic edge cases crafted from static code audits (e.g., crafted hash collisions, extreme epoch sentinels, or non-default flags) practically unreachable in real SQL workloads.",
+        "nonOptHtml": "<b>Filtered · Non-Optimizer / Fixed / Invalid</b> Issues belonging to executor, DDL, client-go, or Dashboard UI; issues already fixed on master pending closure/backport; and flaky unit tests.",
+        "keepHtml": "<b>Borderline Retention & Enhancements</b> Fuzz-reduced or AI-discovered issues with realistic trigger paths causing <b>wrong results, deadlocks, missing locks, or crashes</b> are retained as real bugs; feature requests for new rewrite rules, access paths, or syntax with correct current behavior are classified as <b>Enhancement</b>."
       },
       "difficulty": {
-        "title": "2. Fix Difficulty (Engineering Effort)",
-        "easyHtml": "<b>Easy (1–3 days)</b>: Clear root cause isolated to a local guard or metadata fix in a single file (e.g., missing privilege checks, session vars in Plan Cache keys, local bound arithmetic, warning/display fixes) without altering cross-phase contracts.",
-        "medHtml": "<b>Medium (3–7 days)</b>: Coordinates invariants across adjacent phases within a subsystem (e.g., logical rewrite vs. column pruning schema mapping, Ranger extraction vs. partitioned pessimistic locking, parameterization type precision, partitioned Global Stats merge).",
-        "hardHtml": "<b>Hard (1–3+ weeks)</b>: Cross-module refactoring, CBO cost / out-of-range extrapolation trade-offs (with plan regression risk), <code>ANALYZE</code> memory &amp; stats-table lock ordering, MPP isolation semantics, or single-pass name resolution / <code>ONLY_FULL_GROUP_BY</code> architectural debt."
+        "title": "Fix difficulty",
+        "easyHtml": "<b>Easy (1–3 days)</b> Clear root cause isolated to a local guard or metadata fix in a single file (e.g., missing privilege checks, session vars in Plan Cache keys, local bound arithmetic, warning/display fixes) without altering cross-phase contracts.",
+        "medHtml": "<b>Medium (3–7 days)</b> Coordinates invariants across adjacent phases within a subsystem (e.g., logical rewrite vs. column pruning schema mapping, Ranger extraction vs. partitioned pessimistic locking, parameterization type precision, partitioned Global Stats merge).",
+        "hardHtml": "<b>Hard (1–3+ weeks)</b> Cross-module refactoring, CBO cost / out-of-range extrapolation trade-offs (with plan regression risk), <code>ANALYZE</code> memory &amp; stats-table lock ordering, MPP isolation semantics, or single-pass name resolution / <code>ONLY_FULL_GROUP_BY</code> architectural debt."
       },
       "severity": {
-        "title": "3. Assessed Severity (Production Impact)",
-        "critHtml": "<b>S0 · Critical</b>: Server panic/crash, <code>ANALYZE</code> or compile-time OOM, permanent background worker exit, cluster-wide GC blocked &gt;12h, silent DML data corruption, missing pessimistic <code>FOR UPDATE</code> locks, privilege bypass, or common/easily-hit <code>SELECT</code> wrong results.",
-        "majHtml": "<b>S1 · Major</b>: Realistic non-edge-case <code>SELECT</code> wrong results requiring specific conditions, valid production SQL failing with internal errors (e.g., <code>ERROR 1105</code>, unresolved internal column) or stats-table deadlocks, and order-of-magnitude plan regressions on core workloads.",
-        "modHtml": "<b>S2 · Moderate</b>: Corner-case / hard-to-hit wrong results retained as borderline bugs, general cardinality/cost estimation skew (suboptimal plan without catastrophic regression), Plan Cache / SPM misses, hint export/replay mismatches, or minor MySQL edge compatibility gaps.",
-        "minHtml": "<b>S3 · Minor</b>: Hint warning text, <code>EXPLAIN</code> / <code>SHOW STATS</code> / slow-log / metric formatting, or peripheral diagnostic tooling polish. <i>(Where the raw GitHub <code>severity/*</code> label is missing or differs, <code>GH</code> is shown inline for reference.)</i>"
+        "title": "Severity",
+        "critHtml": "<b>S0 · Critical</b> Server panic/crash, <code>ANALYZE</code> or compile-time OOM, permanent background worker exit, cluster-wide GC blocked &gt;12h, silent DML data corruption, missing pessimistic <code>FOR UPDATE</code> locks, privilege bypass, or common/easily-hit <code>SELECT</code> wrong results.",
+        "majHtml": "<b>S1 · Major</b> Realistic non-edge-case <code>SELECT</code> wrong results requiring specific conditions, valid production SQL failing with internal errors (e.g., <code>ERROR 1105</code>, unresolved internal column) or stats-table deadlocks, and order-of-magnitude plan regressions on core workloads.",
+        "modHtml": "<b>S2 · Moderate</b> Corner-case / hard-to-hit wrong results retained as borderline bugs, general cardinality/cost estimation skew (suboptimal plan without catastrophic regression), Plan Cache / SPM misses, hint export/replay mismatches, or minor MySQL edge compatibility gaps.",
+        "minHtml": "<b>S3 · Minor</b> Hint warning text, <code>EXPLAIN</code> / <code>SHOW STATS</code> / slow-log / metric formatting, or peripheral diagnostic tooling polish. <i>(Where the raw GitHub <code>severity/*</code> label is missing or differs, <code>GH</code> is shown inline for reference.)</i>"
       }
     },
     "filters": {
-      "searchPlaceholder": "Search Issue #, PR # (e.g. #72862), title, @author, @assignee, or triage notes…",
+      "retriageOnly": "Needs re-triage only",
+      "searchPlaceholder": "Search issues by title, #, author or note",
       "searchAria": "Search issues",
       "clearSearch": "Clear search",
       "resetAll": "Reset Filters",
@@ -246,6 +239,7 @@ SiteI18n.extend("en", {
       "subAll": "All Subsystems",
       "sevAria": "Filter by severity",
       "sev": {
+        "none": "No overlapping severity",
         "all": "All Severities",
         "high": "High S0 + S1 (Critical/Major)",
         "critical": "S0 · Critical",
@@ -284,18 +278,27 @@ SiteI18n.extend("en", {
       "sincePrefix": "Since",
       "sinceSuffix": "",
       "sinceAria": "Updated since date",
-      "sortAria": "Sort order",
+      "sortAria": "Sort by",
       "sort": {
-        "updatedDesc": "Sort: Last Updated ↓",
-        "prioDesc": "Sort: Priority (S0→S3, Easy→Hard)",
-        "numDesc": "Sort: Issue # ↓ (Newest)",
-        "numAsc": "Sort: Issue # ↑ (Oldest)"
-      }
+        "updatedDesc": "Recently updated",
+        "prioDesc": "Highest priority",
+        "numDesc": "Newest issue",
+        "numAsc": "Oldest issue"
+      },
+      "more": "Filters",
+      "category": "Category",
+      "removeFilter": "Remove filter: {label}",
+      "stage": "Blocker stage",
+      "ownerLabel": "Next action by",
+      "scopeLabel": "Scope",
+      "severityLabel": "Severity",
+      "subsystemLabel": "Subsystem",
+      "prLabel": "Linked PRs",
+      "assigneeLabel": "Assignment",
+      "updatedLabel": "Updated"
     },
     "pills": {
-      "groupActionable": "Actionable",
-      "groupOther": "Other",
-      "REAL_ALL": "Real Bugs",
+      "REAL_ALL": "Confirmed bugs",
       "EASY": "Easy",
       "MEDIUM": "Medium",
       "HARD": "Hard",
@@ -303,19 +306,16 @@ SiteI18n.extend("en", {
       "FILTER_RANDOM_FUZZ": "Filtered: Fuzz",
       "FILTER_AI_OBSCURE": "Filtered: AI Edge",
       "FILTER_NON_OPT_OR_FIXED": "Filtered: Fixed/Other",
-      "RETRIAGE": "Re-triage",
-      "ALL": "All"
+      "ALL": "All categories"
     },
     "status": {
-      "count": "Showing {matched} of {scoped} issues",
-      "clickHint": "Click subsystem chip to filter · Click column header to sort"
+      "count": "Showing {matched} of {scoped} issues"
     },
     "table": {
       "colIssue": "Issue",
       "colCatSev": "Classification",
       "colSub": "Subsystem",
-      "colTitle": "Title, Triage Root-Cause & Linked PRs",
-      "colTime": "Activity & Owner",
+      "colTime": "Activity",
       "ghSevNote": "GH: {val}",
       "ghUnlabeled": "unlabeled",
       "tagCustomer": "Customer",
@@ -328,19 +328,18 @@ SiteI18n.extend("en", {
       "empty": "Try broadening your filter criteria, clearing the search box, or resetting filters below."
     },
     "prBoard": {
-      "summaryTitle": "Ball Ownership Distribution (Click court to filter)",
       "courts": {
-        "REVIEWER": "Reviewer's Court",
-        "REVIEWER_sub": "Needs review / LGT1 / ok-to-test",
-        "AUTHOR": "Author's Court",
-        "AUTHOR_sub": "CI failed / conflict / changes req.",
-        "MERGE_QUEUE": "Merge Queue",
-        "MERGE_QUEUE_sub": "Approved & running final CI / Tide",
-        "HOLD": "On Hold / Draft",
-        "HOLD_sub": "Marked as Draft or do-not-merge/hold"
+        "REVIEWER": "Awaiting review",
+        "REVIEWER_sub": "Review or test approval",
+        "AUTHOR": "Awaiting author",
+        "AUTHOR_sub": "Changes, conflicts or CI",
+        "MERGE_QUEUE": "Merge queue",
+        "MERGE_QUEUE_sub": "Approved, awaiting merge",
+        "HOLD": "On hold",
+        "HOLD_sub": "Draft or hold label"
       },
       "cards": {
-        "ALL": "All Active PRs",
+        "ALL": "All stages",
         "NEEDS_LGTM2": "LGT1 (Needs 2nd)",
         "WAITING_REVIEWER": "Needs Review",
         "NEEDS_OK_TO_TEST": "Needs ok-to-test",
@@ -352,28 +351,27 @@ SiteI18n.extend("en", {
         "DRAFT_OR_HOLD": "Draft / Hold"
       },
       "filters": {
-        "searchPlaceholder": "Search PR #, linked Issue #, title, @author, @reviewer, or failed CI check…",
+        "searchPlaceholder": "Search PRs by title, #, reviewer or check",
         "scopeMainline": "Mainline Open PRs ({count})",
         "scopeRealBugMainline": "Real-Bug Mainline PRs ({count})",
         "scopeAllOpen": "All Open PRs incl. Cherry-Picks ({count})",
-        "ballAll": "All Ball Owners",
-        "ballReviewer": "Ball in Reviewer's Court",
-        "ballAuthor": "Ball in Author's Court",
+        "ballAll": "Any owner",
+        "ballReviewer": "Reviewer",
+        "ballAuthor": "Author",
         "ballHold": "On Hold / Draft",
         "ballQueue": "Approved / Merge Queue",
-        "sortPrio": "Sort: Linked Bug Severity ↓",
-        "sortWaitDesc": "Sort: Days Waiting ↓",
-        "sortUpdDesc": "Sort: Last Updated ↓",
-        "sortNumDesc": "Sort: PR # ↓ (Newest)"
+        "sortPrio": "Linked issue priority",
+        "sortWaitDesc": "Longest wait",
+        "sortUpdDesc": "Recently updated",
+        "sortNumDesc": "Newest PR",
+        "searchAria": "Search pull requests"
       },
       "statusCount": "Showing {matched} of {scoped} in-flight PRs",
-      "clickHint": "Click red CI chips for build logs · Click target icon to jump to Issue",
       "cols": {
-        "pr": "PR / Author",
-        "blocker": "Blocker & Court Wait",
-        "issues": "Linked Issues & Priority",
-        "details": "Title, Review Progress & Failed CI Checks",
-        "time": "Activity / Commit"
+        "pr": "Pull request",
+        "blocker": "Blocker",
+        "issues": "Linked issues",
+        "time": "Activity"
       },
       "ballTag": {
         "REVIEWER": "Reviewer",
@@ -386,7 +384,6 @@ SiteI18n.extend("en", {
       "ciRunning": "{count} CI running",
       "ciPassed": "{count} passed",
       "ciMore": "+{count} more failed",
-      "ciCollapse": "Show less",
       "revLgtm": "LGTM: {users}",
       "revChanges": "Changes req: {users}",
       "revThreadsWithUsers": "Unresolved ({count}): {users}",

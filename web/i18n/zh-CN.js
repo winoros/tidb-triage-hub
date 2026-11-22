@@ -15,27 +15,26 @@ SiteI18n.extend("zh-CN", {
     },
     "nav": {
       "more": "更多",
-      "toggleOverviewHide": "收起概览",
-      "toggleOverviewShow": "展开概览",
-      "syncInfoBtn": "同步状态"
+      "syncInfoBtn": "数据快照"
     },
     "views": {
       "issuesTab": "Issue 研判",
-      "prsTab": "PR 推进"
+      "prsTab": "PR 进展"
     },
     "rw": {
-      "modeBadge": "读写模式",
-      "readonlyBadge": "只读模式",
+      "modeBadge": "维护者",
+      "readonlyBadge": "只读",
       "pendingBtn": "待处理",
       "syncPrsBtn": "刷新 PR",
       "syncIssuesBtn": "同步 Issue",
       "syncing": "同步中…",
-      "unlockBtn": "解锁维护",
-      "lockBtn": "退出维护",
-      "authModalTitle": "解锁维护者读写权限",
+      "unlockBtn": "维护者登录",
+      "lockBtn": "退出登录",
+      "authModalTitle": "维护者登录",
+      "sessionExpired": "登录已过期。重新登录后可继续当前审核。",
       "authModalHint": "请输入服务端配置的访问令牌（TRIAGE_HUB_TOKEN），验证通过后将在本浏览器启用校准与 GitHub 同步按钮。",
       "authTokenPlaceholder": "输入访问令牌…",
-      "authSubmitBtn": "解锁",
+      "authSubmitBtn": "登录",
       "authCancelBtn": "取消",
       "authInvalidToken": "访问令牌无效，请检查后重试",
       "editBtn": "校准",
@@ -63,6 +62,10 @@ SiteI18n.extend("zh-CN", {
         "substantive_new_comments": "新增实质性讨论"
       },
       "drawer": {
+        "rootCause": "根因与研判备注",
+        "english": "英文",
+        "chinese": "中文",
+        "noNote": "暂无备注。",
         "issueUnavailable": "Issue #{num} 已移出活跃列表，编辑窗口已关闭；请从当前队列重新查看。",
         "title": "校准 Issue #{num}",
         "inspectTitle": "Issue #{num} 研判详情",
@@ -103,6 +106,8 @@ SiteI18n.extend("zh-CN", {
         "cancelBtn": "取消"
       },
       "inbox": {
+        "loadingExcluded": "正在加载已排除的 Issue…",
+        "loadFailed": "未能加载已排除的 Issue。",
         "title": "分拣与复核工作台",
         "tabPending": "新候选 ({count})",
         "tabRetriage": "待复核 ({count})",
@@ -135,8 +140,11 @@ SiteI18n.extend("zh-CN", {
       }
     },
     "header": {
-      "title": "TiDB 优化器开放 Issue 研判与在途 PR 推进看板",
-      "subtitle": "标准集 {totalCan} · 补充集 {totalSup}（共 {totalAll} 条开放候选）"
+      "subtitle": "pingcap/tidb · 标准集 {totalCan} 个 Issue · 补充集 {totalSup} 个",
+      "boards": "工作台视图",
+      "issuesTitle": "Issue 研判",
+      "prsTitle": "PR 进展",
+      "prSubtitle": "主干 PR {mainline} 个 · Cherry-pick {backports} 个"
     },
     "sync": {
       "snapshotLabel": "Issue 快照",
@@ -145,92 +153,77 @@ SiteI18n.extend("zh-CN", {
       "queryLabel": "增量检索词",
       "copyTitle": "点击复制 GitHub 增量搜索限定词",
       "copied": "已复制检索词",
-      "deltaBadge": "近期变更 +{added} / -{closed}",
       "deltaTitle": "距上一快照变更明细",
       "deltaAdded": "新增开放候选 ({count})",
       "deltaClosed": "已关单或转出 ({count})",
-      "popoverTitle": "数据同步水位线与快照信息"
+      "copyFailed": "复制失败，可选中查询条件手动复制。"
     },
     "kpi": {
       "scopedTotal": {
-        "label": "当前口径候选池",
-        "hint": "全部 OPEN 候选单据（点击查看全部）"
+        "label": "全部候选"
       },
       "realBugs": {
-        "label": "真实有效 Bug",
-        "hint": "占比 {pct}% · E {easy} / M {med} / H {hard}"
+        "label": "有效 Bug"
       },
       "highSev": {
-        "label": "高危严重度 (S0+S1)",
-        "hint": "致命 S0: {crit} · 严重 S1: {maj}"
+        "label": "高严重度"
       },
       "prCoverage": {
-        "label": "真 Bug 在途 PR 覆盖",
-        "hint": "在途修复 {open} · 待认领 {unclaimed}"
+        "label": "修复 PR 覆盖"
       },
-      "enhAndNoise": {
-        "label": "功能增强 / 已筛除噪声",
-        "hint": "Fuzz {fuzz} · AI {ai} · 其他 {oth}"
+      "groups": {
+        "canonical": "标准集 {count}",
+        "supplemental": "补充集 {count}",
+        "easy": "简单 {count}",
+        "medium": "中等 {count}",
+        "hard": "困难 {count}",
+        "critical": "S0 {count}",
+        "major": "S1 {count}",
+        "open": "有在途 PR {count}",
+        "uncovered": "无在途 PR {count}"
       }
     },
-    "legend": {
-      "easy": "Easy 简单",
-      "med": "Medium 中等",
-      "hard": "Hard 困难",
-      "enh": "Enhancement 增强",
-      "flt": "已筛除噪声"
-    },
     "matrix": {
-      "title": "真实 Bug 修复难度 × 严重度优先级矩阵",
-      "subHtml": "点击单元格联动过滤列表 · 暖色高亮区为 <b>Easy × S0/S1 高性价比速赢项</b>",
+      "hint": "点击数量筛选",
+      "title": "优先级矩阵",
+      "corner": "修复难度",
+      "difficulty": {
+        "EASY": "简单",
+        "MEDIUM": "中等",
+        "HARD": "困难"
+      },
+      "total": "合计",
       "quickWinTag": "速赢",
-      "corner": "修复难度 \\ 研判严重度",
-      "colCrit": "S0 · Critical 致命",
-      "colMaj": "S1 · Major 严重",
-      "colMod": "S2 · Moderate 中等",
-      "colMin": "S3 · Minor 轻微",
-      "colTotal": "难度合计",
-      "rowEasy": "Easy · 简单",
-      "rowEasySub": "预计 1~3 天",
-      "rowMed": "Medium · 中等",
-      "rowMedSub": "预计 3~7 天",
-      "rowHard": "Hard · 困难",
-      "rowHardSub": "预计 1~3+ 周",
-      "rowTotal": "严重度合计",
-      "cellSub": "{wait} 待认领 · {inPr} 在途",
-      "unclaimedSub": "{wait} 待认领",
-      "resetSub": "重置矩阵筛选",
-      "activeBadge": "矩阵: {diff} × {sev}",
-      "allDiff": "全部难度",
-      "allSev": "全部严重度",
-      "clearTitle": "清除矩阵筛选"
+      "cellSub": "{wait} 无在途 PR · {inPr} 有在途 PR",
+      "resetSub": "清除矩阵筛选"
     },
     "rubric": {
       "summary": "分级与去噪口径说明",
-      "toggleHint": "展开 / 收起",
+      "link": "分级说明",
       "scope": {
-        "title": "1. 噪声筛除与保留边界（Triage Scope）",
-        "fuzzHtml": "<b>筛除 · Random / 差分 Fuzz</b>：由 SQLancer、TLP / NoREC / CERT、多层非常规类型集合运算、随机内建函数组合或手动黑名单关停优化规则构造的差分测试极端用例。",
-        "aiHtml": "<b>筛除 · AI 静态猎奇边界</b>：基于源码静态审计刻意拼凑的表达式哈希碰撞、纪元极值哨兵或未默认开启开关的理论边界，常规业务 SQL 几乎不可达。",
-        "nonOptHtml": "<b>筛除 · 非优化器 / 已修 / 无效</b>：归属执行器、DDL、存储客户端、UI 等非优化器模块的问题，主干已合入修复仅待关单/回移的单据，以及单测 Flaky 用例。",
-        "keepHtml": "<b>边界保留与 Enhancement 区分</b>：虽由 Fuzz 约简或 AI 发现，但触发路径常规且造成<b>错结果、死锁、漏锁或崩溃</b>的问题一律保留为真实 Bug；结果正确、诉求为新增改写规则 / 访问路径 / 属性推导或语法支持的单据归入 <b>Enhancement</b>。"
+        "title": "筛除与保留",
+        "fuzzHtml": "<b>筛除 · Random / 差分 Fuzz</b> 由 SQLancer、TLP / NoREC / CERT、多层非常规类型集合运算、随机内建函数组合或手动黑名单关停优化规则构造的差分测试极端用例。",
+        "aiHtml": "<b>筛除 · AI 静态猎奇边界</b> 基于源码静态审计刻意拼凑的表达式哈希碰撞、纪元极值哨兵或未默认开启开关的理论边界，常规业务 SQL 几乎不可达。",
+        "nonOptHtml": "<b>筛除 · 非优化器 / 已修 / 无效</b> 归属执行器、DDL、存储客户端、UI 等非优化器模块的问题，主干已合入修复仅待关单/回移的单据，以及单测 Flaky 用例。",
+        "keepHtml": "<b>边界保留与 Enhancement 区分</b> 虽由 Fuzz 约简或 AI 发现，但触发路径常规且造成<b>错结果、死锁、漏锁或崩溃</b>的问题一律保留为真实 Bug；结果正确、诉求为新增改写规则 / 访问路径 / 属性推导或语法支持的单据归入 <b>Enhancement</b>。"
       },
       "difficulty": {
-        "title": "2. 修复难度分级（Difficulty · 工程成本）",
-        "easyHtml": "<b>Easy · 简单（预计 1~3 天）</b>：根因清晰、改动收敛在单文件局部守卫或元数据补齐（如权限检查补漏、Plan Cache 键补齐会话变量、局部算术边界修正、告警与展示修复），不改变多阶段规则契约。",
-        "medHtml": "<b>Medium · 中等（预计 3~7 天）</b>：涉及单子系统相邻阶段的不变量协同（如逻辑改写与列裁剪 Schema 映射、Range 提取与分区悲观锁下推、参数泛化与类型精度、分区 Global Stats 合并）。",
-        "hardHtml": "<b>Hard · 困难（预计 1~3+ 周）</b>：牵涉跨模块重构、CBO 代价与超界外推模型权衡（易引发基准或生产计划回归）、<code>ANALYZE</code> 内存与系统表并发锁治理、MPP 隔离交互或单遍名称解析历史架构债，需配套设计方案与全量回归验证。"
+        "title": "修复难度",
+        "easyHtml": "<b>Easy · 简单（预计 1~3 天）</b> 根因清晰、改动收敛在单文件局部守卫或元数据补齐（如权限检查补漏、Plan Cache 键补齐会话变量、局部算术边界修正、告警与展示修复），不改变多阶段规则契约。",
+        "medHtml": "<b>Medium · 中等（预计 3~7 天）</b> 涉及单子系统相邻阶段的不变量协同（如逻辑改写与列裁剪 Schema 映射、Range 提取与分区悲观锁下推、参数泛化与类型精度、分区 Global Stats 合并）。",
+        "hardHtml": "<b>Hard · 困难（预计 1~3+ 周）</b> 牵涉跨模块重构、CBO 代价与超界外推模型权衡（易引发基准或生产计划回归）、<code>ANALYZE</code> 内存与系统表并发锁治理、MPP 隔离交互或单遍名称解析历史架构债，需配套设计方案与全量回归验证。"
       },
       "severity": {
-        "title": "3. 严重度分级（Severity · 故障影响）",
-        "critHtml": "<b>S0 · Critical 致命</b>：进程 Panic / Crash、<code>ANALYZE</code> 或编译引发实例 OOM、后台核心协程永久退出、长时间阻塞全集群 GC、DML 错删改或串表、悲观事务 <code>FOR UPDATE</code> 静默漏锁、权限校验绕过，以及常规常见 <code>SELECT</code> 容易触发的错结果。",
-        "majHtml": "<b>S1 · Major 严重</b>：非边角但需特定条件触发的 <code>SELECT</code> 错结果、合法常见 SQL 报内部错误（如 <code>ERROR 1105</code>、隐式列解析失败）或统计信息元表死锁阻断执行、核心生产场景出现数量级计划退化。",
-        "modHtml": "<b>S2 · Moderate 中等</b>：边界保留但较难触发的边角错结果、一般性基数/代价估算偏差（计划次优但结果正确且无雪崩）、Plan Cache / SPM 未命中、Hint 导出回放局部失配或低频 MySQL 兼容性边缘差异。",
-        "minHtml": "<b>S3 · Minor 轻微</b>：Hint 告警文案、<code>EXPLAIN</code> / <code>SHOW STATS</code> / 慢日志 / 监控指标显示细节或周边诊断工具微瑕。<i>（若 GitHub 原始 <code>severity/*</code> 标签未标或与研判不一致，行内会附注 <code>GH</code> 原标供对照。）</i>"
+        "title": "严重度",
+        "critHtml": "<b>S0 · Critical 致命</b> 进程 Panic / Crash、<code>ANALYZE</code> 或编译引发实例 OOM、后台核心协程永久退出、长时间阻塞全集群 GC、DML 错删改或串表、悲观事务 <code>FOR UPDATE</code> 静默漏锁、权限校验绕过，以及常规常见 <code>SELECT</code> 容易触发的错结果。",
+        "majHtml": "<b>S1 · Major 严重</b> 非边角但需特定条件触发的 <code>SELECT</code> 错结果、合法常见 SQL 报内部错误（如 <code>ERROR 1105</code>、隐式列解析失败）或统计信息元表死锁阻断执行、核心生产场景出现数量级计划退化。",
+        "modHtml": "<b>S2 · Moderate 中等</b> 边界保留但较难触发的边角错结果、一般性基数/代价估算偏差（计划次优但结果正确且无雪崩）、Plan Cache / SPM 未命中、Hint 导出回放局部失配或低频 MySQL 兼容性边缘差异。",
+        "minHtml": "<b>S3 · Minor 轻微</b> Hint 告警文案、<code>EXPLAIN</code> / <code>SHOW STATS</code> / 慢日志 / 监控指标显示细节或周边诊断工具微瑕。<i>（若 GitHub 原始 <code>severity/*</code> 标签未标或与研判不一致，行内会附注 <code>GH</code> 原标供对照。）</i>"
       }
     },
     "filters": {
-      "searchPlaceholder": "搜索 Issue #、PR #（如 #72862）、标题、@作者、@指派人 或研判备注…",
+      "retriageOnly": "仅看待复核",
+      "searchPlaceholder": "搜索标题、编号、作者或研判备注",
       "searchAria": "搜索单据",
       "clearSearch": "清空搜索",
       "resetAll": "重置全部筛选",
@@ -246,6 +239,7 @@ SiteI18n.extend("zh-CN", {
       "subAll": "全部子模块",
       "sevAria": "严重度过滤",
       "sev": {
+        "none": "严重度条件无交集",
         "all": "全部严重度",
         "high": "高危 S0 + S1 (Critical/Major)",
         "critical": "S0 · Critical 致命",
@@ -284,18 +278,27 @@ SiteI18n.extend("zh-CN", {
       "sincePrefix": "自",
       "sinceSuffix": "起",
       "sinceAria": "增量起始日期",
-      "sortAria": "排序方式",
+      "sortAria": "排序",
       "sort": {
-        "updatedDesc": "排序：最后更新 ↓",
-        "prioDesc": "排序：优先级 (S0→S3, 易→难)",
-        "numDesc": "排序：Issue 编号 ↓ (最新)",
-        "numAsc": "排序：Issue 编号 ↑ (最早)"
-      }
+        "updatedDesc": "最近更新",
+        "prioDesc": "优先级最高",
+        "numDesc": "编号从新到旧",
+        "numAsc": "编号从旧到新"
+      },
+      "more": "筛选",
+      "category": "分类",
+      "removeFilter": "移除筛选：{label}",
+      "stage": "阻塞阶段",
+      "ownerLabel": "下一步责任方",
+      "scopeLabel": "范围",
+      "severityLabel": "严重度",
+      "subsystemLabel": "子系统",
+      "prLabel": "关联 PR",
+      "assigneeLabel": "指派状态",
+      "updatedLabel": "更新时间"
     },
     "pills": {
-      "groupActionable": "核心关注",
-      "groupOther": "增强与筛除",
-      "REAL_ALL": "有效真 Bug",
+      "REAL_ALL": "有效 Bug",
       "EASY": "Easy",
       "MEDIUM": "Medium",
       "HARD": "Hard",
@@ -303,19 +306,16 @@ SiteI18n.extend("zh-CN", {
       "FILTER_RANDOM_FUZZ": "筛除: Fuzz",
       "FILTER_AI_OBSCURE": "筛除: AI 边界",
       "FILTER_NON_OPT_OR_FIXED": "筛除: 已修/非优化器",
-      "RETRIAGE": "待复核",
-      "ALL": "全部"
+      "ALL": "全部分类"
     },
     "status": {
-      "count": "显示 {matched} / {scoped} 条单据",
-      "clickHint": "点击子模块可快速筛选 · 点击表头可切换排序"
+      "count": "显示 {matched} / {scoped} 条单据"
     },
     "table": {
-      "colIssue": "单号",
-      "colCatSev": "分级定性",
+      "colIssue": "Issue",
+      "colCatSev": "研判分类",
       "colSub": "所属子模块",
-      "colTitle": "标题、研判归因与关联 PR",
-      "colTime": "更新时间 & 归属",
+      "colTime": "最近动态",
       "ghSevNote": "GH: {val}",
       "ghUnlabeled": "未标",
       "tagCustomer": "客户反馈",
@@ -328,19 +328,18 @@ SiteI18n.extend("zh-CN", {
       "empty": "请尝试放宽筛选条件、清空搜索关键词或点击下方按钮重置筛选。"
     },
     "prBoard": {
-      "summaryTitle": "当前球权分布（点击卡片过滤对应责任方）",
       "courts": {
-        "REVIEWER": "卡在 Reviewer",
-        "REVIEWER_sub": "待首审 / 复审 / 差一票 / 放行",
-        "AUTHOR": "卡在 Author",
-        "AUTHOR_sub": "CI 失败 / 代码冲突 / 待改代码",
-        "MERGE_QUEUE": "批准待合入",
-        "MERGE_QUEUE_sub": "跑收尾 CI 或排 Tide 队列",
-        "HOLD": "暂挂 / 草稿",
-        "HOLD_sub": "Draft 或带有 hold 标签"
+        "REVIEWER": "待审阅人处理",
+        "REVIEWER_sub": "代码审阅或测试放行",
+        "AUTHOR": "待作者处理",
+        "AUTHOR_sub": "修改代码、解决冲突或修复 CI",
+        "MERGE_QUEUE": "合并队列",
+        "MERGE_QUEUE_sub": "已批准，等待合并",
+        "HOLD": "暂缓处理",
+        "HOLD_sub": "草稿或带有 hold 标签"
       },
       "cards": {
-        "ALL": "全部在途 PR",
+        "ALL": "全部阶段",
         "NEEDS_LGTM2": "LGT1 差一票",
         "WAITING_REVIEWER": "待首审 / 复审",
         "NEEDS_OK_TO_TEST": "待 ok-to-test",
@@ -352,28 +351,27 @@ SiteI18n.extend("zh-CN", {
         "DRAFT_OR_HOLD": "草稿 / Hold"
       },
       "filters": {
-        "searchPlaceholder": "搜索 PR #、关联 Issue #、标题、@作者、@审阅人 或失败 CI 名称…",
+        "searchPlaceholder": "搜索 PR 标题、编号、审阅人或 CI 检查",
         "scopeMainline": "主干在途 PR ({count})",
         "scopeRealBugMainline": "仅真 Bug 主干 PR ({count})",
         "scopeAllOpen": "全部开放 PR · 含 Cherry-Pick ({count})",
-        "ballAll": "全部球权归属",
-        "ballReviewer": "球在 Reviewer (待审/放行)",
-        "ballAuthor": "球在 Author (CI/冲突/待改)",
+        "ballAll": "全部责任方",
+        "ballReviewer": "审阅人",
+        "ballAuthor": "作者",
         "ballHold": "暂挂 Hold / 草稿",
         "ballQueue": "已批准排队列",
-        "sortPrio": "排序：关联 Bug 严重度 ↓",
-        "sortWaitDesc": "排序：球权等待天数 ↓",
-        "sortUpdDesc": "排序：最后活跃时间 ↓",
-        "sortNumDesc": "排序：PR 编号 ↓ (最新)"
+        "sortPrio": "关联 Issue 优先级",
+        "sortWaitDesc": "等待最久",
+        "sortUpdDesc": "最近更新",
+        "sortNumDesc": "编号从新到旧",
+        "searchAria": "搜索 PR"
       },
       "statusCount": "显示 {matched} / {scoped} 个在途 PR",
-      "clickHint": "点击红色失败项可直达构建日志 · 点击定位图标可回到对应 Issue",
       "cols": {
-        "pr": "PR / 作者",
-        "blocker": "阻塞阶段 & 球权等待",
-        "issues": "关联 Issue & 优先级",
-        "details": "标题、审阅进展 & 失败 CI 直链",
-        "time": "最后活跃 / 提交"
+        "pr": "PR",
+        "blocker": "阻塞原因",
+        "issues": "关联 Issue",
+        "time": "最近动态"
       },
       "ballTag": {
         "REVIEWER": "Reviewer",
@@ -386,7 +384,6 @@ SiteI18n.extend("zh-CN", {
       "ciRunning": "{count} 项 CI 运行中",
       "ciPassed": "{count} 项通过",
       "ciMore": "展开其余 {count} 项失败",
-      "ciCollapse": "收起",
       "revLgtm": "LGTM: {users}",
       "revChanges": "需修改: {users}",
       "revThreadsWithUsers": "未决讨论 ({count}): {users}",
