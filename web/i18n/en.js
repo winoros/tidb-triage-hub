@@ -158,6 +158,11 @@ SiteI18n.extend("en", {
       "deltaClosed": "Closed & Graduated ({count})",
       "copyFailed": "Copy failed. Select the query to copy it manually."
     },
+    "bugTrend": {
+      "all": "View all dates",
+      "title": "Confirmed open bugs",
+      "hint": "Latest observation per day · UTC+8 · Drag to zoom"
+    },
     "kpi": {
       "scopedTotal": {
         "label": "All candidates"

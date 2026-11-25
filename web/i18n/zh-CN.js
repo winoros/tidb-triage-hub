@@ -158,6 +158,11 @@ SiteI18n.extend("zh-CN", {
       "deltaClosed": "已关单或转出 ({count})",
       "copyFailed": "复制失败，可选中查询条件手动复制。"
     },
+    "bugTrend": {
+      "all": "查看全部日期",
+      "title": "已确认且仍开放的 Bug",
+      "hint": "每日最后一次记录 · UTC+8 · 横向拖选放大"
+    },
     "kpi": {
       "scopedTotal": {
         "label": "全部候选"

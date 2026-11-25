@@ -398,6 +398,19 @@
   .issue-overview {
     display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 12px;
   }
+  .bug-trend { margin: 12px 0; }
+  .trend-chart { position: relative; width: 100%; max-width: 760px; height: 155px; margin: 4px auto 0; }
+  #bugTrendPlot { touch-action: pan-y; user-select: none; cursor: crosshair; }
+  .bug-trend .matrix-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+  .trend-readout { display: grid; grid-template-columns: minmax(22ch, 1fr) auto; gap: 8px; align-items: center; }
+  #bugTrendLatest { text-align: end; font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 13px; }
+  #trendReset { white-space: nowrap; }
+  #trendReset:disabled { visibility: hidden; }
+  @container (max-width: 660px) {
+    .bug-trend .matrix-head { grid-template-columns: 1fr; gap: 4px; }
+    #bugTrendLatest { text-align: start; }
+    .trend-readout { grid-template-columns: minmax(0, 1fr) auto; }
+  }
   .matrix-box {
     display: flex; flex-direction: column;
     min-width: 0; padding: 12px 16px 10px; background: var(--bg-elevated);
@@ -1091,6 +1104,20 @@
       </section>
     </div>
 
+    <figure class="matrix-box bug-trend" id="bugTrend" hidden>
+      <figcaption class="matrix-head">
+        <div class="matrix-heading">
+          <h2 id="bugTrendTitle" data-i18n="report.bugTrend.title"></h2>
+          <span class="matrix-hint" data-i18n="report.bugTrend.hint"></span>
+        </div>
+        <div class="trend-readout">
+          <strong id="bugTrendLatest"></strong>
+          <button id="trendReset" type="button" class="btn" data-i18n="report.bugTrend.all" disabled></button>
+        </div>
+      </figcaption>
+      <div class="trend-chart"><canvas id="bugTrendPlot" role="img" aria-labelledby="bugTrendTitle bugTrendLatest"></canvas></div>
+    </figure>
+
     <div class="list-panel">
       <div class="controls">
         <div class="query-line">
@@ -1516,6 +1543,7 @@
   <svg class="ico ico-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
 </button>
 
+<script src="/assets/vendor/charts.min.js"></script>
 <!--SERVER_INLINE_BUNDLE-->
 <script>
 (function() {
@@ -1929,7 +1957,94 @@
     }
   }
 
+  var trendPlot = document.getElementById("bugTrendPlot");
+  var trendReset = document.getElementById("trendReset");
+  var trendReadout = document.getElementById("bugTrendLatest");
+  var trendChart, trendHistory, trendAppearance, dragStartDate;
+
+  function trendDate(ms) {
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+
+  function updateTrendReadout() {
+    var x = trendChart.scales.x;
+    var last = trendHistory[trendHistory.length - 1];
+    trendReset.disabled = !trendChart.isZoomedOrPanned();
+    trendReadout.textContent = trendReset.disabled ? last.date + " · " + last.count :
+      trendDate(x.min) + " — " + trendDate(x.max);
+  }
+
+  trendReset.addEventListener("click", function() { trendChart.resetZoom(); });
+
+  // The plugin draws the selection. Show the dates at its edges while dragging.
+  trendPlot.addEventListener("mousemove", function(event) {
+    if (!trendChart || !event.buttons || dragStartDate == null) return;
+    var x = trendChart.scales.x;
+    var end = x.getValueForPixel(Math.max(x.left, Math.min(x.right, event.offsetX)));
+    trendReadout.textContent = [dragStartDate, trendDate(end)].sort().join(" — ");
+  });
+  function finishTrendDrag() {
+    if (dragStartDate != null && trendChart) updateTrendReadout();
+    dragStartDate = null;
+  }
+  document.addEventListener("mouseup", finishTrendDrag);
+  document.addEventListener("keydown", function(event) {
+    if (event.key === "Escape") finishTrendDrag();
+  });
+
+  function renderBugTrend() {
+    var history = window.REPORT_DATASET.bug_history;
+    document.getElementById("bugTrend").hidden = !history || !history.length;
+    var appearance = SiteI18n.getLocale() + SiteI18n.getEffectiveTheme();
+    if (trendHistory === history && trendAppearance === appearance) return;
+    var range = trendChart && trendChart.isZoomedOrPanned() && history === trendHistory ?
+      {min: trendChart.scales.x.min, max: trendChart.scales.x.max} : null;
+    if (trendChart) trendChart.destroy();
+    trendChart = null;
+    dragStartDate = null;
+    trendHistory = history;
+    trendAppearance = appearance;
+    if (!history || !history.length) return;
+
+    var style = getComputedStyle(trendPlot);
+    var accent = style.getPropertyValue("--accent").trim();
+    var ticks = style.getPropertyValue("--muted").trim();
+    var grid = style.getPropertyValue("--border").trim();
+    trendChart = new Chart(trendPlot, {
+      type: "line",
+      data: { datasets: [{ data: history.map(function(p) { return {x: Date.parse(p.date), y: p.count}; }),
+        borderColor: accent, backgroundColor: accent, borderWidth: 2, pointRadius: 3 }] },
+      options: {
+        locale: SiteI18n.getLocale(), responsive: true, maintainAspectRatio: false,
+        animation: false, parsing: false, interaction: {mode: "nearest", axis: "x", intersect: false},
+        scales: {
+          x: {type: "time", adapters: {date: {zone: "utc"}}, time: {minUnit: "day", displayFormats: {day: "MM-dd"}},
+            ticks: {color: ticks, align: "inner", maxTicksLimit: 7, maxRotation: 0}, grid: {display: false}},
+          y: {ticks: {color: ticks, precision: 0, maxTicksLimit: 4}, grid: {color: grid}}
+        },
+        plugins: {
+          legend: {display: false},
+          tooltip: {displayColors: false, callbacks: {
+            title: function(items) { return trendDate(items[0].parsed.x); },
+            label: function(item) { return String(item.parsed.y); }
+          }},
+          zoom: {limits: {x: {min: "original", max: "original", minRange: 86400000}},
+            zoom: {mode: "x", drag: {enabled: true, threshold: 4}, pinch: {enabled: true},
+              onZoomStart: function(ctx) {
+                if (ctx.point) dragStartDate = trendDate(ctx.chart.scales.x.getValueForPixel(ctx.point.x));
+                return history.length > 1;
+              },
+              onZoomComplete: function() { dragStartDate = null; updateTrendReadout(); }
+            }}
+        }
+      }
+    });
+    if (range) trendChart.zoomScale("x", range, "none");
+    updateTrendReadout();
+  }
+
   function renderSyncAndScopeMeta() {
+    renderBugTrend();
     document.getElementById("syncSnapTxt").textContent = META.snapshot_utc8;
     var prWrap = document.getElementById("prSyncWrap");
     if (META.pr_snapshot_utc8) {
@@ -4288,7 +4403,7 @@
     if (!document.getElementById("inboxDrawer").hidden) renderInboxDrawer();
     refreshOpenEditDrawer();
   });
-  SiteI18n.onThemeChange(updateThemeBtnUI);
+  SiteI18n.onThemeChange(function() { updateThemeBtnUI(); renderBugTrend(); });
 
   rebuildDerivedIndexes();
   SiteI18n.init();

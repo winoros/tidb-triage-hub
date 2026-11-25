@@ -1164,7 +1164,7 @@ WHERE i.repo = ? AND i.number = ?`, DefaultRepo, prevAdd.Number).Scan(&triagedAt
 		return issuesync.SyncAppliedOutcome{}, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := commitIssueObservation(tx); err != nil {
 		return issuesync.SyncAppliedOutcome{}, err
 	}
 
@@ -1612,7 +1612,7 @@ func (s *Store) ExcludeExistingIssueWithPrecondition(number int, reason string, 
 	if err := s.excludeExistingIssueInTx(tx, number, reason, allowCanonical, nowISO); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return commitIssueObservation(tx)
 }
 
 func (s *Store) excludeExistingIssueInTx(tx *sql.Tx, number int, reason string, allowCanonical bool, nowISO string) error {

@@ -366,6 +366,8 @@ func (s *Server) registerRoutes() {
 	// Standalone static fallback & live bootstrap payload
 	s.mux.HandleFunc("GET /assets/i18n/", s.serveI18nAsset("/assets/i18n/"))
 	s.mux.HandleFunc("GET /i18n/", s.serveI18nAsset("/i18n/"))
+	s.mux.Handle("GET /assets/vendor/charts.min.js", http.StripPrefix("/assets/", http.FileServerFS(webassets.FS)))
+	s.mux.Handle("GET /assets/vendor/LICENSES.txt", http.StripPrefix("/assets/", http.FileServerFS(webassets.FS)))
 	s.mux.HandleFunc("GET /bootstrap.js", s.handleBootstrapJS)
 
 	s.mux.HandleFunc("GET /auth/github", s.handleGitHubLogin)

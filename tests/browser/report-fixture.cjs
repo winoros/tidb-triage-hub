@@ -24,7 +24,9 @@ async function openReport(t, dataset, query, pending = []) {
   const html = template.replace('<!--SERVER_INLINE_BUNDLE-->', () => '<script>' + i18n + '\n' + boot + '</script>');
   await page.route('**/*', route => route.request().isNavigationRequest()
     ? route.fulfill({ contentType: 'text/html', body: html })
-    : route.abort());
+    : new URL(route.request().url()).pathname === '/assets/vendor/charts.min.js'
+      ? route.fulfill({ contentType: 'application/javascript', path: join(web, 'vendor/charts.min.js') })
+      : route.abort());
   await page.goto('https://triage.test/?' + query);
   return page;
 }

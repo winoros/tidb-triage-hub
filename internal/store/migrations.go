@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const schemaVersion = 5
+const schemaVersion = 6
 
 func uriMode(raw string) string {
 	u, err := url.Parse(raw)
@@ -92,6 +92,9 @@ func (s *Store) ensureSchema(readOnly bool) error {
 		if _, err := tx.Exec(authSessionSchema); err != nil {
 			return err
 		}
+	}
+	if err := migrateBugHistory(tx); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 		return err

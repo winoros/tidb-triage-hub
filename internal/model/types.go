@@ -327,11 +327,17 @@ type DatasetEnums struct {
 	BallOwners    []string `json:"ball_owners,omitempty"`
 }
 
+type BugCountPoint struct {
+	Date  string `json:"date"`
+	Count int    `json:"count"`
+}
+
 type Dataset struct {
-	SyncMeta SyncMeta            `json:"sync_meta"`
-	Enums    DatasetEnums        `json:"enums"`
-	Records  []IssueRecord       `json:"records"`
-	PRStatus map[string]PRStatus `json:"pr_status,omitempty"`
+	BugHistory []BugCountPoint     `json:"bug_history,omitempty"`
+	SyncMeta   SyncMeta            `json:"sync_meta"`
+	Enums      DatasetEnums        `json:"enums"`
+	Records    []IssueRecord       `json:"records"`
+	PRStatus   map[string]PRStatus `json:"pr_status,omitempty"`
 }
 
 type PendingComment struct {

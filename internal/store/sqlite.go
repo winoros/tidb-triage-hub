@@ -1163,7 +1163,21 @@ ON CONFLICT(repo, number) DO NOTHING`, DefaultRepo, exNum, nowNanoISO); err != n
 		return err
 	}
 
-	return tx.Commit()
+	if replacePRStatus && len(ds.BugHistory) > 0 {
+		for _, point := range ds.BugHistory {
+			if _, err := tx.Exec("INSERT OR REPLACE INTO bug_history(day,count) VALUES (?,?)", point.Date, point.Count); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	}
+	if replacePRStatus && ds.SyncMeta.SnapshotUTC != "" {
+		if err := recordBugCount(tx, ds.SyncMeta.SnapshotUTC); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	return commitIssueObservation(tx)
 }
 
 // queryBoardEligibleOpenPRKeys returns open/draft (and optionally unknown) PRs linked to at least
@@ -1659,7 +1673,7 @@ func (s *Store) applyIssueOverrideLocked(number int, req model.TriagePatchReques
 	if err := s.applyIssueOverrideInTx(tx, number, req, nowISO); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return commitIssueObservation(tx)
 }
 
 func (s *Store) SaveIssueOverride(number int, req model.TriagePatchRequest) (model.IssueRecord, error) {
@@ -1823,7 +1837,7 @@ WHERE repo = ? AND number = ?`,
 	if err := s.reevaluateIssueRetriageInTx(tx, []int{number}); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return commitIssueObservation(tx)
 }
 
 func (s *Store) DeleteIssueOverride(number int) (model.IssueRecord, error) {
@@ -1954,7 +1968,7 @@ func (s *Store) ResolvePendingCandidate(number int, req model.PendingResolveRequ
 	if err := s.resolvePendingCandidateInTx(tx, number, req, model.NowRFC3339Nano()); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return commitIssueObservation(tx)
 }
 
 func isCanonicalLabelList(labels []string) bool {
@@ -2940,7 +2954,7 @@ func (s *Store) ApplyBatchTriageDecisionsWithOptions(dec model.BatchTriageDecisi
 		res.AcknowledgedIssues = acked
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := commitIssueObservation(tx); err != nil {
 		return BatchTriageResult{}, err
 	}
 
@@ -3506,8 +3520,13 @@ ORDER BY i.number DESC`, DefaultRepo)
 	syncMeta.PendingCandidateNums = pendNums
 	syncMeta.RetriageIssueNums = retriageNums
 
+	history, err := loadBugHistory(q)
+	if err != nil {
+		return model.Dataset{}, err
+	}
 	return model.Dataset{
-		SyncMeta: syncMeta,
+		BugHistory: history,
+		SyncMeta:   syncMeta,
 		Enums: model.DatasetEnums{
 			Categories:    model.ValidCategories,
 			Severities:    model.ValidSeverities,
